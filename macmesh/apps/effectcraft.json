@@ -1,0 +1,68 @@
+{
+  "name": "effectcraft",
+  "description": "EffectCraft motion graphics: renders a composition",
+  "notes": "Needs vars.comp (the composition's name). Takes seconds, so it needs the comp's frame rate; macmesh reads the active comp's rate from the project, so pass fps when rendering another comp at a different rate. Fails rather than render with missing footage or fonts.",
+  "program": {
+    "path": "~/.local/bin/effectcraft-cli",
+    "version_args": [
+      "--version"
+    ]
+  },
+  "media": "scan",
+  "fps_probe": {
+    "args": [
+      "--project",
+      "{project}",
+      "info",
+      "--json"
+    ],
+    "pattern": "\"frameRate\":\\s*([0-9.]+)"
+  },
+  "range": {
+    "steps": [
+      [
+        "--project",
+        "{in:project}",
+        "--save",
+        "exec",
+        "file.relinkFootage",
+        "--params",
+        "{\"folder\": \"{indir}\", \"wait\": true}"
+      ],
+      [
+        "--project",
+        "{in:project}",
+        "run",
+        "footage.check",
+        "{\"wait\": true}",
+        "file.findMissing",
+        "{\"what\": \"footage\"}",
+        "file.findMissing",
+        "{\"what\": \"fonts\"}"
+      ],
+      [
+        "--project",
+        "{in:project}",
+        "render",
+        "--comp",
+        "{comp}",
+        "--out",
+        "{out:result}",
+        "--format",
+        "prores",
+        "--start",
+        "{start_s}",
+        "--end",
+        "{end_s}",
+        "--audio",
+        "auto"
+      ]
+    ],
+    "out_ext": ".mov",
+    "merge": "concat"
+  },
+  "fail_if": [
+    "\"missing\":\\s*[1-9]",
+    "\"fonts\":\\s*\\[\\s*[^\\]\\s]"
+  ]
+}

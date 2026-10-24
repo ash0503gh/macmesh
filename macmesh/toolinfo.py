@@ -12,7 +12,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from . import wire
+from . import profiles, wire
 
 # Version flags known to be safe (print and exit). App tools declare theirs as
 # `version_args` in the `tools` table; running an unknown GUI binary with
@@ -22,16 +22,24 @@ VERSION_ARGS = {"ffmpeg": ["-version"], "ffprobe": ["-version"]}
 _hash_cache: dict[tuple, str] = {}
 
 
-def programs(cfg: dict) -> dict[str, str]:
+def tools(cfg: dict, home: Path | None = None) -> dict[str, dict]:
+    """The `tools` table: app profiles' programs, with the config's entries layered on top."""
+    table = {name: profiles.tool_entry(p) for name, p in profiles.load(home).items()}
+    for name, entry in cfg["tools"].items():
+        table[name] = {**table.get(name, {}), **entry}
+    return table
+
+
+def programs(cfg: dict, home: Path | None = None) -> dict[str, str]:
     """Allowed program name -> resolved executable, for those present here."""
     found = {}
     for name in cfg["allowed_programs"]:
         path = shutil.which(name)
         if path:
             found[name] = path
-    for name, tool in cfg["tools"].items():
-        path = tool.get("path", "")
-        if path and os.access(path, os.X_OK):
+    for name, tool in tools(cfg, home).items():
+        path = os.path.expanduser(tool.get("path", ""))
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
             found[name] = path
         elif shutil.which(name):
             found[name] = shutil.which(name)
@@ -48,8 +56,8 @@ def file_sha256(path: str) -> str:
     return _hash_cache[key]
 
 
-def version(name: str, path: str, cfg: dict) -> str:
-    args = cfg["tools"].get(name, {}).get("version_args") or VERSION_ARGS.get(name)
+def version(name: str, path: str, table: dict) -> str:
+    args = table.get(name, {}).get("version_args") or VERSION_ARGS.get(name)
     if not args:
         return ""
     try:
@@ -60,11 +68,11 @@ def version(name: str, path: str, cfg: dict) -> str:
     return lines[0].strip() if lines else ""
 
 
-def fingerprints(cfg: dict) -> dict[str, dict]:
-    out = {}
-    for name, path in programs(cfg).items():
+def fingerprints(cfg: dict, home: Path | None = None) -> dict[str, dict]:
+    out, table = {}, tools(cfg, home)
+    for name, path in programs(cfg, home).items():
         try:
-            out[name] = {"sha256": file_sha256(path), "version": version(name, path, cfg)}
+            out[name] = {"sha256": file_sha256(path), "version": version(name, path, table)}
         except OSError:
             continue
     return out

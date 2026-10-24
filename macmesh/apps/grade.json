@@ -1,0 +1,28 @@
+{
+  "name": "grade",
+  "description": "Grade colour grader and finisher: renders the current timeline",
+  "notes": "Renders the project's current timeline (a .gradeproject file). Frames are timeline frames from 0. grade-cli refuses offline media. Install it with Grade's `make install`.",
+  "program": {
+    "path": "~/Applications/Grade.app/Contents/MacOS/grade-cli"
+  },
+  "media": "scan",
+  "range": {
+    "steps": [
+      [
+        "export",
+        "{in:project}",
+        "{out:result}",
+        "--start",
+        "{start}",
+        "--end",
+        "{end_excl}",
+        "--codec",
+        "prores",
+        "--relink",
+        "{indir}"
+      ]
+    ],
+    "out_ext": ".mov",
+    "merge": "concat"
+  }
+}

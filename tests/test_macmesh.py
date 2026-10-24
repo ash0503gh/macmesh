@@ -16,10 +16,11 @@ import time
 import unittest
 from pathlib import Path
 
-from macmesh import config, jobspec, media, owner, pairing, pki, sandbox, toolinfo, wire
+from macmesh import config, jobspec, media, mediarefs, owner, pairing, pki, profiles, sandbox, toolinfo, wire
 from macmesh import worker as worker_module
 from macmesh.client import NodeClient, NodeError
-from macmesh.planners import plan_batch, plan_range, plan_video
+from macmesh.planners import plan_app, plan_batch, plan_range, plan_video
+from macmesh.planners.range import exact_fps
 from macmesh.planners.ai import extract_plan
 from macmesh.scheduler import JobFailed, Scheduler
 from macmesh.worker import Worker, make_server
@@ -127,7 +128,7 @@ class JobSpecTests(unittest.TestCase):
             Path(d, "p.ecproj").mkdir()
             job = plan_range("effectcraft", str(Path(d, "p.ecproj")), 10, 254, ["{in:project}", "{start}", "{end}",
                              "{out:result}"], chunk=100)
-        spans = [(int(t["argv"][2]), int(t["argv"][3])) for t in job["tasks"]]
+        spans = [(int(t["steps"][0][2]), int(t["steps"][0][3])) for t in job["tasks"]]
         self.assertEqual(spans, [(10, 109), (110, 209), (210, 254)])
 
     def test_extract_plan_from_claude_wrapper_and_prose(self):
@@ -336,7 +337,14 @@ class ResilienceTests(MeshCase):
         os.environ["FAKE_DELAY"] = "0.3"
         lines = []
         try:
-            threading.Timer(1.0, lambda: self.nodes[1].worker.drain("worker shutting down")).start()
+            air = self.nodes[1].worker
+
+            def drain_mid_task():
+                while not any(t.state == "running" and t.proc for t in list(air.tasks.values())):
+                    time.sleep(0.01)
+                air.drain("worker shutting down")
+
+            threading.Thread(target=drain_mid_task, daemon=True).start()
             self.run_job(self.range_job(frames=800), log=lines.append)
         finally:
             os.environ.pop("FAKE_DELAY")
@@ -560,6 +568,172 @@ class TLSTests(unittest.TestCase):
                 n.stop()
 
 
+FAKE_APP = """#!/bin/sh
+# fake app with a project that refers to media: relink <project> <dir> | render <project> <start> <end_excl> <out>
+case "$1" in
+  relink) test -f "$3/clip.dat" || { echo "no media in $3"; exit 4; }; echo relinked > "$2.linked" ;;
+  render) test -f "$2.linked" || { echo '{"offline": ["clip.dat"]}'; exit 0; }
+          mkdir -p "$5"; i=$3; while [ $i -lt $4 ]; do echo "$i" > "$5/frame_$(printf %05d $i).txt"; i=$((i+1)); done ;;
+esac
+"""
+
+
+class StepsAndMarkersTests(MeshCase):
+    def sh_job(self, steps, fail_if=None, inputs=None):
+        for n in self.nodes:
+            n.worker.cfg["tools"] = {"sh": {"path": "/bin/sh"}}
+        return jobspec.validate({"workdir": str(self.tmp / "o"), "tasks": [
+            {"id": "t", "steps": steps, "inputs": inputs or {}, "outputs": {"r": "r.txt"}, "fail_if": fail_if or []}]})
+
+    def test_steps_run_in_order_in_one_folder(self):
+        f = self.tmp / "in.txt"
+        f.write_text("x")
+        job = self.sh_job([["sh", "-c", "ls {indir} > step1.txt"], ["sh", "-c", "cat step1.txt > {out:r}"]],
+                          inputs={"f": str(f)})
+        self.run_job(job)
+        self.assertEqual((self.tmp / "o/r.txt").read_text().split(), ["in.txt"])
+
+    def test_a_failing_step_stops_the_task(self):
+        job = self.sh_job([["sh", "-c", "exit 3"], ["sh", "-c", "echo no > {out:r}"]])
+        with self.assertRaisesRegex(JobFailed, r"step 1 \(sh\) exit code 3"):
+            self.run_job(job, max_attempts=1)
+
+    def test_fail_if_catches_success_that_isnt(self):
+        job = self.sh_job([["sh", "-c", 'echo \'{"missing": 2}\'; echo ok > {out:r}']], fail_if=[r'"missing":\s*[1-9]'])
+        with self.assertRaisesRegex(JobFailed, "the output says it failed"):
+            self.run_job(job, max_attempts=1)
+        job = self.sh_job([["sh", "-c", 'echo \'{"missing": 0}\'; echo ok > {out:r}']], fail_if=[r'"missing":\s*[1-9]'])
+        self.run_job(job)
+        with self.assertRaisesRegex(jobspec.JobError, "regular expression"):
+            self.sh_job([["sh", "-c", "true"]], fail_if=["("])
+
+
+class RangePlaceholderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.proj = self.tmp / "p.json"
+        self.proj.write_text("{}")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_seconds_land_exactly_on_ntsc_frames(self):
+        self.assertEqual(exact_fps(29.97), exact_fps(30000 / 1001))
+        self.assertEqual(str(exact_fps(23.976)), "24000/1001")
+        self.assertEqual(str(exact_fps(25)), "25")
+        job = plan_range("app", str(self.proj), 7, 36, steps=[["{start_s}", "{end_s}", "{end_excl}", "{fps}"]],
+                         chunk=30, fps=29.97)
+        args = job["tasks"][0]["steps"][0][1:]
+        self.assertEqual(args, [repr(7 * 1001 / 30000), repr(37 * 1001 / 30000), "37", repr(30000 / 1001)])
+
+    def test_missing_values_are_explained(self):
+        with self.assertRaisesRegex(ValueError, "needs the frame rate"):
+            plan_range("app", str(self.proj), 0, 9, steps=[["{start_s}"]])
+        with self.assertRaisesRegex(ValueError, "--var comp="):
+            plan_range("app", str(self.proj), 0, 9, steps=[["--comp", "{comp}"]])
+        job = plan_range("app", str(self.proj), 0, 9, steps=[["--comp", "{comp}", "{indir}"]], vars={"comp": "Main"})
+        self.assertEqual(job["tasks"][0]["steps"][0], ["app", "--comp", "Main", "{indir}"])
+
+
+class MediaRefsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        (self.tmp / "media").mkdir()
+        for name in ("a.mov", "b.wav"):
+            (self.tmp / "media" / name).write_bytes(b"x")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_finds_paths_and_file_urls_in_any_json(self):
+        a, b = self.tmp / "media/a.mov", self.tmp / "media/b.wav"
+        proj = self.tmp / "p.gradeproject"
+        # Grade writes file URLs with escaped slashes; FilmCraft plain paths. Missing and system files don't count.
+        proj.write_text(json.dumps({"items": [{"url": a.as_uri()}, {"path": str(b)}, {"path": "/Volumes/Gone/c.mov"},
+                                              {"lut": "/System/Library/x.cube"}, {"name": "a.mov"}]}).replace("/", "\\/"))
+        self.assertEqual(mediarefs.scan(proj), sorted([str(a), str(b)]))
+        bundle = self.tmp / "Ad.ecproj"
+        (bundle / "Footage").mkdir(parents=True)
+        (bundle / "Footage/inside.mov").write_bytes(b"x")
+        (bundle / "project.json").write_text(json.dumps({"f": [str(bundle / "Footage/inside.mov"), str(a)]}))
+        self.assertEqual(mediarefs.scan(bundle), [str(a)])  # what's inside the bundle travels with it
+
+    def test_two_files_with_one_name_are_refused(self):
+        (self.tmp / "other").mkdir()
+        (self.tmp / "other/a.mov").write_bytes(b"y")
+        with self.assertRaisesRegex(ValueError, "both called 'a.mov'"):
+            mediarefs.as_inputs([str(self.tmp / "media/a.mov"), str(self.tmp / "other/a.mov")])
+
+
+class ProfileTests(MeshCase):
+    def write_profile(self, home: Path, prof: dict):
+        (home / "apps").mkdir(parents=True, exist_ok=True)
+        (home / "apps" / f"{prof['name']}.json").write_text(json.dumps(prof))
+
+    def fake_profile(self, app: Path) -> dict:
+        return {"name": "fakeapp2", "description": "test app", "program": {"path": str(app)}, "media": "scan",
+                "range": {"steps": [["relink", "{in:project}", "{indir}"],
+                                    ["render", "{in:project}", "{start}", "{end_excl}", "{out:result}"]],
+                          "out_ext": "", "merge": "dirs"},
+                "fail_if": [r'"offline":\s*\[\s*"']}
+
+    def test_shipped_profiles_are_valid(self):
+        shipped = {p["name"] for p in profiles.load(self.tmp / "nobody").values()}
+        self.assertTrue({"filmcraft", "effectcraft", "grade"} <= shipped, shipped)
+
+    def test_bad_profile_is_rejected(self):
+        with self.assertRaises(profiles.ProfileError):
+            profiles.validate({"name": "x", "program": {"path": "/x"}, "range": {"steps": "nope"}})
+        with self.assertRaises(profiles.ProfileError):
+            profiles.validate({"name": "x", "program": {"path": "/x"}, "range": {"steps": [["a"]]}, "fail_if": ["("]})
+
+    def test_app_job_ships_media_and_relinks_on_each_mac(self):
+        app = self.tmp / "fakeapp2"
+        app.write_text(FAKE_APP)
+        app.chmod(app.stat().st_mode | stat.S_IEXEC)
+        media_dir = self.tmp / "footage"
+        media_dir.mkdir()
+        (media_dir / "clip.dat").write_bytes(b"pixels")
+        project = self.tmp / "show.json"
+        project.write_text(json.dumps({"clips": [{"path": str(media_dir / "clip.dat")}]}))
+        prof = self.fake_profile(app)
+        for home in [config.home(), *(n.home for n in self.nodes)]:
+            self.write_profile(home, prof)  # the coordinator's and each worker's ~/.macmesh/apps
+        for n in self.nodes:
+            n.worker.fingerprints = toolinfo.fingerprints(n.worker.cfg, n.home)
+        cfg = dict(config.defaults(), tools={})
+        job = jobspec.validate(plan_app("fakeapp2", str(project), 0, 99, chunk=25, workdir=str(self.tmp / "out"),
+                                        cfg=cfg))
+        self.assertIn(str((media_dir / "clip.dat").resolve()), job["tasks"][0]["inputs"].values())
+        self.run_job(job)
+        self.assertEqual(len(os.listdir(self.tmp / "out/frames")), 100)
+        # Without the media the app "renders" a placeholder and exits 0: fail_if turns that into a failure.
+        prof["media"] = "none"
+        prof["range"]["steps"] = prof["range"]["steps"][1:]
+        for home in [config.home(), *(n.home for n in self.nodes)]:
+            self.write_profile(home, prof)
+        job = jobspec.validate(plan_app("fakeapp2", str(project), 0, 24, chunk=25, workdir=str(self.tmp / "out2"),
+                                        cfg=cfg))
+        with self.assertRaisesRegex(JobFailed, "the output says it failed"):
+            self.run_job(job, max_attempts=1)
+
+    def test_user_profile_overrides_shipped_one(self):
+        prof = self.fake_profile(Path("/bin/echo"))
+        prof["name"] = "grade"
+        self.write_profile(self.tmp / "u", prof)
+        self.assertEqual(profiles.load(self.tmp / "u")["grade"]["program"]["path"], "/bin/echo")
+
+    def test_v01_gui_entries_are_dropped_from_old_configs(self):
+        home = self.tmp / "old"
+        home.mkdir()
+        os.environ["MACMESH_HOME"] = str(home)
+        old = dict(config.defaults(), tools={
+            "filmcraft": {"path": "/Applications/FilmCraft.app/Contents/MacOS/filmcraft", "description": "d", "usage": "u"},
+            "mine": {"path": "/usr/local/bin/mine"}})
+        (home / "config.json").write_text(json.dumps(old))
+        self.assertEqual(set(config.load()["tools"]), {"mine"})
+
+
 @unittest.skipUnless(sandbox.available(), "sandbox-exec not available")
 class SandboxTests(unittest.TestCase):
     def setUp(self):
@@ -587,6 +761,17 @@ class SandboxTests(unittest.TestCase):
         self.assertTrue(secret.exists())
         with self.assertRaisesRegex(JobFailed, "Operation not permitted"):
             self.run_task(["sh", "-c", f"cat '{secret}' > {{out:result}}"])
+
+    def test_task_cannot_read_owners_temp_files(self):
+        private = sandbox.user_private_dir()
+        self.assertIsNotNone(private)
+        secret = Path(tempfile.mkstemp(dir=private / "T")[1])
+        try:
+            secret.write_text("someone else's temp file")
+            with self.assertRaisesRegex(JobFailed, "Operation not permitted"):
+                self.run_task(["sh", "-c", f"cat '{secret}' > {{out:result}}"])
+        finally:
+            secret.unlink()
 
     def test_task_cannot_write_outside_or_use_network(self):
         escape = Path("/tmp") / f"macmesh-escape-{os.getpid()}"

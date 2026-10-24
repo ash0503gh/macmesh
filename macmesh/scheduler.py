@@ -23,7 +23,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import toolinfo, wire
+from . import jobspec, toolinfo, wire
 from .client import NodeClient, NodeError, TaskRejected
 
 POLL = 0.5
@@ -76,8 +76,8 @@ class NodeState:
         return float(self.client.info.get("hardware", {}).get("score", 1.0))
 
     def can_run(self, spec: dict) -> bool:
-        prog = spec["argv"][0]
-        return prog in self.client.info.get("programs", []) and prog not in self.mismatched
+        have = self.client.info.get("programs", [])
+        return all(p in have and p not in self.mismatched for p in jobspec.programs(spec))
 
 
 class Scheduler:
@@ -111,7 +111,9 @@ class Scheduler:
         self._check_builds()
         for t in self.tasks:
             if not any(n.can_run(t.spec) for n in self.nodes):
-                prog = t.spec["argv"][0]
+                missing = [p for p in jobspec.programs(t.spec)
+                           if not any(p in n.client.info.get("programs", []) and p not in n.mismatched for n in self.nodes)]
+                prog = (missing or jobspec.programs(t.spec))[0]
                 if any(prog in n.mismatched for n in self.nodes):
                     raise JobFailed(f"{t.id}: every Mac with '{prog}' has a different build from this one "
                                     "(install the same version, or use --match none)")
@@ -143,7 +145,7 @@ class Scheduler:
     def _check_builds(self) -> None:
         if self.reference is None or self.match == "none":
             return
-        programs = {t.spec["argv"][0] for t in self.tasks}
+        programs = {p for t in self.tasks for p in jobspec.programs(t.spec)}
         for prog in sorted(programs):
             ours = self.reference.get(prog)
             if ours is None:
@@ -285,7 +287,8 @@ class Scheduler:
                 self._ensure_uploaded(c, sha, path)
             upload_s = time.time() - t0
             c.submit({
-                "task_id": remote_id, "argv": task.spec["argv"], "inputs": inputs,
+                "task_id": remote_id, "steps": task.spec["steps"], "fail_if": task.spec.get("fail_if", []),
+                "inputs": inputs,
                 "outputs": {k: Path(v).name for k, v in task.spec["outputs"].items()},
                 "timeout": task.spec.get("timeout"),
             })

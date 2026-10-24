@@ -14,3 +14,6 @@ macmesh = "macmesh.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["macmesh*"]
+
+[tool.setuptools.package-data]
+macmesh = ["apps/*.json"]

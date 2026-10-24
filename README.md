@@ -30,9 +30,10 @@ across the Macs around you, over Wi-Fi, with zero configuration.
 | Discovery | Zero-config over mDNS, the same mechanism AirDrop and AirPlay use for discovery. Static `--peer host:port` works too. |
 | Scheduler | **Pull-based**: each Mac takes the next chunk when it has room, so faster Macs naturally do more. Re-queues work when a Mac disappears, retries failures on a *different* Mac, and duplicates straggling chunks at the end of a job (first finisher wins). |
 | `macmesh video` | Splits a video at keyframes (lossless), encodes chunks across Macs, stitches with `-c copy`, then adds the original audio back in one pass. Frame-exact: tested to match the source's frame count with no seam errors. |
-| `macmesh range` | Frame-range rendering for **FilmCraft / EffectCraft / Grade** (or any CLI renderer). Project bundles are uploaded once per Mac. |
+| `macmesh range` | Frame-range rendering with any app that has a command line: `--app` uses an [app profile](#any-app-profiles), `--tool` takes the tool's arguments. Projects and the media they use are uploaded once per Mac. |
+| `macmesh apps` | Lists app profiles, and which apps (and builds) this Mac has. |
 | `macmesh batch` | One task per file: transcode, transcribe, upscale, mask, convert. |
-| `macmesh plan` | **AI planner** via **Claude Code CLI** or **Antigravity CLI**, headless, no API keys. It reads the request, file metadata, Mac specs and your apps' CLI docs, and picks how to split the work. |
+| `macmesh plan` | **AI planner** via **Claude Code CLI** or **Antigravity CLI**, headless, no API keys. It reads the request, file metadata, Mac specs and the app profiles, and picks how to split the work. |
 | `macmesh run` | Runs a raw job spec (JSON). This is what every planner produces; see `macmesh/jobspec.py`. |
 
 ## Quick start (two Macs)
@@ -69,51 +70,71 @@ macmesh video clip.mov -o clip-hevc.mp4 --preset hevc
 
 To start the worker automatically at login, see `examples/com.macmesh.worker.plist`.
 
-## Hooking up FilmCraft, EffectCraft and Grade
+## Any app: profiles
 
-Workers only execute programs that are explicitly allowed: entries in
-`allowed_programs` (default: `ffmpeg`, `ffprobe`) or the `tools` table.
-Point `tools` at your apps' real CLI binaries **on every Mac**. The
-`description` and `usage` fields are what the AI planner reads, so make them
-accurate:
-
-```sh
-macmesh config tools '{
-  "effectcraft": {"path": "/Applications/EffectCraft.app/Contents/MacOS/effectcraft",
-                  "description": "Motion graphics renderer",
-                  "usage": "effectcraft render <project> --comp <name> --start <f> --end <f> --output <dir|file.mov>"},
-  "grade":       {"path": "/Applications/Grade.app/Contents/MacOS/grade",
-                  "description": "Colour grading + AI subject masking",
-                  "usage": "grade export <project> --start <f> --end <f> --output <file.mov>"},
-  "filmcraft":   {"path": "/Applications/FilmCraft.app/Contents/MacOS/filmcraft",
-                  "description": "Editor timeline export",
-                  "usage": "filmcraft render <project> --in <f> --out <f> --output <file.mov>"}
-}'
-```
-
-Then render a frame range. Everything after `--` is the app's own arguments,
-with placeholders:
+macmesh's core knows nothing about particular apps. It runs commands on files
+and returns files. What it knows about an app lives in an **app profile**: one
+JSON file that says how to drive the app's command-line tool. Shipped
+examples are in `macmesh/apps/` (FilmCraft, EffectCraft, Grade). Yours go in
+`~/.macmesh/apps/`, and a file there replaces a shipped one with the same
+name. The format is documented at the top of `macmesh/profiles.py`.
 
 ```sh
-# 1200 frames as PNG folders, 100 frames per chunk, pooled into ./macmesh-out/…/frames
-macmesh range --tool effectcraft --project MyAd.ecproj --frames 0-1199 --chunk 100 \
-  -- render {in:project} --comp Main --start {start} --end {end} --output {out:result}
-
-# Movie chunks, joined losslessly at the end
-macmesh range --tool grade --project Interview.grade --frames 0-4799 --chunk 400 --out-ext .mov \
-  -- export {in:project} --start {start} --end {end} --output {out:result}
+macmesh apps                     # profiles, and whether this Mac has each app (and which build)
+macmesh range --app filmcraft --project Edit.fcproj --frames 0-4799 --chunk 400
+macmesh range --app effectcraft --project MyAd.ecproj --frames 0-899 --var comp=Main
+macmesh range --app grade --project Interview.gradeproject --frames 0-2999
 ```
+
+A profile gives:
+
+- **The program:** its path, and the flag that prints its version. Version
+  strings are compared across Macs; with no version, the binary itself is.
+- **The range steps:** one or more commands run in order in the task's folder,
+  usually "relink the project's media to the folder it arrived in", then
+  "render this range".
+- **Media:** with `"media": "scan"`, macmesh finds the files the project
+  refers to (any JSON project: absolute paths and `file://` URLs) and sends
+  them with it. On the other Mac they arrive beside the project, in `{indir}`.
+- **Failure markers** (`fail_if`): regular expressions for output that means
+  the render failed even though the app exited 0. Some apps render grey
+  placeholders for missing media.
+- **Sandbox needs:** extra folders the app must read or write.
+- **The frame rate,** for apps that take seconds instead of frames
+  (`fps_probe`, or `--fps`).
+
+Chunks are ProRes `.mov` files with PCM sound, so they join back losslessly:
+pictures and sound come out identical to a render on one Mac. That was tested
+for all three example profiles, sandboxed, at 24 and 29.97 fps.
 
 | Placeholder | Becomes |
 |---|---|
 | `{in:project}`, `{in:NAME}` | Path of that input on the Mac running the task (bundles/folders work) |
 | `{out:result}`, `{out:NAME}` | Where the task must write its output (a file, or a folder of frames) |
-| `{start}` `{end}` `{count}` `{index}` | This chunk's frame range (inclusive) |
+| `{indir}` | The folder holding the project and its media on that Mac |
+| `{start}` `{end}` | This chunk's frames, both inclusive; `{end_excl}` = end + 1; `{count}` `{index}` |
+| `{start_s}` `{end_s}` `{fps}` | The same range in seconds (end exclusive). NTSC rates such as 29.97 are exact (30000/1001) |
+| `{name}` | A `--var name=value` (or the profile's default) |
 | `{stem}` (batch only) | Input file name without its extension |
 
-For a movie-chunk merge to be lossless, every chunk must start on a keyframe
-and use identical codec settings. Intra-frame codecs such as ProRes always
-qualify. For long-GOP codecs, your app must start each chunk with a keyframe.
+An app with no profile still works through `--tool` and its own arguments:
+
+```sh
+macmesh range --tool myrenderer --project Scene.blend --frames 1-250 --chunk 25 \
+  -- -b {in:project} -s {start} -e {end} -o {out:result}
+```
+
+**What makes an app offloadable:** a command that renders part of the work
+headless from files: a frame range, a file, a batch. GUI-only apps can't be
+offloaded, and a running process can't move to another Mac. That's why Grade
+gained `grade-cli export` (frame range, relink, refuses offline media). The
+example profiles show what each app needed:
+
+- **FilmCraft:** its `exec` export renders placeholders for offline media and
+  still exits 0, which the profile's failure marker catches.
+- **EffectCraft:** takes seconds, relinks footage in the background unless
+  asked to wait, and renders missing footage silently. Its profile relinks,
+  then checks for missing footage **and fonts** before rendering.
 
 ## The AI planner (Claude Code or Antigravity, no API)
 
@@ -127,15 +148,15 @@ How it works:
 
 1. macmesh builds a prompt containing the request, file metadata (`ffprobe` for
    media, listings for bundles), every Mac's specs (chip, cores, fanless,
-   battery, installed apps), and your apps' `usage` docs.
+   battery, installed apps), the app profiles, and other tools' `usage` docs.
 2. It runs the agent headlessly:
    - `claude -p … --output-format json --tools "" --no-session-persistence`
      (all tools disabled, so it can only answer)
    - `agy -p …`
    Both commands are editable under `agents` in the config.
 3. The agent answers with JSON choosing a **deterministic planner**
-   (`video` / `range` / `batch`) and its parameters, or a raw job spec for
-   unusual work. The AI decides *how to split*; plain code does the scheduling
+   (`app` / `video` / `range` / `batch`) and its parameters, or a raw job spec
+   for unusual work. The AI decides *how to split*; plain code does the scheduling
    and execution.
 4. macmesh validates the plan, refuses inputs outside the files you named,
    shows you every command, and asks before running.
@@ -211,9 +232,12 @@ On the first run, use `--dry-run --save-job plan.json` to review a plan and
   - has no IP networking;
   - can write only to its own task folder;
   - can't read or even list the owner's home folder, apart from its task
-    folder, the tool itself, `~/Library/Fonts` and paths the tool's config
-    allows (`"sandbox": {"read": [...], "write": [...]}`, or `false` for a tool
-    that can't work inside it).
+    folder, the tool's own folder or `.app` bundle, `~/Library/Fonts` and
+    paths the tool's profile allows (`"sandbox": {"read": [...], "write":
+    [...]}`, or `false` for a tool that can't work inside it);
+  - can't read the owner's private temp and cache folders under
+    `/var/folders`, where other apps' temp files live. Only the metadata of
+    the folders above its task folder is visible.
 - **Protecting the Mac that sends work:** task outputs can't escape the
   coordinator's `workdir`, archives are extracted with path-traversal checks,
   and downloads are verified against the worker's SHA-256.
@@ -239,16 +263,18 @@ The suite starts in-process workers to stand in for Macs. It covers:
 - a node dying mid-job, a node going silent (detected within seconds), shutdown handing work back, and a busy owner getting their Mac back (pause, resume, yield);
 - build matching, and blob cleanup and expiry;
 - pairing (and a wrong code), mutual TLS jobs, and refusal of plain HTTP, foreign CAs and revoked certificates;
-- the sandbox (no home reads, no writes outside, no network);
+- the sandbox (no home reads, no private temp reads, no writes outside, no network);
+- multi-step tasks, failure markers, exact seconds at NTSC rates, media scanning, app profiles (including a job whose media must be shipped and relinked), and dropping v0.1's GUI-app config entries;
 - permanent failure after retries, signature tampering, the program allowlist, and tar traversal.
 
 ## Known limitations / roadmap
 
-1. **Same assets everywhere.** Project files and bundles travel with each
-   task, but fonts, plugins, LUTs and app versions must match on every Mac,
-   or different Macs render different pixels. Next step: workers report
-   app version and font/plugin hashes, and the planner refuses mismatched
-   nodes.
+1. **Same assets everywhere.** Projects and their media travel with each
+   task, and builds are matched, but fonts, plugins and LUTs must match on
+   every Mac, or different Macs render different pixels. (The EffectCraft
+   profile refuses to render when fonts are missing; other apps don't check.)
+   Next step: workers report font and plugin hashes, and the planner refuses
+   mismatched Macs.
 2. **Media-engine encoders** (`h264-hw`, `hevc-hw`) are already very fast on
    Apple Silicon. Splitting pays off most for software encoders (x264/x265),
    heavy filters, motion-graphics renders and AI passes.

@@ -16,25 +16,15 @@ from . import DEFAULT_PORT
 # Add interpreters (python3, sh) only if you want the mesh to run scripts.
 DEFAULT_ALLOWED = ["ffmpeg", "ffprobe"]
 
-# Your own apps. `path` is the CLI binary; `description`/`usage` are shown to
-# the AI planner so it knows how to drive the tool.
-DEFAULT_TOOLS = {
-    "filmcraft": {
-        "path": "/Applications/FilmCraft.app/Contents/MacOS/filmcraft",
-        "description": "FilmCraft video editor CLI: render/export a timeline.",
-        "usage": "filmcraft render <project> --in <frame> --out <frame> --output <file.mov>",
-    },
-    "effectcraft": {
-        "path": "/Applications/EffectCraft.app/Contents/MacOS/effectcraft",
-        "description": "EffectCraft motion graphics CLI: render a composition to frames or a movie.",
-        "usage": "effectcraft render <project> --comp <name> --start <frame> --end <frame> --output <dir|file>",
-    },
-    "grade": {
-        "path": "/Applications/Grade.app/Contents/MacOS/grade",
-        "description": "Grade colour/AI CLI: apply grades, AI subject masks, export.",
-        "usage": "grade export <project> --start <frame> --end <frame> --output <file.mov>",
-    },
-}
+# Extra programs or overrides of app profiles (macmesh/apps/, ~/.macmesh/apps/):
+# {"name": {"path": ..., "version_args": [...], "sandbox": {"read": [...], "write": [...]} | false}}.
+DEFAULT_TOOLS: dict = {}
+
+# macmesh 0.1 wrote these app entries into every config; they point at the GUI apps, not their
+# command-line tools, and would hide the app profiles. load() drops them.
+OLD_DEFAULT_PATHS = {"/Applications/FilmCraft.app/Contents/MacOS/filmcraft",
+                     "/Applications/EffectCraft.app/Contents/MacOS/effectcraft",
+                     "/Applications/Grade.app/Contents/MacOS/grade"}
 
 DEFAULT_AGENTS = {
     # The planner only needs text in, JSON out: all agent tools are disabled.
@@ -91,6 +81,8 @@ def load() -> dict:
     saved = json.loads(p.read_text())
     cfg["owner"].update(saved.pop("owner", {}))
     cfg.update(saved)
+    cfg["tools"] = {name: t for name, t in cfg["tools"].items()
+                    if not (t.get("path") in OLD_DEFAULT_PATHS and set(t) <= {"path", "description", "usage"})}
     return cfg
 
 

@@ -11,9 +11,9 @@ import threading
 import time
 from pathlib import Path
 
-from . import PAIR_SERVICE_TYPE, __version__, config, discovery, jobspec, media, pairing, pki, toolinfo
+from . import PAIR_SERVICE_TYPE, __version__, config, discovery, jobspec, media, pairing, pki, profiles, toolinfo
 from .client import NodeClient, NodeError
-from .planners import ENCODE_PRESETS, PLANNERS
+from .planners import ENCODE_PRESETS, PLANNERS, PRIVATE_PARAMS
 from .scheduler import JobFailed, Scheduler
 
 
@@ -77,7 +77,7 @@ def describe(job: dict) -> None:
     tasks = job["tasks"]
     print(f"\nJob '{job['name']}': {len(tasks)} task(s) → {job['workdir']}")
     for t in tasks[:3]:
-        print(f"  {t['id']}: {shlex.join(t['argv'])}")
+        print(f"  {t['id']}: " + "  &&  ".join(shlex.join(step) for step in t["steps"]))
     if len(tasks) > 3:
         print(f"  … {len(tasks) - 3} more")
     for step in job.get("merge", []):
@@ -282,23 +282,52 @@ def cmd_video(args) -> int:
     return execute(job, config.load(), args)
 
 
-def _kv(pairs) -> dict:
+def _kv(pairs, flag: str = "--input") -> dict:
     out = {}
     for p in pairs or []:
         k, sep, v = p.partition("=")
         if not sep:
-            raise SystemExit(f"--input expects name=path, got {p!r}")
+            raise SystemExit(f"{flag} expects name=value, got {p!r}")
         out[k] = v
     return out
 
 
 def cmd_range(args) -> int:
     start, _, end = args.frames.partition("-")
-    job = PLANNERS["range"](args.tool, args.project, int(start), int(end), _template(args.template),
-                            chunk=args.chunk, out_ext=args.out_ext, merge=args.merge,
-                            output=args.output or "", extra_inputs=_kv(args.input),
-                            workdir=args.workdir or "")
-    return execute(job, config.load(), args)
+    cfg = config.load()
+    if bool(args.app) == bool(args.tool):
+        raise ValueError("give --app NAME (an app profile, see `macmesh apps`) or --tool NAME -- <its arguments>")
+    if args.app:
+        if args.template:
+            raise ValueError("--app takes its commands from the app's profile; drop the arguments after --")
+        job = PLANNERS["app"](args.app, args.project, int(start), int(end), chunk=args.chunk, fps=args.fps,
+                              vars=_kv(args.var, "--var"), output=args.output or "", workdir=args.workdir or "",
+                              cfg=cfg)
+    else:
+        job = PLANNERS["range"](args.tool, args.project, int(start), int(end), _template(args.template),
+                                chunk=args.chunk, out_ext=args.out_ext, merge=args.merge,
+                                output=args.output or "", extra_inputs=_kv(args.input),
+                                workdir=args.workdir or "", fps=args.fps, vars=_kv(args.var, "--var"))
+    return execute(job, cfg, args)
+
+
+def cmd_apps(args) -> int:
+    cfg = config.load()
+    found = profiles.load()
+    if not found:
+        print("No app profiles. Add one to ~/.macmesh/apps/ (see macmesh/profiles.py).")
+        return 0
+    here, fps = toolinfo.programs(cfg), toolinfo.fingerprints(cfg)
+    print(f"{'APP':<14} {'ON THIS MAC':<14} {'BUILD':<26} DESCRIPTION")
+    for name, p in sorted(found.items()):
+        status = "yes" if name in here else "not found"
+        build = toolinfo.describe(fps[name]) if name in fps else "-"
+        print(f"{name:<14} {status:<14} {build[:26]:<26} {p.get('description', '')}")
+        if args.verbose:
+            print(f"  profile: {p['source']}\n  program: {here.get(name) or p['program']['path']}")
+            for i, step in enumerate(p["range"]["steps"], 1):
+                print(f"  step {i}: {name} {' '.join(step)}")
+    return 0
 
 
 def cmd_batch(args) -> int:
@@ -335,7 +364,7 @@ def cmd_plan(args) -> int:
             job = params
         else:
             fn = PLANNERS[plan["planner"]]
-            allowed = set(fn.__code__.co_varnames[:fn.__code__.co_argcount])
+            allowed = set(fn.__code__.co_varnames[:fn.__code__.co_argcount]) - PRIVATE_PARAMS
             unknown = set(params) - allowed
             if unknown:
                 raise ValueError(f"unexpected params for {plan['planner']}: {sorted(unknown)}")
@@ -438,11 +467,15 @@ def build_parser() -> argparse.ArgumentParser:
     mesh_opts(p)
     p.set_defaults(fn=cmd_video)
 
-    p = sub.add_parser("range", help="render a frame range with FilmCraft/EffectCraft/Grade/...",
-                       usage="macmesh range --tool T --project P --frames A-B [options] -- <tool args>")
-    p.add_argument("--tool", required=True)
+    p = sub.add_parser("range", help="render a frame range with an app (profile) or any command-line renderer",
+                       usage="macmesh range --app APP --project P --frames A-B [options]\n"
+                             "       macmesh range --tool T --project P --frames A-B [options] -- <tool args>")
+    p.add_argument("--app", help="an app profile (see `macmesh apps`)")
+    p.add_argument("--tool", help="any allowed program, with its arguments after --")
     p.add_argument("--project", required=True)
     p.add_argument("--frames", required=True, help="START-END, inclusive")
+    p.add_argument("--fps", type=float, help="frame rate, for commands that take seconds (else asked of the app)")
+    p.add_argument("--var", action="append", help="value for a {name} placeholder, e.g. --var comp=Main")
     p.add_argument("--chunk", type=int, default=100, help="frames per task")
     p.add_argument("--out-ext", default="", help=".mov for movie chunks; omit for frame folders")
     p.add_argument("--merge", default="auto", choices=["auto", "concat", "dirs", "none"])
@@ -450,6 +483,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input", action="append", help="extra asset name=path, use as {in:name}")
     mesh_opts(p)
     p.set_defaults(fn=cmd_range)
+
+    p = sub.add_parser("apps", help="list app profiles and whether this Mac has each app")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(fn=cmd_apps)
 
     p = sub.add_parser("batch", help="one task per file",
                        usage="macmesh batch FILES... --out-ext .EXT [options] -- <program> <args>")
@@ -479,7 +516,8 @@ def main(argv: list[str] | None = None) -> int:
     args.template = template
     try:
         return args.fn(args) or 0
-    except (jobspec.JobError, ValueError, FileNotFoundError, pki.PKIError, pairing.PairingError) as e:
+    except (jobspec.JobError, ValueError, FileNotFoundError, pki.PKIError, pairing.PairingError,
+            profiles.ProfileError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 

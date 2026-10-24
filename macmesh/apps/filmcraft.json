@@ -1,0 +1,44 @@
+{
+  "name": "filmcraft",
+  "description": "FilmCraft video editor: renders the active sequence",
+  "notes": "Renders the project's active sequence. Chunks are ProRes with PCM sound, joined losslessly. Frames are sequence frames from 0.",
+  "program": {
+    "path": "~/.local/bin/filmcraft-cli",
+    "version_args": [
+      "--version"
+    ]
+  },
+  "media": "scan",
+  "range": {
+    "steps": [
+      [
+        "--compact",
+        "--project",
+        "{in:project}",
+        "--save",
+        "exec",
+        "media.autoRelink",
+        "folder={indir}"
+      ],
+      [
+        "--compact",
+        "--project",
+        "{in:project}",
+        "exec",
+        "file.exportMedia",
+        "path={out:result}",
+        "format=prores",
+        "audio=true",
+        "range=custom",
+        "startFrame={start}",
+        "endFrame={end_excl}",
+        "wait=true"
+      ]
+    ],
+    "out_ext": ".mov",
+    "merge": "concat"
+  },
+  "fail_if": [
+    "\"offlineMedia\":\\[\\{"
+  ]
+}

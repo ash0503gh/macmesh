@@ -47,8 +47,11 @@ def run(argv: list[str]) -> None:
 def concat_video(workdir: Path, step: dict) -> Path:
     """Join encoded chunks losslessly, then add the original audio back in one pass.
 
-    Chunks are video-only: encoding audio per chunk leaves tiny gaps (AAC
-    priming) at every seam, so audio is taken whole from the source instead.
+    With `audio_from` (a path, or one relative to the workdir) the chunks are
+    taken as video-only and the sound comes whole from that file: encoding AAC
+    per chunk leaves tiny gaps (priming) at every seam. Without it, every
+    stream of the chunks is copied as is, which joins exactly when their sound
+    is PCM (as in ProRes .mov chunks).
     """
     out = workdir / step["output"]
     listing = workdir / ".concat.txt"
@@ -60,13 +63,16 @@ def concat_video(workdir: Path, step: dict) -> Path:
             "-f", "concat", "-safe", "0", "-i", str(listing)]
     audio_src = step.get("audio_from")
     if audio_src:
+        audio_src = workdir / audio_src if not Path(audio_src).is_absolute() else Path(audio_src)
         argv += ["-i", str(audio_src), "-map", "0:v:0", "-map", "1:a?", "-map_metadata", "1"]
         mode = step.get("audio", "auto")
         if mode == "auto":
             a = summary(audio_src)["audio"]
             mode = "copy" if a and a["codec"] in MP4_AUDIO else "aac"
         argv += ["-c:a", "copy"] if mode == "copy" else ["-c:a", "aac", "-b:a", "256k"]
-    argv += ["-c:v", "copy"]
+        argv += ["-c:v", "copy"]
+    else:
+        argv += ["-map", "0", "-c", "copy"]
     if out.suffix.lower() in (".mp4", ".mov", ".m4v"):
         argv += ["-movflags", "+faststart"]
     argv.append(str(out))

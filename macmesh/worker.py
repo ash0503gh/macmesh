@@ -89,7 +89,7 @@ class Worker:
         self.lock = threading.Lock()
         self.slots = threading.Semaphore(int(cfg["slots"]))
         self.extract_lock = threading.Lock()
-        self.fingerprints = toolinfo.fingerprints(cfg)
+        self.fingerprints = toolinfo.fingerprints(cfg, self.root)
         self.sandboxed = bool(cfg.get("sandbox")) and sandbox.available()
         self.owner_busy = ""      # why the owner needs the Mac right now, or ""
         self.draining = ""        # why this worker is going away, or ""
@@ -104,7 +104,7 @@ class Worker:
 
     # ---- capabilities -------------------------------------------------
     def programs(self) -> dict[str, str]:
-        return toolinfo.programs(self.cfg)
+        return toolinfo.programs(self.cfg, self.root)
 
     def info(self) -> dict:
         with self.lock:
@@ -233,12 +233,22 @@ class Worker:
         tid = spec.get("task_id", "")
         if not TASK_ID.match(tid):
             raise ValueError("bad task_id")
-        argv = spec.get("argv")
-        if not argv or not all(isinstance(a, str) for a in argv):
-            raise ValueError("argv must be a non-empty list of strings")
+        steps = spec.get("steps") or [spec.get("argv")]
+        if not all(isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv) for argv in steps):
+            raise ValueError("argv (or each step) must be a non-empty list of strings")
+        spec["steps"] = steps
+        fail_if = spec.get("fail_if", [])
+        if not isinstance(fail_if, list) or not all(isinstance(m, str) and m for m in fail_if):
+            raise ValueError("fail_if must be a list of non-empty strings")
+        for pattern in fail_if:
+            try:
+                re.compile(pattern)
+            except re.error as e:
+                raise ValueError(f"fail_if {pattern!r} isn't a valid regular expression: {e}") from None
         programs = self.programs()
-        if argv[0] not in programs:
-            raise PermissionError(f"program {argv[0]!r} is not allowed or not installed on this node")
+        for argv in steps:
+            if argv[0] not in programs:
+                raise PermissionError(f"program {argv[0]!r} is not allowed or not installed on this node")
         for name, inp in spec.get("inputs", {}).items():
             if not SHA.match(inp.get("blob", "")):
                 raise ValueError(f"input {name}: bad blob hash")
@@ -252,10 +262,10 @@ class Worker:
                 raise FileExistsError("duplicate task_id")
             task = Task(spec, self.work)
             self.tasks[tid] = task
-        threading.Thread(target=self._run, args=(task, programs[argv[0]]), daemon=True).start()
+        threading.Thread(target=self._run, args=(task, [programs[a[0]] for a in steps]), daemon=True).start()
         return task
 
-    def _run(self, task: Task, exe: str) -> None:
+    def _run(self, task: Task, exes: list[str]) -> None:
         with self.slots:
             while self.owner_busy and task.state == "queued":
                 time.sleep(0.5)  # don't start new work while the owner needs the Mac
@@ -265,8 +275,7 @@ class Worker:
                 task.state = "running"
             task.started = time.time()
             try:
-                argv = self._prepare(task, exe)
-                rc = self._execute(task, argv)
+                rc = self._execute(task, self._prepare(task, exes))
                 task.returncode = rc
                 if task.state in ("cancelled", "yielded"):
                     return
@@ -282,7 +291,7 @@ class Worker:
             finally:
                 task.finished = time.time()
 
-    def _prepare(self, task: Task, exe: str) -> list[str]:
+    def _prepare(self, task: Task, exes: list[str]) -> list[list[str]]:
         (task.dir / "in").mkdir(parents=True)
         (task.dir / "out").mkdir()
         (task.dir / "tmp").mkdir()
@@ -302,43 +311,64 @@ class Worker:
                 if key not in paths:
                     raise ValueError(f"unknown placeholder {m.group(0)}")
                 return paths[key]
-            return PLACEHOLDER.sub(sub, arg)
+            return PLACEHOLDER.sub(sub, arg).replace("{indir}", str(task.dir / "in"))
 
-        argv = [exe] + [expand(a) for a in task.spec["argv"][1:]]
-        if self.sandboxed:
-            argv = sandbox.wrap(argv, task.dir, self.cfg["tools"].get(task.spec["argv"][0], {}))
+        table = toolinfo.tools(self.cfg, self.root) if self.sandboxed else {}
         priority = self.cfg.get("priority", "normal")
-        if priority in QOS and sysinfo.IS_MAC:
-            # A QoS clamp makes macOS favour the owner's apps over this task.
-            argv = ["taskpolicy", "-c", priority, *argv]
-        (task.dir / "argv.json").write_text(json.dumps(argv, indent=1))
-        return argv
+        steps = []
+        for i, (exe, step) in enumerate(zip(exes, task.spec["steps"])):
+            argv = [exe] + [expand(a) for a in step[1:]]
+            if self.sandboxed:
+                argv = sandbox.wrap(argv, task.dir, table.get(step[0], {}), name=f"step{i + 1}.sb")
+            if priority in QOS and sysinfo.IS_MAC:
+                # A QoS clamp makes macOS favour the owner's apps over this task.
+                argv = ["taskpolicy", "-c", priority, *argv]
+            steps.append(argv)
+        (task.dir / "steps.json").write_text(json.dumps(steps, indent=1))
+        return steps
 
-    def _execute(self, task: Task, argv: list[str]) -> int:
+    def _execute(self, task: Task, steps: list[list[str]]) -> int:
+        """Run the steps in order in the task folder; the first that fails ends the task."""
         nice = int(self.cfg.get("nice", 0))
         env = dict(os.environ, TMPDIR=str(task.dir / "tmp"))
+        deadline = time.time() + task.spec["timeout"] if task.spec.get("timeout") else None
         with open(task.dir / "task.log", "wb") as log:
-            with self.lock:
-                if task.state != "running":
+            for i, argv in enumerate(steps):
+                if len(steps) > 1:
+                    log.write(f"--- step {i + 1}/{len(steps)}: {task.spec['steps'][i][0]}\n".encode())
+                    log.flush()
+                with self.lock:
+                    if task.state not in ("running", "paused"):
+                        return -1  # yielded or cancelled between steps
+                    task.proc = subprocess.Popen(
+                        argv, cwd=task.dir, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
+                        preexec_fn=(lambda: os.nice(nice)) if nice else None, start_new_session=True,
+                    )
+                    if task.state == "paused":  # the owner got busy while the last step was ending
+                        self._signal(task, signal.SIGSTOP)
+                awake = None
+                if sysinfo.IS_MAC:
+                    # Keep the Mac from idle-sleeping while this task runs.
+                    awake = subprocess.Popen(["caffeinate", "-i", "-w", str(task.proc.pid)])
+                try:
+                    rc = task.proc.wait(timeout=max(deadline - time.time(), 0.1) if deadline else None)
+                except subprocess.TimeoutExpired:
+                    _kill(task.proc)
+                    task.error = "timed out"
                     return -1
-                task.proc = subprocess.Popen(
-                    argv, cwd=task.dir, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
-                    preexec_fn=(lambda: os.nice(nice)) if nice else None, start_new_session=True,
-                )
-            awake = None
-            if sysinfo.IS_MAC:
-                # Keep the Mac from idle-sleeping while this task runs.
-                awake = subprocess.Popen(["caffeinate", "-i", "-w", str(task.proc.pid)])
-            try:
-                timeout = task.spec.get("timeout")
-                return task.proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                _kill(task.proc)
-                task.error = "timed out"
-                return -1
-            finally:
-                if awake:
-                    awake.wait()
+                finally:
+                    if awake:
+                        awake.wait()
+                if rc != 0:
+                    if len(steps) > 1:
+                        task.error = f"step {i + 1} ({task.spec['steps'][i][0]}) exit code {rc}"
+                    return rc
+        text = (task.dir / "task.log").read_text(errors="replace")
+        for pattern in task.spec.get("fail_if", []):
+            if m := re.search(pattern, text, re.MULTILINE):
+                task.error = f"the output says it failed: {m.group(0)!r}"
+                return 1
+        return 0
 
     def _collect(self, task: Task) -> None:
         for name, fname in task.spec.get("outputs", {}).items():

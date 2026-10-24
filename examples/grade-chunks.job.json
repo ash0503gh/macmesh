@@ -1,0 +1,66 @@
+{
+  "name": "grade-chunks",
+  "workdir": "./macmesh-out/grade-chunks",
+  "tasks": [
+    {
+      "id": "f0000-0599",
+      "argv": [
+        "grade",
+        "export",
+        "{in:project}",
+        "{out:result}",
+        "--start",
+        "0",
+        "--end",
+        "600",
+        "--codec",
+        "prores",
+        "--relink",
+        "{indir}"
+      ],
+      "inputs": {
+        "project": "./Interview.gradeproject",
+        "m0001": "./Interview-source.mov"
+      },
+      "outputs": {
+        "result": "chunks/f0000-0599.mov"
+      },
+      "cost": 600
+    },
+    {
+      "id": "f0600-1199",
+      "argv": [
+        "grade",
+        "export",
+        "{in:project}",
+        "{out:result}",
+        "--start",
+        "600",
+        "--end",
+        "1200",
+        "--codec",
+        "prores",
+        "--relink",
+        "{indir}"
+      ],
+      "inputs": {
+        "project": "./Interview.gradeproject",
+        "m0001": "./Interview-source.mov"
+      },
+      "outputs": {
+        "result": "chunks/f0600-1199.mov"
+      },
+      "cost": 600
+    }
+  ],
+  "merge": [
+    {
+      "op": "concat_video",
+      "inputs": [
+        "chunks/f0000-0599.mov",
+        "chunks/f0600-1199.mov"
+      ],
+      "output": "Interview-graded.mov"
+    }
+  ]
+}
