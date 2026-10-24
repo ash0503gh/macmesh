@@ -42,7 +42,7 @@ import uuid
 from pathlib import Path
 
 from . import ai, config, jobspec, media, mesh, pairing, pki, profiles, teach, toolinfo
-from .planners import plan_app, plan_video
+from .planners import plan_app, plan_batch, plan_video
 from .planners.ai import MEDIA_EXT, plan_to_job, plan_with_agent, unsafe_reasons
 from .planners.app import probe_fps, probe_frames
 from .planners.range import NEEDS_FPS
@@ -207,9 +207,23 @@ class Control:
     # ---- jobs ------------------------------------------------------------
     def plan_job(self, spec: dict) -> dict:
         """spec: {"kind": "app", "path", "app"?, "start"?, "end"?, "vars"?, "chunk"?}
-               | {"kind": "video", "path", "preset"?, "vf"?}  plus "title"? and "macs"? (node ids)."""
+               | {"kind": "video", "path", "preset"?, "vf"?}
+               | {"kind": "batch", "files", "template"?, "out_ext"?, "name"?}
+               plus "title"? and "macs"? (node ids)."""
         out_root = Path(self.cfg.get("output_dir", "~/Movies/macmesh")).expanduser()
         kind, path = spec.get("kind"), spec.get("path")
+        if kind == "batch":
+            files = spec.get("files") or ([path] if path else [])
+            if not files:
+                raise ControlError("say which files to work on (files)")
+            stem = spec.get("name") or spec.get("title") or "batch"
+            workdir = Path(spec.get("workdir") or (out_root / ".work" / f"{stem}-{uuid.uuid4().hex[:6]}")).expanduser().resolve()
+            template = spec.get("template") or ["demucs-stem", "{in:file}", "{out:result}"]
+            out_ext = spec.get("out_ext", ".zip")
+            job = plan_batch(files, template, out_ext=out_ext, name=stem, workdir=str(workdir))
+            final_out = spec.get("workdir") or str(out_root / f"{stem} (macmesh)")
+            return {"job": jobspec.validate(job), "final": str(final_out)}
+
         if not path:
             raise ControlError("say which file to work on (path)")
         stem = Path(path).stem
@@ -236,7 +250,7 @@ class Control:
                              vf=spec.get("vf", ""), chunk_seconds=chunk, workdir=str(workdir))
             job.pop("final")
         else:
-            raise ControlError("kind is \"app\" or \"video\"")
+            raise ControlError("kind is \"app\", \"video\" or \"batch\"")
         # The result lands as "<name> (macmesh)" plus its own extension (or as a folder).
         return {"job": jobspec.validate(job), "final": str(out_root / f"{stem} (macmesh)")}
 
@@ -291,8 +305,40 @@ class Control:
 
     def m_jobs(self) -> list:
         with self.lock:
-            jobs = sorted(self.jobs.values(), key=lambda j: j.created, reverse=True)
-        return [j.summary() for j in jobs]
+            jobs = [j.summary() for j in self.jobs.values()]
+        if self.worker:
+            with self.worker.lock:
+                wtasks = list(self.worker.tasks.values())
+            for t in wtasks:
+                inp = t.spec.get("inputs", {}).get("file", {})
+                fname = inp.get("filename") if isinstance(inp, dict) else ""
+                if not fname:
+                    fname = t.spec.get("task_id", "")
+                task_name = f"Lending: {Path(fname).stem}"
+                elapsed = round(t.elapsed(), 1)
+                is_done = t.state == "done"
+                is_running = t.state == "running"
+                jobs.append({
+                    "id": t.spec["task_id"],
+                    "name": task_name,
+                    "kind": "lending",
+                    "state": t.state,
+                    "path": fname,
+                    "done": 1 if is_done else 0,
+                    "tasks": 1,
+                    "progress": 1.0 if is_done else (0.5 if is_running else 0.0),
+                    "started": t.started or None,
+                    "finished": t.finished or None,
+                    "elapsed": elapsed,
+                    "eta": None,
+                    "speedup": None,
+                    "error": t.error,
+                    "macs": [{"name": self.cfg.get("node_name", "This Mac"), "done": 1 if is_done else 0, "running": 1 if is_running else 0}],
+                    "chunks": [{"state": t.state, "mac": self.cfg.get("node_name", "This Mac")}],
+                    "output": "",
+                    "created": t.started or time.time()
+                })
+        return sorted(jobs, key=lambda j: j.get("created") or j.get("started") or 0, reverse=True)
 
     def _job(self, id: str) -> Job:
         with self.lock:

@@ -80,6 +80,10 @@ class Server:
         if name == "inspect_file":
             return c.call("inspect", path=args["path"])
         if name == "start_job":
+            if args.get("kind") == "batch" or args.get("files"):
+                spec = {k: v for k, v in args.items() if v is not None}
+                spec.setdefault("kind", "batch")
+                return c.call("start", **spec)
             kind = c.call("inspect", path=args["path"])["kind"]
             spec = {"kind": kind, **{k: v for k, v in args.items() if v is not None}}
             if kind != "video":
