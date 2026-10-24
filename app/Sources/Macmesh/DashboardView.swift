@@ -295,39 +295,203 @@ struct MacsPage: View {
         }
         .toolbar {
             ToolbarItem {
-                Button { inviting = true; Task { await engine.invite() } } label: { Label("Add a Mac", systemImage: "plus.circle") }
-                    .disabled(engine.status?.holdsCa != true)
-                    .help(engine.status?.holdsCa == true ? "Show a code for a new Mac" : "Add Macs from the Mac that started the mesh")
+                Button {
+                    inviting = true
+                    if engine.status?.holdsCa == true { Task { await engine.invite() } }
+                } label: {
+                    Label("Add or Join Macs", systemImage: "plus.circle")
+                }
+                .help("Add Macs, Join a mesh, Start a new mesh, or Leave mesh")
             }
         }
-        .sheet(isPresented: $inviting) { InviteSheet().environment(engine) }
+        .sheet(isPresented: $inviting) { MeshSheet().environment(engine) }
     }
 }
 
-struct InviteSheet: View {
+struct MeshSheet: View {
     @Environment(Engine.self) private var engine
     @Environment(\.dismiss) private var dismiss
 
+    enum ActionTab: String, CaseIterable, Identifiable {
+        case invite = "Add Mac"
+        case join = "Join Mesh"
+        case start = "Start Mesh"
+        case leave = "Leave Mesh"
+        var id: Self { self }
+    }
+
+    @State private var tab: ActionTab = .invite
+    @State private var code = ""
+    @State private var host = ""
+    @State private var name = Host.current().localizedName ?? ""
+    @State private var busy = false
+    @State private var error: String?
+    @State private var confirmLeave = false
+
     var body: some View {
-        let invite = engine.status?.invite
-        VStack(spacing: 14) {
-            Image(systemName: "link.circle").font(.system(size: 36)).foregroundStyle(.secondary)
-            Text("Add a Mac").font(.title2).fontWeight(.semibold)
-            if invite?.state == "paired" {
-                Label("\(invite?.joined ?? "The Mac") joined the mesh", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-            } else if invite?.state == "failed" {
-                Text(invite?.error ?? "The invite didn't work.").foregroundStyle(.orange)
-            } else if let code = invite?.code {
-                Text("On the new Mac, open macmesh, choose Join a mesh and enter:").foregroundStyle(.secondary)
-                Text(code).font(.system(size: 30, weight: .medium, design: .monospaced)).textSelection(.enabled)
-                Text("The code works once, for 10 minutes.").font(.caption).foregroundStyle(.secondary)
-            } else {
-                ProgressView()
+        VStack(spacing: 16) {
+            Picker("Action", selection: $tab) {
+                if engine.status?.holdsCa == true {
+                    Text("Add a Mac").tag(ActionTab.invite)
+                }
+                Text("Join a Mesh").tag(ActionTab.join)
+                Text("Start a Mesh").tag(ActionTab.start)
+                Text("Leave Mesh").tag(ActionTab.leave)
             }
-            Button("Done") { dismiss() }.keyboardShortcut(.defaultAction).padding(.top, 6)
+            .pickerStyle(.segmented)
+            .padding(.top, 4)
+
+            Group {
+                switch tab {
+                case .invite:
+                    inviteView
+                case .join:
+                    joinView
+                case .start:
+                    startView
+                case .leave:
+                    leaveView
+                }
+            }
+            .frame(minHeight: 180)
+
+            if let error {
+                Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.callout)
+            }
+
+            HStack {
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
         }
-        .padding(28)
-        .frame(width: 420)
+        .padding(24)
+        .frame(width: 480)
+        .onAppear {
+            if engine.status?.holdsCa != true {
+                tab = .join
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var inviteView: some View {
+        let invite = engine.status?.invite
+        VStack(spacing: 12) {
+            Image(systemName: "plus.circle").font(.system(size: 32)).foregroundStyle(Color.accentColor)
+            Text("Invite Another Mac").font(.headline)
+            if invite?.state == "paired" {
+                Label("\(invite?.joined ?? "The Mac") joined the mesh!", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+            } else if invite?.state == "failed" {
+                Text(invite?.error ?? "The invite failed.").foregroundStyle(.orange)
+            } else if let c = invite?.code {
+                Text("On the other Mac, open macmesh, choose Join a mesh and enter:").foregroundStyle(.secondary).font(.callout).multilineTextAlignment(.center)
+                Text(c).font(.system(size: 26, weight: .semibold, design: .monospaced)).textSelection(.enabled)
+                Text("Code valid for 10 minutes.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ProgressView("Generating invite code…")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var joinView: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "link.circle").font(.system(size: 32)).foregroundStyle(Color.accentColor)
+            Text("Join Another Mesh").font(.headline)
+            Text("Enter the 12-character code shown on the other Mac:").foregroundStyle(.secondary).font(.callout)
+            Form {
+                TextField("Code", text: $code, prompt: Text("4HDG-X1PN-Q5VP"))
+                    .font(.system(.body, design: .monospaced))
+                TextField("Address (optional, e.g. 192.168.0.103)", text: $host)
+                TextField("This Mac's Name", text: $name)
+            }
+            .formStyle(.grouped)
+            .scrollDisabled(true)
+
+            Button(busy ? "Joining…" : "Join Mesh") {
+                Task { await doJoin() }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(busy || code.trimmingCharacters(in: .whitespaces).count < 12)
+        }
+    }
+
+    @ViewBuilder
+    private var startView: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "crown").font(.system(size: 32)).foregroundStyle(Color.accentColor)
+            Text("Start a New Mesh").font(.headline)
+            Text("Make this Mac the Certificate Authority and invite others.").foregroundStyle(.secondary).font(.callout)
+            Form {
+                TextField("Mesh Name / Mac Name", text: $name)
+            }
+            .formStyle(.grouped)
+            .scrollDisabled(true)
+
+            Button(busy ? "Starting…" : "Start New Mesh") {
+                Task { await doStart() }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(busy)
+        }
+    }
+
+    @ViewBuilder
+    private var leaveView: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "xmark.shield").font(.system(size: 32)).foregroundStyle(.red)
+            Text("Leave / Revoke Current Mesh").font(.headline)
+            Text("Leaving this mesh removes its paired certificate so you can join a different mesh or start your own.")
+                .foregroundStyle(.secondary).font(.callout).multilineTextAlignment(.center)
+
+            Button("Leave Mesh", role: .destructive) {
+                confirmLeave = true
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
+            .disabled(busy)
+        }
+        .confirmationDialog("Leave this mesh?", isPresented: $confirmLeave) {
+            Button("Leave Mesh", role: .destructive) {
+                Task { await doLeave() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This Mac will disconnect from all other Macs on this mesh.")
+        }
+    }
+
+    private func doJoin() async {
+        busy = true; error = nil
+        defer { busy = false }
+        do {
+            try await engine.join(code: code, host: host, name: name, force: true)
+            dismiss()
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func doStart() async {
+        busy = true; error = nil
+        defer { busy = false }
+        do {
+            try await engine.createMesh(name: name, force: true)
+            dismiss()
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func doLeave() async {
+        busy = true; error = nil
+        defer { busy = false }
+        do {
+            try await engine.createMesh(name: name, force: true)
+            dismiss()
+        } catch {
+            self.error = error.localizedDescription
+        }
     }
 }
 

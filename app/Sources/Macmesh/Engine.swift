@@ -227,9 +227,10 @@ final class Engine {
     }
 
     /// First Mac: start a new mesh. Then the daemon can run.
-    func createMesh(name: String) async throws {
+    func createMesh(name: String, force: Bool = false) async throws {
         guard let location else { throw ControlClient.Failure.engine("the engine is missing from this app") }
         var args = ["init"]
+        if force { args.append("--force") }
         if !name.isEmpty { args += ["--name", name] }
         _ = try await location.run(args)
         phase = .starting
@@ -237,9 +238,10 @@ final class Engine {
     }
 
     /// Any other Mac: join with the code shown by `invite` on the first one.
-    func join(code: String, host: String, name: String) async throws {
+    func join(code: String, host: String, name: String, force: Bool = false) async throws {
         guard let location else { throw ControlClient.Failure.engine("the engine is missing from this app") }
         var args = ["join", code.trimmingCharacters(in: .whitespaces)]
+        if force { args.append("--force") }
         if !host.isEmpty { args += ["--host", host] }
         if !name.isEmpty { args += ["--name", name] }
         _ = try await location.run(args)
