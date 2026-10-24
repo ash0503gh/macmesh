@@ -15,6 +15,8 @@ struct MeshStatus: Decodable, Equatable {
     var holdsCa: Bool
     var fingerprint: String
     var outputDir: String
+    var mesh: String?
+    var firewall: Firewall?
     var invite: Invite
     var macs: [Mac]
     var jobs: [Job]
@@ -25,6 +27,22 @@ struct MeshStatus: Decodable, Equatable {
         var expires: Double?
         var joined: String?
         var error: String?
+        var requests: [JoinRequest]?
+    }
+
+    /// A Mac asking to join (on the Mac that started the mesh): allow it if the numbers match.
+    struct JoinRequest: Decodable, Equatable, Identifiable {
+        var id: String
+        var name: String
+        var number: String
+        var age: Int?
+    }
+
+    struct Firewall: Decodable, Equatable {
+        var on: Bool
+        var blockAll: Bool
+        var blocked: Bool
+        var program: String
     }
 }
 
@@ -84,7 +102,7 @@ struct Job: Decodable, Equatable, Identifiable {
         var mac: String
     }
 
-    var isActive: Bool { ["starting", "running", "merging"].contains(state) }
+    var isActive: Bool { ["starting", "running", "merging", "paused"].contains(state) }
 }
 
 struct AppProfile: Decodable, Equatable, Identifiable {
@@ -133,7 +151,9 @@ enum Format {
     static func jobState(_ job: Job) -> String {
         switch job.state {
         case "starting": return "Finding Macs…"
-        case "running": return job.eta.map { "\(duration($0)) left" } ?? "Starting chunks…"
+        case "running" where job.kind == "lending": return "Working · \(job.tasks) \(job.tasks == 1 ? "chunk" : "chunks")"
+        case "paused": return "Paused while you use this Mac"
+        case "running": return job.eta.map { "About \(duration($0)) left" } ?? (job.done > 0 ? "Working…" : "Measuring speed…")
         case "merging": return "Joining the pieces…"
         case "done": return "Done in \(duration(job.elapsed))"
         case "cancelled": return "Cancelled"
@@ -204,4 +224,12 @@ struct AiResult: Decodable, Equatable {
     var summary: String?
     var fix: String?
     var `where`: String?
+}
+
+/// A mesh found on the network that can take this Mac (its first Mac is running macmesh).
+struct NearbyMesh: Decodable, Equatable, Identifiable {
+    var name: String
+    var addresses: [String]
+    var mesh: String
+    var id: String { mesh.isEmpty ? name : mesh }
 }

@@ -33,6 +33,7 @@ struct DashboardView: View {
         } detail: {
             detail
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .safeAreaInset(edge: .top, spacing: 0) { banners }
                 .navigationTitle(page.rawValue)
                 .toolbar {
                     ToolbarItem(placement: .primaryAction) {
@@ -55,8 +56,8 @@ struct DashboardView: View {
         .onReceive(NotificationCenter.default.publisher(for: .macmeshOpenFiles)) { _ in
             if let url = AppDelegate.pendingFiles.popLast() { dropped = url; newJob = true; page = .jobs }
         }
-        .onAppear { engine.watching = true; engine.launch() }
-        .onDisappear { engine.watching = false }
+        .onAppear { engine.watch("dashboard", true); engine.launch() }
+        .onDisappear { engine.watch("dashboard", false) }
     }
 
     @ViewBuilder
@@ -80,6 +81,21 @@ struct DashboardView: View {
             ContentUnavailableView("macmesh stopped", systemImage: "exclamationmark.triangle", description: Text(why))
         case .checking, .starting:
             ProgressView("Starting macmesh…").frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    /// A Mac asking to join, or the firewall in the way: above every page until dealt with.
+    @ViewBuilder
+    private var banners: some View {
+        if engine.phase == .running, let status = engine.status,
+           !(status.invite.requests ?? []).isEmpty || status.firewall?.blocked == true {
+            VStack(spacing: 8) {
+                ForEach(status.invite.requests ?? []) { JoinRequestBanner(request: $0) }
+                if let firewall = status.firewall, firewall.blocked { FirewallBanner(firewall: firewall) }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+            .background(.bar)
         }
     }
 
@@ -115,6 +131,7 @@ struct JobsPage: View {
                         LiveJob(job: job) { confirmCancel = job }
                     }
                 }
+                if !engine.lendingJobs.isEmpty { lending }
                 history
             }
             .padding(24)
@@ -128,6 +145,27 @@ struct JobsPage: View {
             Text("Every Mac stops its part. Finished chunks are thrown away.")
         }
         .sheet(item: $explaining) { job in ExplainSheet(job: job).environment(engine) }
+    }
+
+    /// Work this Mac is doing for your other Macs.
+    private var lending: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Helping other Macs").font(.headline)
+            ForEach(engine.lendingJobs) { job in
+                HStack(spacing: 10) {
+                    Image(systemName: job.state == "paused" ? "pause.circle" : "arrow.triangle.2.circlepath")
+                        .foregroundStyle(job.state == "paused" ? .orange : .secondary)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(job.name).lineLimit(1)
+                        Text(Format.jobState(job)).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if job.state == "running" { ProgressView().controlSize(.small) }
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.035)))
+            }
+        }
     }
 
     private var emptyState: some View {
@@ -213,8 +251,9 @@ struct LiveJob: View {
                 Spacer()
                 Button("Cancel", role: .destructive, action: onCancel)
             }
+            JobProgressBar(job: job)
             HStack(spacing: 12) {
-                metric("Done", "\(Int((job.progress * 100).rounded()))%")
+                metric("Done", job.progress == 0 && job.done == 0 ? "–" : "\(Int((job.progress * 100).rounded()))%")
                 metric("Time left", job.eta.map { Format.duration($0) } ?? "–")
                 metric("Faster by", job.speedup.map { "\($0.formatted())×" } ?? "–")
                 metric("Chunks", "\(job.done) of \(job.tasks)")
@@ -310,228 +349,82 @@ struct MacsPage: View {
 struct MeshSheet: View {
     @Environment(Engine.self) private var engine
     @Environment(\.dismiss) private var dismiss
-
-    enum ActionTab: String, CaseIterable, Identifiable {
-        case join = "Join Mesh"
-        case start = "Start Mesh"
-        case invite = "Add Mac"
-        case revoke = "Revoke / Leave"
-        var id: Self { self }
-    }
-
-    @State private var tab: ActionTab = .join
-    @State private var code = ""
-    @State private var host = ""
-    @State private var name = Host.current().localizedName ?? ""
-    @State private var busy = false
-    @State private var error: String?
+    @State private var showCode = false
     @State private var confirmLeave = false
+    @State private var revoking: Mac?
+    @State private var error: String?
 
     var body: some View {
-        VStack(spacing: 16) {
-            Picker("Action", selection: $tab) {
-                Text("Join Mesh").tag(ActionTab.join)
-                Text("Start Mesh").tag(ActionTab.start)
-                if engine.status?.holdsCa == true {
-                    Text("Add Mac").tag(ActionTab.invite)
-                }
-                Text("Revoke / Leave").tag(ActionTab.revoke)
-            }
-            .pickerStyle(.segmented)
-            .padding(.top, 4)
+        let status = engine.status
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Your mesh").font(.title2).fontWeight(.semibold)
+            if let firewall = status?.firewall, firewall.blocked { FirewallBanner(firewall: firewall) }
+            ForEach(status?.invite.requests ?? []) { JoinRequestBanner(request: $0) }
 
-            Group {
-                switch tab {
-                case .join:
-                    joinView
-                case .start:
-                    startView
-                case .invite:
-                    inviteView
-                case .revoke:
-                    revokeView
+            VStack(alignment: .leading, spacing: 6) {
+                SectionLabel("Add a Mac")
+                if status?.holdsCa == true {
+                    Text("On the other Mac, install macmesh and open it. It finds \u{201C}\(status?.name ?? "this Mac")\u{201D} on the network: click Join there, then Allow here when the numbers match.")
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let joined = status?.invite.joined {
+                        Label("\(joined) joined", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    }
+                    DisclosureGroup("Use a code instead", isExpanded: $showCode) {
+                        if let code = status?.invite.code {
+                            HStack {
+                                Text(code).font(.system(.title3, design: .monospaced)).textSelection(.enabled)
+                                Spacer()
+                                Text("On the other Mac: macmesh join \(code)").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            }
+                            .padding(.top, 4)
+                        } else {
+                            ProgressView().controlSize(.small).padding(.top, 4)
+                        }
+                    }
+                    .font(.callout)
+                    .onChange(of: showCode) { _, open in if open { Task { await engine.invite() } } }
+                } else {
+                    Text("New Macs are let in by the Mac that started this mesh: open macmesh there to allow them.")
+                        .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .frame(minHeight: 180)
 
-            if let error {
-                Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.callout)
+            VStack(alignment: .leading, spacing: 4) {
+                SectionLabel("Macs in this mesh")
+                ForEach(status?.macs ?? []) { mac in
+                    HStack {
+                        MacRow(mac: mac)
+                        if !mac.thisMac {
+                            Button("Remove…", role: .destructive) { revoking = mac }.controlSize(.small)
+                        }
+                    }
+                }
             }
 
             HStack {
+                Button("Leave this mesh…", role: .destructive) { confirmLeave = true }
                 Spacer()
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }
+            if let error { Text(error).font(.callout).foregroundStyle(.orange) }
         }
         .padding(24)
-        .frame(width: 480)
-        .onAppear {
-            if let status = engine.status {
-                if !status.holdsCa || status.macs.count <= 1 {
-                    tab = .join
-                } else {
-                    tab = .invite
-                }
-            } else {
-                tab = .join
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var inviteView: some View {
-        let invite = engine.status?.invite
-        VStack(spacing: 12) {
-            Image(systemName: "plus.circle").font(.system(size: 32)).foregroundStyle(Color.accentColor)
-            Text("Invite Another Mac").font(.headline)
-            if invite?.state == "paired" {
-                Label("\(invite?.joined ?? "The Mac") joined the mesh!", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-            } else if invite?.state == "failed" {
-                Text(invite?.error ?? "The invite failed.").foregroundStyle(.orange)
-            } else if let c = invite?.code {
-                Text("On the other Mac, open macmesh, choose Join a mesh and enter:").foregroundStyle(.secondary).font(.callout).multilineTextAlignment(.center)
-                Text(c).font(.system(size: 26, weight: .semibold, design: .monospaced)).textSelection(.enabled)
-                Text("Code valid for 10 minutes.").font(.caption).foregroundStyle(.secondary)
-            } else {
-                ProgressView("Generating invite code…")
-            }
-        }
-        .task {
-            if engine.status?.holdsCa == true && engine.status?.invite.code == nil {
-                await engine.invite()
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var joinView: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "link.circle").font(.system(size: 32)).foregroundStyle(Color.accentColor)
-            Text("Join Another Mesh").font(.headline)
-            Text("Enter the 12-character code shown on the other Mac:").foregroundStyle(.secondary).font(.callout)
-            Form {
-                TextField("Code", text: $code, prompt: Text("4HDG-X1PN-Q5VP"))
-                    .font(.system(.body, design: .monospaced))
-                TextField("Address (optional, e.g. 192.168.0.103)", text: $host)
-                TextField("This Mac's Name", text: $name)
-            }
-            .formStyle(.grouped)
-            .scrollDisabled(true)
-
-            Button(busy ? "Joining…" : "Join Mesh") {
-                Task { await doJoin() }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(busy || code.trimmingCharacters(in: .whitespaces).count < 12)
-        }
-    }
-
-    @ViewBuilder
-    private var startView: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "crown").font(.system(size: 32)).foregroundStyle(Color.accentColor)
-            Text("Start a New Mesh").font(.headline)
-            Text("Make this Mac the Certificate Authority and invite others.").foregroundStyle(.secondary).font(.callout)
-            Form {
-                TextField("Mesh Name / Mac Name", text: $name)
-            }
-            .formStyle(.grouped)
-            .scrollDisabled(true)
-
-            Button(busy ? "Starting…" : "Start New Mesh") {
-                Task { await doStart() }
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(busy)
-        }
-    }
-
-    @ViewBuilder
-    private var revokeView: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "xmark.shield").font(.system(size: 32)).foregroundStyle(.red)
-            Text("Revoke or Leave Mesh").font(.headline)
-
-            let peers = engine.status?.macs.filter { !$0.thisMac } ?? []
-            if !peers.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Connected Macs:").font(.subheadline).foregroundStyle(.secondary)
-                    ForEach(peers) { mac in
-                        HStack {
-                            VStack(alignment: .leading) {
-                                Text(mac.name).font(.system(.body, weight: .medium))
-                                Text(mac.chip ?? "Apple Silicon").font(.caption).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Button("Revoke", role: .destructive) {
-                                Task {
-                                    await engine.revoke(mac)
-                                    await engine.tick()
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        }
-                        .padding(.vertical, 4)
-                        Divider()
-                    }
-                }
-                .padding(.horizontal)
-            }
-
-            VStack(spacing: 8) {
-                Text("Leave / Reset This Mac").font(.subheadline).foregroundStyle(.secondary)
-                Text("Disconnects this Mac from the current mesh and resets its local certificate.")
-                    .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
-
-                Button("Leave Mesh", role: .destructive) {
-                    confirmLeave = true
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.red)
-                .disabled(busy)
-            }
-        }
+        .frame(width: 520)
         .confirmationDialog("Leave this mesh?", isPresented: $confirmLeave) {
-            Button("Leave Mesh", role: .destructive) {
-                Task { await doLeave() }
+            Button("Leave", role: .destructive) {
+                Task {
+                    do { try await engine.leave(); dismiss() } catch { self.error = error.localizedDescription }
+                }
             }
-            Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This Mac will disconnect from all other Macs on this mesh.")
+            Text("This Mac stops lending and borrowing, and forgets the mesh. You can join one again from the start screen.")
         }
-    }
-
-    private func doJoin() async {
-        busy = true; error = nil
-        defer { busy = false }
-        do {
-            try await engine.join(code: code, host: host, name: name, force: true)
-            dismiss()
-        } catch {
-            self.error = error.localizedDescription
-        }
-    }
-
-    private func doStart() async {
-        busy = true; error = nil
-        defer { busy = false }
-        do {
-            try await engine.createMesh(name: name, force: true)
-            dismiss()
-        } catch {
-            self.error = error.localizedDescription
-        }
-    }
-
-    private func doLeave() async {
-        busy = true; error = nil
-        defer { busy = false }
-        do {
-            try await engine.createMesh(name: name, force: true)
-            dismiss()
-        } catch {
-            self.error = error.localizedDescription
+        .confirmationDialog("Remove \(revoking?.name ?? "this Mac")?",
+                            isPresented: Binding(get: { revoking != nil }, set: { if !$0 { revoking = nil } }),
+                            presenting: revoking) { mac in
+            Button("Remove", role: .destructive) { Task { await engine.revoke(mac) }; revoking = nil }
+        } message: { _ in
+            Text("This Mac will refuse it from now on. Do the same on your other Macs.")
         }
     }
 }

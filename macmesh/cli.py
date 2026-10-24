@@ -166,6 +166,14 @@ def cmd_invite(args) -> int:
     if not pki.paths()["ca_key"].exists():
         print("This Mac doesn't hold the mesh's certificate authority; invite from the Mac you ran `macmesh init` on.")
         return 1
+    from .control import ControlClient, ControlError
+    try:  # the running engine already listens for new Macs: just ask it for a code
+        state = ControlClient().call("invite")
+        print(f"\nOn the new Mac, run:\n\n  macmesh join {state['code']}\n")
+        print("(or open macmesh there and click Join: you'll approve it in the app here)", flush=True)
+        return 0
+    except ControlError:
+        pass
     code = pairing.new_code()
     port = args.port or int(cfg["port"]) + 1
     invite = pairing.Invite(cfg, code, port)
@@ -182,32 +190,72 @@ def cmd_invite(args) -> int:
     return 0
 
 
+def cmd_nearby(args) -> int:
+    """Meshes on the network that can take this Mac (their first Mac is running macmesh)."""
+    found = discovery.browse_services(args.seconds, PAIR_SERVICE_TYPE)
+    if args.json:
+        print(json.dumps([{"name": f["name"], "addresses": f["addresses"], "mesh": f["props"].get("mesh", "")}
+                          for f in found]))
+    elif not found:
+        print("No meshes found nearby. Is macmesh open on the first Mac, on this network?")
+    else:
+        for f in found:
+            print(f"{f['name']:<30} {', '.join(f['addresses'])}")
+    return 0
+
+
+def _emit(args, event: str, **fields) -> None:
+    if getattr(args, "json", False):
+        print(json.dumps({"event": event, **fields}), flush=True)
+
+
 def cmd_join(args) -> int:
     p = config.config_path()
     cfg = config.load() if p.exists() else config.defaults()
     if p.exists() and pki.ready() and not args.force:
         print("This Mac already belongs to a mesh. Use --force to leave it and join another.")
         return 1
+    if not args.code and not args.request:
+        raise ValueError("give the code from `macmesh invite`, or --request to ask the other Mac to let you in")
     _apply_init_args(cfg, args)
     if args.host:
-        address = args.host if ":" in args.host else f"{args.host}:{int(cfg['port']) + 1}"
+        addresses = [h if ":" in h.replace("::", "") else f"{h}:{int(cfg['port']) + 1}" for h in args.host.split(",")]
+        to = args.host
     else:
-        found = discovery.browse(3.0, PAIR_SERVICE_TYPE)
+        found = discovery.browse_services(4.0, PAIR_SERVICE_TYPE)
         if not found:
-            print("No open invite found. Run `macmesh invite` on the first Mac, or pass --host <address>.")
-            return 1
+            raise ValueError("no mesh found nearby. Open macmesh on the first Mac (same network), or pass --host <address>")
         if len(found) > 1:
-            print("More than one Mac is inviting: " + ", ".join(found) + ". Pick one with --host.")
-            return 1
-        address = found[0]
+            raise ValueError("more than one mesh is nearby: " + ", ".join(f["name"] for f in found) + ". Pick one with --host.")
+        addresses, to = found[0]["addresses"], found[0]["name"]
     if args.force:
         shutil.rmtree(pki.paths()["dir"], ignore_errors=True)
-    pairing.join(cfg, args.code, address)
+    if args.request:
+        def show(number: str) -> None:
+            _emit(args, "number", number=number, to=to)
+            if not args.json:
+                print(f"\nOn {to}, check that it shows {number}, then click Allow.\n", flush=True)
+        pairing.request_join(cfg, addresses, on_number=show)
+    else:
+        pairing.join(cfg, args.code, addresses)
     config.save(cfg)
-    print(f"Joined the mesh through {address}.")
-    print(f"node:   {cfg['node_name']} ({cfg['node_id']})")
-    print(f"cert:   {pki.own_fingerprint()}")
-    print("Now run `macmesh serve` here.")
+    _emit(args, "joined", to=to, node_id=cfg["node_id"])
+    if not args.json:
+        print(f"Joined the mesh through {to}.")
+        print(f"node:   {cfg['node_name']} ({cfg['node_id']})")
+        print("Now run `macmesh serve` here (the app does this for you).")
+    return 0
+
+
+def cmd_leave(args) -> int:
+    """Leave the mesh: forget its certificate and token. Apps you taught macmesh stay."""
+    p = config.config_path()
+    if not p.exists():
+        print("This Mac isn't in a mesh.")
+        return 0
+    shutil.rmtree(pki.paths()["dir"], ignore_errors=True)
+    p.unlink()
+    print("Left the mesh. Start a new one or join another with the app (or `macmesh init` / `macmesh join`).")
     return 0
 
 
@@ -390,11 +438,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, help="pairing port (default: worker port + 1)")
     p.set_defaults(fn=cmd_invite)
 
-    p = sub.add_parser("join", help="join a mesh with the code from `macmesh invite`")
-    p.add_argument("code")
-    p.add_argument("--host", help="the inviting Mac's address[:port], if Bonjour can't find it")
+    p = sub.add_parser("join", help="join a mesh: ask to be let in (--request), or with a code from `macmesh invite`")
+    p.add_argument("code", nargs="?")
+    p.add_argument("--request", action="store_true", help="ask the first Mac to let this one in (approve it there)")
+    p.add_argument("--host", help="the first Mac's address[:port] (comma-separated to try several)")
+    p.add_argument("--json", action="store_true", help="print progress as JSON lines (for the app)")
     node_opts(p)
     p.set_defaults(fn=cmd_join)
+
+    p = sub.add_parser("nearby", help="meshes on this network that can take this Mac")
+    p.add_argument("--seconds", type=float, default=3.0)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_nearby)
+
+    p = sub.add_parser("leave", help="leave the mesh (forget its certificate and token)")
+    p.set_defaults(fn=cmd_leave)
 
     p = sub.add_parser("revoke", help="refuse a Mac's certificate from now on (run on every Mac)")
     p.add_argument("fingerprint")

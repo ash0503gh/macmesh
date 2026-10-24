@@ -61,13 +61,16 @@ enum Snapshots {
                                                      where: "another Mac"),
                                     error: "", awaitingOk: false)
 
-    static func status(jobs: [Job], macs: [Mac]? = nil, paused: Int = 0) -> MeshStatus {
+    static func status(jobs: [Job], macs: [Mac]? = nil, paused: Int = 0, requests: Bool = false,
+                       blockedFirewall: Bool = false) -> MeshStatus {
         let macs = macs ?? Self.macs
         return MeshStatus(nodeId: "ashwinsmacbookpro", name: "Ashwin's MacBook Pro", lend: true, accepting: true, reason: "",
                    running: 2, paused: paused, ownerMode: "shared", tls: true, holdsCa: true,
                    fingerprint: "0b4109f4ba1c7033bf0ac00db1c03e381d2d4f9a1864c0d393d8efde5d1aeeaa",
-                   outputDir: "/Users/me/Movies/macmesh",
-                   invite: .init(code: "7K2Q-M9XD-4TRA", state: "waiting", expires: nil, joined: nil, error: nil),
+                   outputDir: "/Users/me/Movies/macmesh", mesh: "0b4109f4ba1c",
+                   firewall: .init(on: true, blockAll: false, blocked: blockedFirewall, program: "/Applications/macmesh.app/Contents/Resources/engine/python/bin/python3.13"),
+                   invite: .init(code: "7K2Q-M9XD-4TRA", state: "waiting", expires: nil, joined: nil, error: nil,
+                                 requests: requests ? [.init(id: "r1", name: "Riya's MacBook", number: "736 487", age: 4)] : []),
                    macs: macs, jobs: jobs)
     }
 
@@ -121,6 +124,16 @@ enum Snapshots {
                                    .environment(engine(working)))),
             ("explain", AnyView(ExplainSheet(job: finished[1], task: explainTask).environment(engine(working)))),
             ("menubar-working", AnyView(PopoverView().environment(engine(working)))),
+            ("setup-nearby", AnyView(OnboardingView(nearby: [NearbyMesh(name: "Ashwin's MacBook Pro", addresses: ["192.168.0.103:7478"], mesh: "0b41")],
+                                                    searching: false).environment(engine(nil, phase: .needsSetup)))),
+            ("setup-number", AnyView(OnboardingView(nearby: [], searching: false,
+                                                    joining: NearbyMesh(name: "Ashwin's MacBook Pro", addresses: [], mesh: "0b41"),
+                                                    number: "736 487").environment(engine(nil, phase: .needsSetup)))),
+            ("mesh-sheet", AnyView(MeshSheet().environment(engine(status(jobs: [], requests: true))))),
+            ("dashboard-request", dash(.jobs, engine(status(jobs: finished, requests: true, blockedFirewall: true)))),
+            ("dashboard-request-only", dash(.jobs, engine(status(jobs: finished, requests: true)))),
+            ("dashboard-firewall-only", dash(.jobs, engine(status(jobs: finished, blockedFirewall: true)))),
+            ("menubar-request", AnyView(PopoverView().environment(engine(status(jobs: [], requests: true))))),
             ("menubar-idle", AnyView(PopoverView().environment(engine(idle)))),
         ]
         NSApplication.shared.setActivationPolicy(.prohibited)
@@ -130,8 +143,10 @@ enum Snapshots {
             // drawing, which needs no screen recording permission.
             let host = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)))
             host.frame.size = host.fittingSize
+            // Dashboards get a real titled window (as in the app); sheets and popovers a plain one.
+            let style: NSWindow.StyleMask = name.hasPrefix("dashboard") ? [.titled, .closable, .resizable] : [.borderless]
             let window = NSWindow(contentRect: NSRect(origin: NSPoint(x: -10_000, y: -10_000), size: host.fittingSize),
-                                  styleMask: [.borderless], backing: .buffered, defer: false)
+                                  styleMask: style, backing: .buffered, defer: false)
             window.contentView = host
             window.orderFrontRegardless()
             RunLoop.main.run(until: Date().addingTimeInterval(0.6))

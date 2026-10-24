@@ -360,9 +360,16 @@ class ResilienceTests(MeshCase):
         try:
             self.nodes[1] = Node(self.tmp, "air2", self.tools, owner={"mode": "shared", "yield_after": 0.3},
                                  owner_sample=lambda ours: {"cpu": busy["cpu"], "gpu": None, "idle": None})
-            os.environ["FAKE_DELAY"] = "0.3"
+            os.environ["FAKE_DELAY"] = "0.6"
             lines = []
-            threading.Timer(1.0, lambda: busy.update(cpu=0.9)).start()
+            air = self.nodes[1].worker
+
+            def busy_mid_task():
+                while not any(t.state == "running" and t.proc for t in list(air.tasks.values())):
+                    time.sleep(0.01)
+                busy.update(cpu=0.9)
+
+            threading.Thread(target=busy_mid_task, daemon=True).start()
             result = self.run_job(self.range_job(frames=800), log=lines.append)
         finally:
             worker_module.OWNER_POLL = old_poll
@@ -519,10 +526,65 @@ class TLSTests(unittest.TestCase):
         self.assertEqual(self.cfg_b["token"], TOKEN)
 
     def test_wrong_code_is_refused(self):
-        with self.assertRaisesRegex(pairing.PairingError, "wrong code"):
+        with self.assertRaisesRegex(pairing.PairingError, "wrong or expired code"):
             self.pair(code_for_joiner=pairing.new_code())
         self.assertFalse(pki.ready(self.b))
         self.assertNotEqual(self.cfg_b["token"], TOKEN)
+
+    def request(self, decide: bool | None):
+        """Ask to join; the first Mac's side decides once the request shows up. Returns (numbers seen, error)."""
+        server = pairing.PairingServer(self.cfg_a, 0, home=self.a, host="127.0.0.1")
+        seen, error = {}, None
+
+        def first_mac():
+            for _ in range(100):
+                pending = server.pending()
+                if pending:
+                    seen["first"] = pending[0]["number"]
+                    seen["name"] = pending[0]["name"]
+                    if decide is not None:
+                        server.decide(pending[0]["id"], decide)
+                    return
+                time.sleep(0.05)
+
+        threading.Thread(target=first_mac, daemon=True).start()
+        try:
+            pairing.request_join(self.cfg_b, [f"127.0.0.1:{server.port}"], home=self.b,
+                                 on_number=lambda n: seen.update(new=n))
+        except pairing.PairingError as e:
+            error = str(e)
+        finally:
+            server.close()
+        return seen, error
+
+    def test_asking_to_join_and_being_let_in(self):
+        seen, error = self.request(True)
+        self.assertIsNone(error)
+        self.assertRegex(seen["new"], r"^\d{3} \d{3}$")
+        self.assertEqual(seen["new"], seen["first"])  # both Macs show the same number
+        self.assertEqual(seen["name"], self.cfg_b["node_name"])
+        self.assertTrue(pki.ready(self.b))
+        self.assertEqual(self.cfg_b["token"], TOKEN)
+
+    def test_a_refused_request_gets_nothing(self):
+        seen, error = self.request(False)
+        self.assertIn("didn't let this one in", error)
+        self.assertFalse(pki.ready(self.b))
+        self.assertNotEqual(self.cfg_b["token"], TOKEN)
+
+    def test_a_broken_commitment_is_refused(self):
+        server = pairing.PairingServer(self.cfg_a, 0, home=self.a, host="127.0.0.1")
+        try:
+            s, _ = pairing._connect([f"127.0.0.1:{server.port}"])
+            with s:
+                pairing._send(s, {"v": 2, "kind": "request", "node_id": "bbbb", "name": "x",
+                                  "csr": pki.new_csr("bbbb", self.b), "commit": "0" * 64})
+                pairing._read_line(s)
+                pairing._send(s, {"nj": "f" * 32})  # doesn't hash to the commitment
+                self.assertIn("commitment", pairing._read_line(s)["error"])
+            self.assertEqual(server.pending(), [])
+        finally:
+            server.close()
 
     def test_code_format(self):
         code = pairing.new_code()

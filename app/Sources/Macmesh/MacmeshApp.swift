@@ -22,9 +22,11 @@ struct MacmeshApp: App {
                 .environment(engine)
                 .onAppear { engine.launch() }
         } label: {
-            Image(systemName: engine.activeJobs.isEmpty ? "point.3.connected.trianglepath.dotted"
-                                                         : "point.3.filled.connected.trianglepath.dotted")
-                .accessibilityLabel(engine.activeJobs.isEmpty ? "macmesh" : "macmesh, a job is running")
+            Image(systemName: !(engine.status?.invite.requests ?? []).isEmpty ? "person.crop.circle.badge.plus"
+                              : engine.activeJobs.isEmpty ? "point.3.connected.trianglepath.dotted"
+                              : "point.3.filled.connected.trianglepath.dotted")
+                .accessibilityLabel(!(engine.status?.invite.requests ?? []).isEmpty ? "macmesh, a Mac wants to join"
+                                    : engine.activeJobs.isEmpty ? "macmesh" : "macmesh, a job is running")
                 .onAppear {
                     engine.launch()
                     delegate.engine = engine

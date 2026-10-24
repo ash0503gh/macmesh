@@ -41,6 +41,34 @@ struct EngineLocation {
         return p
     }
 
+    /// Runs a command, handing each line it prints to `line` as it comes; throws with its last error line.
+    func stream(_ arguments: [String], line: @escaping @Sendable (String) -> Void) async throws {
+        try await Task.detached {
+            let p = process(arguments)
+            let out = Pipe(), err = Pipe()
+            p.standardOutput = out
+            p.standardError = err
+            p.standardInput = FileHandle.nullDevice
+            try p.run()
+            var buffer = Data()
+            while true {
+                let chunk = out.fileHandleForReading.availableData
+                if chunk.isEmpty { break }
+                buffer.append(chunk)
+                while let newline = buffer.firstIndex(of: 0x0A) {
+                    line(String(decoding: buffer[..<newline], as: UTF8.self))
+                    buffer.removeSubrange(...newline)
+                }
+            }
+            p.waitUntilExit()
+            guard p.terminationStatus == 0 else {
+                let text = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                throw ControlClient.Failure.engine(text.split(separator: "\n").last.map(String.init)?
+                    .replacingOccurrences(of: "error: ", with: "") ?? "it stopped with status \(p.terminationStatus)")
+            }
+        }.value
+    }
+
     /// Runs a one-off command (init, join) and returns its output; throws with what it printed.
     func run(_ arguments: [String]) async throws -> String {
         try await Task.detached {
@@ -74,8 +102,13 @@ final class Engine {
     var apps: [AppProfile] = []
     var ai: AiInfo?
     var notice: String?
-    /// Polled quickly while someone is looking or a job runs.
-    var watching = false
+    /// Views on screen that want quick updates; polled every second while any is open or a job runs.
+    private var watchers: Set<String> = []
+    var watching: Bool { !watchers.isEmpty }
+
+    func watch(_ view: String, _ on: Bool) {
+        if on { watchers.insert(view) } else { watchers.remove(view) }
+    }
     /// Off for sample data (snapshots): nothing is polled or started.
     var live = true
 
@@ -89,12 +122,18 @@ final class Engine {
         self.location = location
     }
 
+    var home: String { (client.socketPath as NSString).deletingLastPathComponent }
+
+    /// Set up means in a mesh: a config and this Mac's certificate.
     var configExists: Bool {
-        FileManager.default.fileExists(atPath: (client.socketPath as NSString).deletingLastPathComponent + "/config.json")
+        FileManager.default.fileExists(atPath: home + "/config.json") && FileManager.default.fileExists(atPath: home + "/tls/node.crt")
     }
 
-    var activeJobs: [Job] { status?.jobs.filter(\.isActive) ?? [] }
-    var recentJobs: [Job] { Array((status?.jobs.filter { !$0.isActive } ?? []).prefix(3)) }
+    /// This Mac's own jobs that are running.
+    var activeJobs: [Job] { status?.jobs.filter { $0.isActive && $0.kind != "lending" } ?? [] }
+    var recentJobs: [Job] { Array((status?.jobs.filter { !$0.isActive && $0.kind != "lending" } ?? []).prefix(3)) }
+    /// Work this Mac is doing for other Macs right now.
+    var lendingJobs: [Job] { status?.jobs.filter { $0.kind == "lending" } ?? [] }
     var otherMacs: [Mac] { status?.macs.filter { !$0.thisMac } ?? [] }
 
     func launch() {
@@ -102,7 +141,7 @@ final class Engine {
         poller = Task { [weak self] in
             while let self, !Task.isCancelled {
                 await self.tick()
-                let busy = self.watching || !self.activeJobs.isEmpty
+                let busy = self.watching || !self.activeJobs.isEmpty || !self.lendingJobs.isEmpty
                 try? await Task.sleep(for: .seconds(busy ? 1 : 5))
             }
         }
@@ -229,12 +268,71 @@ final class Engine {
         await tick()
     }
 
-    /// First Mac: start a new mesh. Then the daemon can run.
-    func createMesh(name: String, force: Bool = false) async throws {
+    // ---- joining and leaving ---------------------------------------------------
+    /// Meshes nearby that can take this Mac (works before this Mac is set up).
+    func nearby() async -> [NearbyMesh] {
+        guard let location, let text = try? await location.run(["nearby", "--json", "--seconds", "3"]),
+              let line = text.split(separator: "\n").last(where: { $0.hasPrefix("[") }) else { return [] }
+        return (try? JSONDecoder().decode([NearbyMesh].self, from: Data(line.utf8))) ?? []
+    }
+
+    /// Ask a mesh's first Mac to let this one in. `onNumber` gets the number to compare;
+    /// returns once someone clicks Allow there (or throws).
+    func requestJoin(_ mesh: NearbyMesh, name: String, onNumber: @escaping @MainActor (String) -> Void) async throws {
         guard let location else { throw ControlClient.Failure.engine("the engine is missing from this app") }
+        await stopEngine()
+        var args = ["join", "--request", "--json", "--force", "--host", mesh.addresses.joined(separator: ",")]
+        if !name.isEmpty { args += ["--name", name] }
+        try await location.stream(args) { line in
+            guard let data = line.data(using: .utf8),
+                  let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  event["event"] as? String == "number", let number = event["number"] as? String else { return }
+            Task { @MainActor in onNumber(number) }
+        }
+        phase = .starting
+        await tick()
+    }
+
+    /// Leave the mesh: this Mac forgets its certificate and token, and setup starts again.
+    func leave() async throws {
+        guard let location else { throw ControlClient.Failure.engine("the engine is missing from this app") }
+        await stopEngine()
+        _ = try await location.run(["leave"])
+        status = nil
+        phase = .needsSetup
+    }
+
+    func approve(_ request: MeshStatus.JoinRequest, allow: Bool) async {
+        do { let _: MeshStatus.Invite = try await client.call("approve", ["id": request.id, "allow": allow]); await tick() } catch {
+            notice = error.localizedDescription
+        }
+    }
+
+    /// Lets the firewall pass the engine, through macOS's own administrator prompt.
+    func allowThroughFirewall() async {
+        guard let program = status?.firewall?.program else { return }
+        let tool = "/usr/libexec/ApplicationFirewall/socketfilterfw"
+        let quoted = "'" + program.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let script = "do shell script \"\(tool) --add \(quoted); \(tool) --unblockapp \(quoted)\" with administrator privileges"
+        var error: NSDictionary?
+        NSAppleScript(source: script)?.executeAndReturnError(&error)
+        if let error, (error[NSAppleScript.errorNumber] as? Int) != -128 {
+            notice = "Couldn't change the firewall: \(error[NSAppleScript.errorMessage] ?? "unknown error")"
+        }
+        await tick()
+    }
+
+    private func stopEngine() async {
         let _: [String: Bool]? = try? await client.call("stop")
         daemon?.terminate()
         daemon = nil
+        try? await Task.sleep(for: .milliseconds(500))
+    }
+
+    /// First Mac: start a new mesh. Then the daemon can run.
+    func createMesh(name: String, force: Bool = false) async throws {
+        guard let location else { throw ControlClient.Failure.engine("the engine is missing from this app") }
+        await stopEngine()
         var args = ["init"]
         if force { args.append("--force") }
         if !name.isEmpty { args += ["--name", name] }
@@ -246,9 +344,7 @@ final class Engine {
     /// Any other Mac: join with the code shown by `invite` on the first one.
     func join(code: String, host: String, name: String, force: Bool = false) async throws {
         guard let location else { throw ControlClient.Failure.engine("the engine is missing from this app") }
-        let _: [String: Bool]? = try? await client.call("stop")
-        daemon?.terminate()
-        daemon = nil
+        await stopEngine()
         var args = ["join", code.trimmingCharacters(in: .whitespaces)]
         if force { args.append("--force") }
         if !host.isEmpty { args += ["--host", host] }

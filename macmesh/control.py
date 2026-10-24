@@ -15,7 +15,9 @@ Methods:
   job {id} / cancel {id}  one job / stop it
   lend {on}               let other Macs use this one, or not (remembered)
   owner {mode}            "shared" (step aside when the owner is busy) or "idle" (only while away)
-  invite / revoke {fingerprint}
+  invite                  a one-time code for `macmesh join CODE` (the app's Join asks instead)
+  approve {id, allow}     let a Mac that asked to join in, or not (status.invite.requests)
+  revoke {fingerprint}
   ai / set_ai {agent?, autorun?}   which AI agent is used (Claude Code or Antigravity), autorun of safe plans
   plan {request, paths?, macs?}    an AI plan for a free-form request; safe ones start at once
   run_plan {id}                    start a plan that waited for a person's OK
@@ -41,7 +43,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import ai, config, jobspec, media, mesh, pairing, pki, profiles, teach, toolinfo
+from . import ai, config, firewall, jobspec, media, mesh, pairing, pki, profiles, teach, toolinfo
 from .planners import plan_app, plan_batch, plan_video
 from .planners.ai import MEDIA_EXT, plan_to_job, plan_with_agent, unsafe_reasons
 from .planners.app import probe_fps, probe_frames
@@ -80,9 +82,11 @@ class Job:
         done = sum(t.state == "done" for t in tasks)
         total = len(tasks) or len(self.job["tasks"])
         elapsed = (self.finished or time.time()) - self.started if self.started else 0.0
-        eta = None
-        if self.state == "running" and done:
-            eta = round(elapsed / done * (total - done))
+        progress, eta = (done / total if total else 0.0), None
+        if self.state == "running" and self.scheduler:
+            progress, eta = self.scheduler.estimate(elapsed)
+        elif self.state in ("merging", "done"):
+            progress = 1.0
         nodes, chunks = [], []
         if self.scheduler:
             names = {n.client.address: n.client.name for n in self.scheduler.nodes}
@@ -95,8 +99,8 @@ class Job:
         compute = sum(t.elapsed for t in tasks)
         return {"id": self.id, "name": self.name, "state": self.state, "error": self.error,
                 "output": self.output, "tasks": total, "done": done,
-                "progress": round(done / total, 3) if total else 0.0, "elapsed": round(elapsed, 1),
-                "eta": eta, "macs": nodes, "chunks": chunks, "created": self.created, "kind": self.spec.get("kind"),
+                "progress": round(progress, 3), "elapsed": round(elapsed, 1),
+                "eta": round(eta) if eta is not None else None, "macs": nodes, "chunks": chunks, "created": self.created, "kind": self.spec.get("kind"),
                 # Chunk time added up over wall time: how many Macs' worth of work ran at once.
                 "speedup": round(compute / elapsed, 1) if elapsed > 1 and compute else None,
                 "log": self.log[-20:]}
@@ -131,7 +135,9 @@ class Control:
         self.lock = threading.Lock()
         self.nodes: list = []
         self.nodes_at = 0.0
-        self.invite: dict = {}
+        self.pairing: pairing.PairingServer | None = None
+        self.pairing_ad = None
+        self.pairing_problem = ""
         self.stopped = threading.Event()
         threading.Thread(target=self._refresh_loop, daemon=True).start()
 
@@ -276,7 +282,8 @@ class Control:
             if not clients:
                 raise JobFailed("no Macs are available")
             record.scheduler = Scheduler(record.job, clients, log=record.log.append,
-                                         reference=toolinfo.fingerprints(self.cfg, self.home))
+                                         reference=toolinfo.fingerprints(self.cfg, self.home),
+                                         origin={"node_id": self.cfg["node_id"], "name": self.cfg["node_name"]})
             if record.cancel_requested:  # cancelled while the Macs were being found
                 raise JobFailed("cancelled")
             record.state, record.started = "running", time.time()
@@ -306,39 +313,35 @@ class Control:
     def m_jobs(self) -> list:
         with self.lock:
             jobs = [j.summary() for j in self.jobs.values()]
-        if self.worker:
-            with self.worker.lock:
-                wtasks = list(self.worker.tasks.values())
-            for t in wtasks:
-                inp = t.spec.get("inputs", {}).get("file", {})
-                fname = inp.get("filename") if isinstance(inp, dict) else ""
-                if not fname:
-                    fname = t.spec.get("task_id", "")
-                task_name = f"Lending: {Path(fname).stem}"
-                elapsed = round((t.finished or time.time()) - t.started, 1) if t.started else 0.0
-                is_done = t.state == "done"
-                is_running = t.state == "running"
-                jobs.append({
-                    "id": t.spec["task_id"],
-                    "name": task_name,
-                    "kind": "lending",
-                    "state": t.state,
-                    "path": fname,
-                    "done": 1 if is_done else 0,
-                    "tasks": 1,
-                    "progress": 1.0 if is_done else (0.5 if is_running else 0.0),
-                    "started": t.started or None,
-                    "finished": t.finished or None,
-                    "elapsed": elapsed,
-                    "eta": None,
-                    "speedup": None,
-                    "error": t.error,
-                    "macs": [{"name": self.cfg.get("node_name", "This Mac"), "done": 1 if is_done else 0, "running": 1 if is_running else 0}],
-                    "chunks": [{"state": t.state, "mac": self.cfg.get("node_name", "This Mac")}],
-                    "output": "",
-                    "created": t.started or time.time()
-                })
-        return sorted(jobs, key=lambda j: j.get("created") or j.get("started") or 0, reverse=True)
+        return sorted(jobs + self._lending(), key=lambda j: j.get("created") or 0, reverse=True)
+
+    def _lending(self) -> list:
+        """Work this Mac is doing for other Macs right now, one entry per job they asked for."""
+        if not self.worker:
+            return []
+        with self.worker.lock:
+            tasks = [t for t in self.worker.tasks.values() if t.state in ("queued", "running", "paused")]
+        groups: dict[str, dict] = {}
+        for t in tasks:
+            origin = t.spec.get("origin") or {}
+            if origin.get("node_id") == self.cfg["node_id"]:
+                continue  # this Mac's own jobs show as jobs
+            key = origin.get("job_id") or t.id.split("-")[0]
+            g = groups.setdefault(key, {
+                "id": f"lend-{key}", "kind": "lending", "state": "running", "error": "", "output": "",
+                "name": f"For {origin.get('name') or 'another Mac'}: {origin.get('job') or 'a job'}",
+                "tasks": 0, "done": 0, "progress": 0.0, "elapsed": 0.0, "eta": None, "speedup": None,
+                "created": t.started or time.time(), "chunks": [],
+                "macs": [{"name": self.cfg["node_name"], "done": 0, "running": 0}]})
+            g["tasks"] += 1
+            g["macs"][0]["running"] += t.state == "running"
+            g["chunks"].append({"state": "running" if t.state == "running" else "pending", "mac": self.cfg["node_name"]})
+            if t.started:
+                g["created"] = min(g["created"], t.started)
+                g["elapsed"] = round(max(g["elapsed"], time.time() - t.started), 1)
+            if t.state == "paused":
+                g["state"] = "paused"
+        return list(groups.values())
 
     def _job(self, id: str) -> Job:
         with self.lock:
@@ -386,39 +389,60 @@ class Control:
                 "owner_mode": self.cfg["owner"].get("mode"), "tls": bool(self.cfg.get("tls", True)),
                 "holds_ca": pki.paths(self.home)["ca_key"].exists(), "invite": self._invite_state(),
                 "fingerprint": pki.own_fingerprint(self.home) if pki.ready(self.home) else "",
+                "mesh": self._mesh_id(), "firewall": firewall.state(),
                 "output_dir": str(Path(self.cfg.get("output_dir", "~/Movies/macmesh")).expanduser()),
                 "macs": self.m_macs(), "jobs": self.m_jobs()[:10]}
 
     # ---- pairing ---------------------------------------------------------
+    def start_pairing(self, port: int | None = None, advertise: bool = True) -> None:
+        """On the Mac that holds the CA: listen for new Macs all the time, and say so over Bonjour."""
+        if self.pairing or not pki.paths(self.home)["ca_key"].exists():
+            return
+        try:
+            self.pairing = pairing.PairingServer(self.cfg, int(self.cfg["port"]) + 1 if port is None else port, self.home)
+        except OSError as e:
+            self.pairing_problem = f"can't listen for new Macs: {e}"
+            return
+        if advertise:
+            from . import PAIR_SERVICE_TYPE, discovery
+            self.pairing_ad = discovery.advertise(self.cfg, PAIR_SERVICE_TYPE, self.pairing.port,
+                                                  properties={"mesh": self._mesh_id()})
+
+    def _mesh_id(self) -> str:
+        p = pki.paths(self.home)["ca_crt"]
+        return pki.fingerprint_pem(p.read_text())[:12] if p.exists() else ""
+
+    def stop_pairing(self) -> None:
+        if self.pairing_ad:
+            self.pairing_ad.close()
+            self.pairing_ad = None
+        if self.pairing:
+            self.pairing.close()
+            self.pairing = None
+
     def _invite_state(self) -> dict:
-        return {k: v for k, v in self.invite.items() if k != "obj"}
+        if not self.pairing:
+            return {"code": None, "state": None, "expires": None, "joined": None, "error": self.pairing_problem or None,
+                    "requests": []}
+        code, expires = self.pairing.code_state()
+        recent = [j for j in self.pairing.joined if time.time() - j["at"] < 120]
+        return {"code": code, "state": "waiting" if code else ("paired" if recent else None),
+                "expires": expires or None, "joined": recent[-1]["name"] if recent else None,
+                "error": self.pairing.last_error or None, "requests": self.pairing.pending()}
 
     def m_invite(self) -> dict:
-        if not pki.paths(self.home)["ca_key"].exists():
-            raise ControlError("only the Mac that started the mesh can invite (run `macmesh init` there)")
-        if self.invite.get("state") == "waiting" and self.invite.get("expires", 0) > time.time():
-            return self._invite_state()
-        if "obj" in self.invite:
-            try:
-                self.invite["obj"].sock.close()
-            except Exception:
-                pass
-        code = pairing.new_code()
-        inv = pairing.Invite(self.cfg, code, int(self.cfg["port"]) + 1, home=self.home)
-        from . import PAIR_SERVICE_TYPE, discovery
-        ad = discovery.advertise(self.cfg, PAIR_SERVICE_TYPE, inv.port)
-        self.invite = {"code": code, "state": "waiting", "expires": time.time() + pairing.EXPIRY, "joined": "", "obj": inv}
+        """A one-time code, for joining from the command line (the app asks to join instead)."""
+        if not self.pairing:
+            raise ControlError(self.pairing_problem or "only the Mac that started the mesh can add Macs")
+        code, _ = self.pairing.code_state()
+        if not code:
+            self.pairing.set_code()
+        return self._invite_state()
 
-        def wait():
-            try:
-                self.invite.update(state="paired", joined=inv.wait())
-            except pairing.PairingError as e:
-                self.invite.update(state="failed", error=str(e))
-            finally:
-                if ad:
-                    ad.close()
-
-        threading.Thread(target=wait, daemon=True).start()
+    def m_approve(self, id: str, allow: bool) -> dict:
+        """Let a Mac that asked to join in, or not."""
+        if not self.pairing or not self.pairing.decide(id, allow):
+            raise ControlError("that request has gone (it may have timed out)")
         return self._invite_state()
 
     def m_revoke(self, fingerprint: str) -> dict:
@@ -546,7 +570,8 @@ class Control:
         return self._ai_task(id).summary()
 
     # ---- dispatch --------------------------------------------------------
-    METHODS = {"status", "macs", "apps", "inspect", "start", "jobs", "job", "cancel", "lend", "owner", "invite", "revoke", "stop",
+    METHODS = {"status", "macs", "apps", "inspect", "start", "jobs", "job", "cancel", "lend", "owner", "invite", "approve",
+               "revoke", "stop",
                "ai", "set_ai", "plan", "run_plan", "teach", "explain", "ai_task"}
 
     def call(self, method: str, params: dict):

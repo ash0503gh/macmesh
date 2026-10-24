@@ -83,7 +83,7 @@ class NodeState:
 class Scheduler:
     def __init__(self, job: dict, clients: list[NodeClient], log=print,
                  max_attempts: int = 3, speculate: bool = True, reference: dict | None = None,
-                 match: str = "version", keep_blobs: bool = False):
+                 match: str = "version", keep_blobs: bool = False, origin: dict | None = None):
         self.job = job
         self.job_id = uuid.uuid4().hex[:8]
         self.workdir = Path(job["workdir"]).expanduser().resolve()
@@ -103,6 +103,8 @@ class Scheduler:
         self.reference = reference
         self.match = match
         self.keep_blobs = keep_blobs
+        # Who asked for this job ({"node_id", "name"}): workers show it, and skip their own Mac's.
+        self.origin = dict(origin or {}, job=job["name"], job_id=self.job_id)
 
     # ---- public -------------------------------------------------------
     def run(self) -> dict:
@@ -165,6 +167,31 @@ class Scheduler:
         for node in self.nodes:
             for sha in shas:
                 node.client.delete_blob(sha)
+
+    def estimate(self, elapsed: float) -> tuple[float, float | None]:
+        """How much of the job is done (0-1) and the seconds left, counting how far running chunks
+        probably are from their time so far and their Mac's measured speed. No time left is given
+        until some Mac has a measured speed."""
+        now = time.time()
+        total = sum(t.spec["cost"] for t in self.tasks) or 1.0
+        known = any(n.speeds for n in self.nodes)
+        by_address = {n.client.address: n for n in self.nodes}
+        done = 0.0
+        for t in list(self.tasks):
+            cost = t.spec["cost"]
+            if t.state == "done":
+                done += cost
+            elif known and t.copies:
+                shares = []
+                for address, started in list(t.copies.items()):
+                    node = by_address.get(address)
+                    speed = self._speed(node) if node else 0
+                    if speed > 0:
+                        shares.append(min(0.95, (now - started) * speed / cost))
+                done += max(shares, default=0.0) * cost
+        progress = min(done / total, 1.0)
+        eta = elapsed * (total - done) / done if known and done > 0 and elapsed > 0 else None
+        return progress, eta
 
     def cancel(self) -> None:
         """Stop the job: run() raises JobFailed("cancelled") and the remote tasks are cancelled."""
@@ -294,6 +321,7 @@ class Scheduler:
             upload_s = time.time() - t0
             c.submit({
                 "task_id": remote_id, "steps": task.spec["steps"], "fail_if": task.spec.get("fail_if", []),
+                "origin": self.origin,
                 "inputs": inputs,
                 "outputs": {k: Path(v).name for k, v in task.spec["outputs"].items()},
                 "timeout": task.spec.get("timeout"),

@@ -662,6 +662,7 @@ def serve(cfg: dict, host: str = "0.0.0.0", advertise: bool = True) -> None:
 
     from . import control
     ctl = control.Control(cfg, worker)
+    ctl.start_pairing(advertise=advertise)
     try:
         ctl_server = control.serve(ctl)
     except (control.ControlError, OSError) as e:
@@ -689,6 +690,7 @@ def serve(cfg: dict, host: str = "0.0.0.0", advertise: bool = True) -> None:
     finally:
         worker.stopped.set()
         ctl.stopped.set()
+        ctl.stop_pairing()
         if ctl_server:
             ctl_server.shutdown()
             control.socket_path().unlink(missing_ok=True)

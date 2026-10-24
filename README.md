@@ -32,9 +32,16 @@ curl -fsSL https://raw.githubusercontent.com/ash0503gh/macmesh/main/install.sh |
 It downloads the latest release, checks it against its SHA-256, installs `macmesh.app` in
 Applications and opens it. Then:
 
-1. **On the first Mac:** choose *Start a mesh*. To add another Mac, go to *Macs*, then *Add a Mac*,
-   and a one-time code appears.
-2. **On every other Mac:** choose *Join a mesh* and enter that code.
+1. **On the first Mac:** choose *Start a mesh*.
+2. **On every other Mac:** the first Mac shows up under *Meshes nearby*. Click *Join*. A six-digit
+   number appears on both Macs; if they match, click *Allow* on the first Mac. No code to type.
+   (*Use a code instead* is there for networks where Bonjour doesn't get through.)
+
+The first time, macOS asks whether macmesh may find devices on your local network: allow it, or the
+Macs can't see each other. If the macOS firewall blocks incoming connections, macmesh says so and
+offers *Allow…* (it adds macmesh's engine to the firewall's allowed apps; macOS asks for an
+administrator's password). With *Block all incoming connections* on, no app can be reached, so
+turn that option off in Network → Firewall → Options.
 
 To download by hand instead, get `macmesh-macos-arm64.zip` from
 [Releases](https://github.com/ash0503gh/macmesh/releases/latest) and unzip it into Applications.
@@ -54,14 +61,14 @@ What each Mac needs for the work it shares:
 `app/` is a native macOS app (SwiftUI) on top of the engine:
 
 - **Dashboard window:** the sidebar has five pages.
-  - **Jobs:** the running job, with progress, time left, how much faster it is than one Mac, and a map of which Mac did which chunk. Below it, the job history with *Show in Finder*.
-  - **Macs:** every Mac on the mesh, with chip, cores, memory, power and what it's doing. *Add a Mac* shows a pairing code.
+  - **Jobs:** the running job, updated live, with progress (counting chunks still running), time left once each Mac's speed is measured, how much faster it is than one Mac, and a map of which Mac did which chunk. *Helping other Macs* lists work this Mac is doing for others. Below it, the job history with *Show in Finder*.
+  - **Macs:** every Mac on the mesh, with chip, cores, memory, power and what it's doing. *Your mesh* shows Macs asking to join (with the number to compare), how to add a Mac, *Remove…* and *Leave this mesh…*.
   - **Apps:** the app profiles, and whether this Mac has each app.
   - **Lending:** lend this Mac or not, *step aside when I need it* or *only while I'm away*, and open at login.
   - **Security:** encryption, this Mac's certificate, and removing a Mac.
 - **New job:** a sheet that opens from the toolbar, or when you drop a file on the window or open one with macmesh. macmesh recognises the project, its app and its length, asks for anything missing (an EffectCraft composition, say), lets you pick the Macs, and starts the job. Results land in `~/Movies/macmesh`.
 - **Menu bar icon:** what's running, *Lend this Mac*, and *Open macmesh*. It keeps lending going with the window closed.
-- **First run:** *Start a mesh* or *Join a mesh* with a code.
+- **First run:** the meshes found nearby, each with *Join*, and *Start a mesh* for the first Mac.
 
 The app carries its own Python and engine, so a Mac only needs the app. Build it with:
 
@@ -70,8 +77,10 @@ app/scripts/build-app.sh      # → app/build/macmesh.app (fetches a pinned, che
 app/scripts/package.sh        # → app/build/macmesh-macos-arm64.zip and .sha256, for a GitHub release
 ```
 
-`Macmesh --snapshot DIR [--dark]` renders every screen with sample data to PNGs, and
-`Macmesh --check` reads a running engine the way the app does.
+`Macmesh --snapshot DIR [--dark]` renders every screen with sample data to PNGs,
+`Macmesh --check` reads a running engine the way the app does, `Macmesh --watch SECONDS` prints
+the jobs as the app's live view sees them, and `Macmesh --join-nearby [name]` joins a nearby mesh
+the way the first-run screen does.
 
 Under the hood, `macmesh serve` listens on `~/.macmesh/control.sock` (only your user can open it). Jobs started there run inside the daemon, so the app, agents and the CLI all see the same jobs (`macmesh/control.py`).
 
@@ -88,7 +97,7 @@ claude mcp add macmesh -- /Applications/macmesh.app/Contents/Resources/engine/bi
 | Piece | What it does |
 |---|---|
 | `macmesh serve` | Worker daemon, run on every Mac. Advertises itself over Bonjour (`_macmesh._tcp`), accepts signed tasks over mutual TLS, runs them sandboxed at low priority, steps aside when the Mac's owner needs it, keeps the Mac awake with `caffeinate` while working. |
-| `macmesh init` / `invite` / `join` | Start a mesh (this Mac holds its certificate authority), then add Macs with a one-time code, like pairing a Bluetooth device. |
+| `macmesh init` / `nearby` / `join` / `leave` | Start a mesh (this Mac holds its certificate authority). Other Macs find it with `nearby` and `join --request`: both show the same six-digit number and the first Mac allows it, like pairing a Bluetooth device. `invite` / `join CODE` pair with a one-time code instead. `leave` forgets this Mac's mesh. |
 | Discovery | Zero-config over mDNS, the same mechanism AirDrop and AirPlay use for discovery. Static `--peer host:port` works too. |
 | Scheduler | **Pull-based**: each Mac takes the next chunk when it has room, so faster Macs naturally do more. Re-queues work when a Mac disappears, retries failures on a *different* Mac, and duplicates straggling chunks at the end of a job (first finisher wins). |
 | `macmesh video` | Splits a video at keyframes (lossless), encodes chunks across Macs, stitches with `-c copy`, then adds the original audio back in one pass. Frame-exact: tested to match the source's frame count with no seam errors. |
@@ -111,17 +120,21 @@ On the **first** Mac:
 
 ```sh
 macmesh init --slots 2        # starts a mesh; this Mac holds its certificate authority
-macmesh invite                # shows a one-time code such as 7K2Q-M9XD-4TRA and waits
+macmesh serve                 # also listens for Macs asking to join
 ```
 
 On the **second** Mac:
 
 ```sh
-macmesh join 7K2Q-M9XD-4TRA   # finds the inviting Mac over Bonjour (or add --host <address>)
+macmesh nearby                # lists the meshes on this network
+macmesh join --request        # asks to join; shows a number such as 736 487
 macmesh serve
 ```
 
-Then run `macmesh serve` on the first Mac too. Repeat `invite` / `join` for each extra Mac.
+On the first Mac, allow the request in the app when the numbers match (agents and scripts use the
+control socket's `approve`). Without the app, pair with a code instead: `macmesh invite` on the
+first Mac shows one such as 7K2Q-M9XD-4TRA, and `macmesh join 7K2Q-M9XD-4TRA` uses it (add
+`--host <address>` if Bonjour doesn't get through).
 
 From either Mac (in another terminal):
 
@@ -291,11 +304,18 @@ the next section). The AI works on the parts that have no rule yet:
   the mesh's CA on the first Mac. Workers and coordinators accept only
   certificates from that CA. `macmesh revoke <fingerprint>` (fingerprints are
   listed by `macmesh nodes`) cuts one Mac off; run it on every Mac.
-- **Pairing:** `join` sends its signing request over TLS. Both directions
-  carry an HMAC keyed by the one-time code over the inviter's certificate
-  fingerprint, so a machine in the middle can't pair or impersonate without
-  the code. The code is 60 random bits, single-use, expires in 10 minutes and
-  allows 3 wrong tries.
+- **Pairing by request (the default):** the joining Mac commits to a random
+  nonce, the first Mac answers with its own, then the joiner reveals its
+  nonce. Both Macs derive a six-digit number from the two nonces, the first
+  Mac's certificate fingerprint and the signing request. A machine in the
+  middle would have to fix its own nonce before seeing the other one, so it
+  gets the number to match only by a one-in-a-million guess, and nothing
+  joins until someone clicks *Allow* on the first Mac.
+- **Pairing by code:** `join CODE` sends its signing request over TLS. Both
+  directions carry an HMAC keyed by the one-time code over the inviter's
+  certificate fingerprint, so a machine in the middle can't pair or
+  impersonate without the code. The code is 60 random bits, single-use,
+  expires in 10 minutes and allows 3 wrong tries.
 - Every request is also HMAC-signed with the mesh token, with a timestamp and
   body hash.
 - **Protecting the Mac that lends its power:** workers run only allowlisted
@@ -334,7 +354,7 @@ The suite starts in-process workers to stand in for Macs. It covers:
 - the frame-exact video stitch, frame-range renders with a fake app, and batch jobs;
 - a node dying mid-job, a node going silent (detected within seconds), shutdown handing work back, and a busy owner getting their Mac back (pause, resume, yield);
 - build matching, and blob cleanup and expiry;
-- pairing (and a wrong code), mutual TLS jobs, and refusal of plain HTTP, foreign CAs and revoked certificates;
+- pairing by code (and a wrong code), pairing by request (allowed, refused, and a broken commitment), mutual TLS jobs, and refusal of plain HTTP, foreign CAs and revoked certificates;
 - the sandbox (no home reads, no private temp reads, no writes outside, no network);
 - multi-step tasks, failure markers, exact seconds at NTSC rates, media scanning, app profiles (including a job whose media must be shipped and relinked), and dropping v0.1's GUI-app config entries;
 - the control socket and the MCP server (jobs, cancelling, lending);

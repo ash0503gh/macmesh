@@ -106,8 +106,7 @@ struct JobCard: View {
                 }
             }
             if job.isActive {
-                ProgressView(value: job.state == "merging" ? 1 : job.progress)
-                    .progressViewStyle(.linear)
+                JobProgressBar(job: job)
             }
             HStack {
                 Text(Format.jobState(job))
@@ -131,6 +130,19 @@ struct JobCard: View {
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
+    }
+}
+
+/// A job's progress: indeterminate until a chunk has finished and the Macs' speed is known.
+struct JobProgressBar: View {
+    var job: Job
+
+    var body: some View {
+        if job.state == "starting" || (job.state == "running" && job.progress == 0) {
+            ProgressView().progressViewStyle(.linear)
+        } else {
+            ProgressView(value: job.state == "merging" ? 1 : job.progress).progressViewStyle(.linear)
+        }
     }
 }
 

@@ -16,6 +16,7 @@ struct PopoverView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
+            ForEach(engine.status?.invite.requests ?? []) { JoinRequestBanner(request: $0, compact: true) }
             switch engine.phase {
             case .running:
                 ForEach(engine.activeJobs) { job in
@@ -25,10 +26,13 @@ struct PopoverView: View {
                             Spacer()
                             Text(Format.jobState(job)).font(.caption).foregroundStyle(.secondary)
                         }
-                        ProgressView(value: job.state == "merging" ? 1 : job.progress)
+                        JobProgressBar(job: job)
                     }
                 }
-                if engine.activeJobs.isEmpty {
+                ForEach(engine.lendingJobs) { job in
+                    Label(job.name, systemImage: "arrow.triangle.2.circlepath").font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                }
+                if engine.activeJobs.isEmpty && engine.lendingJobs.isEmpty {
                     Text(idleLine).font(.callout).foregroundStyle(.secondary)
                 }
             case .needsSetup:
@@ -67,8 +71,8 @@ struct PopoverView: View {
         }
         .padding(14)
         .frame(width: 280)
-        .onAppear { engine.watching = true }
-        .onDisappear { engine.watching = false }
+        .onAppear { engine.watch("menu", true) }
+        .onDisappear { engine.watch("menu", false) }
     }
 
     private var idleLine: String {

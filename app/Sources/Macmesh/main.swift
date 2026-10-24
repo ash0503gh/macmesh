@@ -34,4 +34,47 @@ if let i = arguments.firstIndex(of: "--check") {
     semaphore.wait()
     exit(0)
 }
+if let i = arguments.firstIndex(of: "--watch"), i + 1 < arguments.count, let seconds = Double(arguments[i + 1]) {
+    // Run the app's own polling loop against a live engine and print every update: tests live tracking.
+    MainActor.assumeIsolated {
+        let engine = Engine()
+        engine.watch("harness", !arguments.contains("--idle"))
+        engine.launch()
+        var last = ""
+        let start = Date()
+        Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { timer in
+            MainActor.assumeIsolated {
+                let jobs = engine.activeJobs.map { "\($0.name) \($0.state) \(Int(($0.progress * 100).rounded()))% eta \($0.eta.map { "\(Int($0))s" } ?? "-")" }
+                let line = jobs.isEmpty ? "no active job (\(engine.status?.jobs.first.map { "\($0.name) \($0.state)" } ?? "none"))" : jobs.joined(separator: " | ")
+                if line != last {
+                    print(String(format: "%5.1fs  ", Date().timeIntervalSince(start)) + line)
+                    fflush(stdout)
+                    last = line
+                }
+                if Date().timeIntervalSince(start) > seconds { timer.invalidate(); exit(0) }
+            }
+        }
+    }
+    RunLoop.main.run()
+}
+if arguments.contains("--join-nearby") {
+    // The app's own join path, headless: find meshes nearby and ask the first to let this Mac in.
+    MainActor.assumeIsolated {
+        let engine = Engine()
+        Task { @MainActor in
+            let found = await engine.nearby()
+            print("nearby: " + found.map { "\($0.name) \($0.addresses)" }.joined(separator: ", "))
+            guard let mesh = found.first(where: { arguments.contains($0.name) }) ?? found.first else { print("none"); exit(1) }
+            do {
+                try await engine.requestJoin(mesh, name: "appD") { print("number: \($0)"); fflush(stdout) }
+                print("joined \(mesh.name); phase \(engine.phase)")
+                exit(0)
+            } catch {
+                print("join failed: \(error.localizedDescription)")
+                exit(1)
+            }
+        }
+    }
+    RunLoop.main.run()
+}
 MacmeshApp.main()
