@@ -38,6 +38,9 @@ dest="/Applications"
 rm -rf "$dest/macmesh.app"
 ditto "$tmp/unpacked/macmesh.app" "$dest/macmesh.app"
 xattr -dr com.apple.quarantine "$dest/macmesh.app" 2>/dev/null || true
+# Same path as the old version: tell Finder and the Dock to show the new icon, not a cached one.
+touch "$dest/macmesh.app"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$dest/macmesh.app" 2>/dev/null || true
 
 echo "Installed $dest/macmesh.app"
 echo "For the command line and agents: $dest/macmesh.app/Contents/Resources/engine/bin/macmesh"
