@@ -396,11 +396,18 @@ class Control:
     def m_invite(self) -> dict:
         if not pki.paths(self.home)["ca_key"].exists():
             raise ControlError("only the Mac that started the mesh can invite (run `macmesh init` there)")
+        if self.invite.get("state") == "waiting" and self.invite.get("expires", 0) > time.time():
+            return self._invite_state()
+        if "obj" in self.invite:
+            try:
+                self.invite["obj"].sock.close()
+            except Exception:
+                pass
         code = pairing.new_code()
         inv = pairing.Invite(self.cfg, code, int(self.cfg["port"]) + 1, home=self.home)
         from . import PAIR_SERVICE_TYPE, discovery
         ad = discovery.advertise(self.cfg, PAIR_SERVICE_TYPE, inv.port)
-        self.invite = {"code": code, "state": "waiting", "expires": time.time() + pairing.EXPIRY, "joined": ""}
+        self.invite = {"code": code, "state": "waiting", "expires": time.time() + pairing.EXPIRY, "joined": "", "obj": inv}
 
         def wait():
             try:
@@ -582,8 +589,7 @@ class _Handler(socketserver.StreamRequestHandler):
             try:
                 result = self.control.call(req.get("method", ""), req.get("params") or {})
                 self._send({"id": rid, "result": result})
-            except (ControlError, ValueError, FileNotFoundError, JobFailed, pairing.PairingError,
-                    pki.PKIError, TypeError) as e:
+            except Exception as e:
                 self._send({"id": rid, "error": str(e)})
 
     def _send(self, obj) -> None:
