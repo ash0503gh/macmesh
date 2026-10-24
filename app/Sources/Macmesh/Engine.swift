@@ -72,6 +72,7 @@ final class Engine {
     var phase: Phase = .checking
     var status: MeshStatus?
     var apps: [AppProfile] = []
+    var ai: AiInfo?
     var notice: String?
     /// Polled quickly while someone is looking or a job runs.
     var watching = false
@@ -113,6 +114,7 @@ final class Engine {
             if phase != .running {
                 phase = .running
                 apps = (try? await client.call("apps")) ?? []
+                ai = try? await client.call("ai")
             }
         } catch {
             if !configExists { phase = .needsSetup; return }
@@ -177,6 +179,51 @@ final class Engine {
         do { let _: [String: String] = try await client.call("revoke", ["fingerprint": mac.fingerprint]) } catch {
             notice = error.localizedDescription
         }
+    }
+
+    // ---- AI ------------------------------------------------------------------
+    func refreshApps() async {
+        apps = (try? await client.call("apps")) ?? apps
+    }
+
+    func setAI(agent: String? = nil, autorun: Bool? = nil) async {
+        var params: [String: Any] = [:]
+        if let agent { params["agent"] = agent }
+        if let autorun { params["autorun"] = autorun }
+        do { ai = try await client.call("set_ai", params) } catch { notice = error.localizedDescription }
+    }
+
+    func plan(request: String, paths: [String], macs: [String]) async throws -> AiTask {
+        try await client.call("plan", ["request": request, "paths": paths, "macs": macs])
+    }
+
+    func teach(program: String, name: String, sample: String) async throws -> AiTask {
+        try await client.call("teach", ["program": program, "name": name, "sample": sample])
+    }
+
+    func explain(_ job: Job) async throws -> AiTask {
+        try await client.call("explain", ["id": job.id])
+    }
+
+    func aiTask(_ id: String) async throws -> AiTask {
+        try await client.call("ai_task", ["id": id])
+    }
+
+    func runPlan(_ id: String) async throws -> Job {
+        let job: Job = try await client.call("run_plan", ["id": id])
+        await tick()
+        return job
+    }
+
+    /// Polls an AI task until it's done or failed, reporting each change.
+    func follow(_ task: AiTask, update: @escaping (AiTask) -> Void) async {
+        var current = task
+        update(current)
+        while current.state == "working", !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(1))
+            if let next = try? await aiTask(current.id) { current = next; update(current) }
+        }
+        await tick()
     }
 
     /// First Mac: start a new mesh. Then the daemon can run.

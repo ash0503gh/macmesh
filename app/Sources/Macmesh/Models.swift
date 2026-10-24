@@ -155,3 +155,53 @@ enum Format {
         }
     }
 }
+
+/// Which AI agent the engine uses for planning, teaching and explaining.
+struct AiInfo: Decodable, Equatable {
+    var choice: String          // auto | claude | antigravity
+    var using: String?
+    var problem: String
+    var available: [String]
+    var autorun: Bool
+
+    static func label(_ agent: String) -> String {
+        switch agent {
+        case "claude": "Claude Code"
+        case "antigravity": "Antigravity"
+        default: "Whichever is installed"
+        }
+    }
+}
+
+/// Something the AI is working on: a plan, a new app's profile, or an explanation.
+struct AiTask: Decodable, Equatable, Identifiable {
+    var id: String
+    var kind: String            // plan | teach | explain
+    var state: String           // working | done | failed
+    var steps: [String]
+    var result: AiResult?
+    var error: String
+    var awaitingOk: Bool
+}
+
+/// The fields of every kind of AI result; each kind fills its own.
+struct AiResult: Decodable, Equatable {
+    // plan
+    var explanation: String?
+    var planner: String?
+    var tasks: Int?
+    var programs: [String]?
+    var example: [String]?
+    var merge: [String]?
+    var safe: Bool?
+    var reasons: [String]?
+    var jobId: String?
+    // teach
+    var verified: String?
+    var attempts: Int?
+    var path: String?
+    // explain
+    var summary: String?
+    var fix: String?
+    var `where`: String?
+}

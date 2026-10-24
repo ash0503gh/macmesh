@@ -25,7 +25,30 @@ struct DropSheetView: View {
     var macs: [Mac] { engine.status?.macs ?? [] }
     var usable: [Mac] { macs.filter { $0.available && !turnedOff.contains($0.nodeId) } }
 
+    enum Mode: String, CaseIterable { case file = "Pick a file", describe = "Describe it" }
+    @State var mode: Mode = .file
+
     var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Picker("", selection: $mode) {
+                ForEach(Mode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 260)
+            if mode == .describe {
+                DescribeJobView(files: file.map { [URL(filePath: $0.path)] } ?? [])
+            } else {
+                fileMode
+            }
+        }
+        .padding(22)
+        .frame(width: 520)
+        .task { if let initialURL, file == nil { await open(initialURL) } }
+    }
+
+    @ViewBuilder
+    private var fileMode: some View {
         VStack(alignment: .leading, spacing: 18) {
             dropZone
             if let file {
@@ -43,9 +66,6 @@ struct DropSheetView: View {
                 HStack { Spacer(); Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction) }
             }
         }
-        .padding(22)
-        .frame(width: 500)
-        .task { if let initialURL, file == nil { await open(initialURL) } }
     }
 
     // ---- the file --------------------------------------------------------
@@ -177,21 +197,7 @@ struct DropSheetView: View {
     }
 
     private var macPicker: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            SectionLabel("Use these Macs")
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 88), spacing: 8)], alignment: .leading, spacing: 12) {
-                    ForEach(macs) { mac in
-                        Button {
-                            guard mac.available else { return }
-                            if turnedOff.contains(mac.nodeId) { turnedOff.remove(mac.nodeId) } else { turnedOff.insert(mac.nodeId) }
-                        } label: {
-                            MacAvatar(mac: mac, selected: mac.available && !turnedOff.contains(mac.nodeId))
-                        }
-                        .buttonStyle(.plain)
-                        .help(mac.available ? "\(mac.chip ?? "") · \(Format.macState(mac))" : Format.macState(mac))
-                    }
-            }
-        }
+        MacPicker(macs: macs, turnedOff: $turnedOff)
     }
 
     @ViewBuilder
@@ -246,6 +252,30 @@ struct DropSheetView: View {
             dismiss()
         } catch {
             self.error = error.localizedDescription
+        }
+    }
+}
+
+/// Choose which Macs a job uses: every available one starts selected.
+struct MacPicker: View {
+    var macs: [Mac]
+    @Binding var turnedOff: Set<String>
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionLabel("Use these Macs")
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 88), spacing: 8)], alignment: .leading, spacing: 12) {
+                ForEach(macs) { mac in
+                    Button {
+                        guard mac.available else { return }
+                        if turnedOff.contains(mac.nodeId) { turnedOff.remove(mac.nodeId) } else { turnedOff.insert(mac.nodeId) }
+                    } label: {
+                        MacAvatar(mac: mac, selected: mac.available && !turnedOff.contains(mac.nodeId))
+                    }
+                    .buttonStyle(.plain)
+                    .help(mac.available ? "\(mac.chip ?? "") · \(Format.macState(mac))" : Format.macState(mac))
+                }
+            }
         }
     }
 }

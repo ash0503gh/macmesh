@@ -52,9 +52,21 @@ struct LendingSettings: View {
 
 struct AppsSettings: View {
     @Environment(Engine.self) private var engine
+    @State private var teaching = false
 
     var body: some View {
         Form {
+            Section {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Teach macmesh an app").fontWeight(.medium)
+                        Text("Any app with a command-line tool that renders frames. The AI writes the profile; a test render proves it.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Teach an app…") { teaching = true }.disabled(engine.ai?.using == nil)
+                }
+            }
             Section {
                 ForEach(engine.apps) { app in
                     HStack {
@@ -71,9 +83,10 @@ struct AppsSettings: View {
                     }
                 }
             } footer: {
-                Text("Each app is described by a profile in macmesh's apps folder. Add a file there to teach macmesh a new app.")
+                Text("Each app is described by a profile in macmesh's apps folder (~/.macmesh/apps).")
             }
         }
         .formStyle(.grouped)
+        .sheet(isPresented: $teaching) { TeachSheet().environment(engine) }
     }
 }

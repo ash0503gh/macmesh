@@ -8,13 +8,14 @@ struct DashboardView: View {
     @State private var dropped: URL?
 
     enum Page: String, CaseIterable, Identifiable {
-        case jobs = "Jobs", macs = "Macs", apps = "Apps", lending = "Lending", security = "Security"
+        case jobs = "Jobs", macs = "Macs", apps = "Apps", ai = "AI", lending = "Lending", security = "Security"
         var id: Self { self }
         var symbol: String {
             switch self {
             case .jobs: "list.bullet.rectangle"
             case .macs: "laptopcomputer.and.desktopcomputer"
             case .apps: "square.grid.2x2"
+            case .ai: "sparkles"
             case .lending: "hand.raised"
             case .security: "lock.shield"
             }
@@ -66,6 +67,7 @@ struct DashboardView: View {
             case .jobs: JobsPage(newJob: $newJob)
             case .macs: MacsPage()
             case .apps: AppsSettings()
+            case .ai: AIPage()
             case .lending: LendingSettings()
             case .security: SecurityPage()
             }
@@ -101,6 +103,7 @@ struct JobsPage: View {
     @Environment(Engine.self) private var engine
     @Binding var newJob: Bool
     @State private var confirmCancel: Job?
+    @State private var explaining: Job?
 
     var body: some View {
         ScrollView {
@@ -124,6 +127,7 @@ struct JobsPage: View {
         } message: { _ in
             Text("Every Mac stops its part. Finished chunks are thrown away.")
         }
+        .sheet(item: $explaining) { job in ExplainSheet(job: job).environment(engine) }
     }
 
     private var emptyState: some View {
@@ -166,6 +170,11 @@ struct JobsPage: View {
                             if job.state == "done", !job.output.isEmpty {
                                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: job.output)]) }
                                     .controlSize(.small)
+                            } else if job.state == "failed" {
+                                Button("Explain") { explaining = job }
+                                    .controlSize(.small)
+                                    .disabled(engine.ai?.using == nil)
+                                    .help("Ask the AI what went wrong")
                             } else {
                                 Text("")
                             }

@@ -56,10 +56,22 @@ def file_sha256(path: str) -> str:
     return _hash_cache[key]
 
 
+_version_cache: dict[tuple, str] = {}
+
+
 def version(name: str, path: str, table: dict) -> str:
+    """The program's version line, asked once per build of it (cached by size and mtime)."""
     args = table.get(name, {}).get("version_args") or VERSION_ARGS.get(name)
     if not args:
         return ""
+    st = Path(path).resolve().stat()
+    key = (str(Path(path).resolve()), st.st_size, st.st_mtime_ns, tuple(args))
+    if key not in _version_cache:
+        _version_cache[key] = _ask_version(path, args)
+    return _version_cache[key]
+
+
+def _ask_version(path: str, args: list[str]) -> str:
     try:
         out = subprocess.run([path, *args], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):

@@ -40,6 +40,27 @@ enum Snapshots {
             tasks: 10, done: 0, progress: 0, elapsed: 3, eta: nil, macs: [], chunks: [], speedup: nil, created: 0, kind: "app"),
     ]
 
+    static let planTask = AiTask(id: "p1", kind: "plan", state: "done", steps: ["Asking Claude Code to plan it", "Checking the plan"],
+                                 result: AiResult(explanation: "Render the sequence in 40 chunks of 120 frames with FilmCraft, join them, then make a 720p HEVC preview from the result.",
+                                                  planner: "job", tasks: 41, programs: ["filmcraft", "ffmpeg"],
+                                                  example: ["filmcraft --compact --project {in:project} exec file.exportMedia path={out:result} format=prores startFrame=0 endFrame=120"],
+                                                  merge: ["concat_video", "command"], safe: false,
+                                                  reasons: ["runs a command on this Mac to put the result together"]),
+                                 error: "", awaitingOk: true)
+    static let teachTask = AiTask(id: "t1", kind: "teach", state: "done",
+                                  steps: ["reading the program's help", "asking the agent for a profile (attempt 1)",
+                                          "test render: whole, then in chunks", "test render failed: rendering frames 0-11 gave 11 frames, not 12",
+                                          "asking the agent for a profile (attempt 2)", "test render: whole, then in chunks"],
+                                  result: AiResult(explanation: "Renders frame ranges with -s/-e into numbered PNGs, after relinking textures.",
+                                                   verified: "frames 0-11 render the same whole and in 3 chunks", attempts: 2,
+                                                   path: "~/.macmesh/apps/blender.json"),
+                                  error: "", awaitingOk: false)
+    static let explainTask = AiTask(id: "e1", kind: "explain", state: "done", steps: [],
+                                    result: AiResult(summary: "The Mac Studio has FilmCraft 0.7.1, while this Mac has 0.7.2, so macmesh wouldn't mix their frames and no Mac was left to run the job.",
+                                                     fix: "Update FilmCraft's command-line tool on the Mac Studio to 0.7.2, or run the job on this Mac only.",
+                                                     where: "another Mac"),
+                                    error: "", awaitingOk: false)
+
     static func status(jobs: [Job], macs: [Mac]? = nil, paused: Int = 0) -> MeshStatus {
         let macs = macs ?? Self.macs
         return MeshStatus(nodeId: "ashwinsmacbookpro", name: "Ashwin's MacBook Pro", lend: true, accepting: true, reason: "",
@@ -54,6 +75,7 @@ enum Snapshots {
         let e = Engine(client: ControlClient(socketPath: "/nonexistent"), location: nil)
         e.live = false
         e.status = status
+        e.ai = AiInfo(choice: "auto", using: "claude", problem: "", available: ["claude", "antigravity"], autorun: true)
         e.phase = phase
         e.apps = [
             AppProfile(name: "filmcraft", description: "FilmCraft video editor: renders the active sequence", installed: true,
@@ -90,6 +112,14 @@ enum Snapshots {
             ("newjob-empty", AnyView(DropSheetView().environment(engine(working)))),
             ("newjob-project", AnyView(DropSheetView(file: project).environment(engine(working)))),
             ("newjob-comp", AnyView(DropSheetView(file: comp).environment(engine(working)))),
+            ("dashboard-ai", dash(.ai, engine(working))),
+            ("newjob-describe", AnyView(DescribeJobView(files: [URL(filePath: "/Users/me/Movies/Interview.fcproj")],
+                                                        request: "Export Interview at 4K in HEVC, then make a 720p preview too",
+                                                        task: planTask).padding(22).frame(width: 520).environment(engine(working)))),
+            ("teach-done", AnyView(TeachSheet(program: URL(filePath: "/Applications/Blender.app/Contents/MacOS/Blender"), name: "blender",
+                                              sample: URL(filePath: "/Users/me/Scenes/Robot.blend"), task: teachTask)
+                                   .environment(engine(working)))),
+            ("explain", AnyView(ExplainSheet(job: finished[1], task: explainTask).environment(engine(working)))),
             ("menubar-working", AnyView(PopoverView().environment(engine(working)))),
             ("menubar-idle", AnyView(PopoverView().environment(engine(idle)))),
         ]

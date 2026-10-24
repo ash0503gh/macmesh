@@ -199,38 +199,47 @@ example profiles show what each app needed:
   asked to wait, and renders missing footage silently. Its profile relinks,
   then checks for missing footage **and fonts** before rendering.
 
-## The AI planner (Claude Code or Antigravity, no API)
+## AI (Claude Code or Antigravity, no API keys)
 
-```sh
-macmesh config agent claude          # or: antigravity
-macmesh plan "Render the Main comp, frames 0-899, as PNGs" MyAd.ecproj
-macmesh plan "Upscale to 4K and export HEVC for YouTube" interview.mov --agent antigravity
-```
+**What the AI doesn't do:** splitting a job, deciding which Mac takes which chunk, and joining the
+pieces are fixed rules. They're instant and exact, and they adapt to each Mac's measured speed (see
+the next section). The AI works on the parts that have no rule yet:
 
-How it works:
+| | In the app | On the command line |
+|---|---|---|
+| **Plan a free-form request** ("export at 4K, then a 720p preview") | New job > *Describe it* | `macmesh plan "…" files…` |
+| **Teach macmesh a new app** from its `--help` | Apps > *Teach an app* | control method `teach` |
+| **Explain a failed job** in plain words | Jobs > History > *Explain* | control method `explain` |
 
-1. macmesh builds a prompt containing the request, file metadata (`ffprobe` for
-   media, listings for bundles), every Mac's specs (chip, cores, fanless,
-   battery, installed apps), the app profiles, and other tools' `usage` docs.
-2. It runs the agent headlessly:
-   - `claude -p … --output-format json --tools "" --no-session-persistence`
-     (all tools disabled, so it can only answer)
-   - `agy -p …`
-   Both commands are editable under `agents` in the config.
-3. The agent answers with JSON choosing a **deterministic planner**
-   (`app` / `video` / `range` / `batch`) and its parameters, or a raw job spec
-   for unusual work. The AI decides *how to split*; plain code does the scheduling
-   and execution.
-4. macmesh validates the plan, refuses inputs outside the files you named,
-   shows you every command, and asks before running.
+- **Which AI:** `agent` is `auto` (Claude Code if it's installed, else Antigravity), `claude` or
+  `antigravity` (the app's *AI* page, or `macmesh config agent …`). It runs each one's command-line
+  tool with your existing subscription. Claude Code runs with its tools turned off
+  (`claude -p … --tools ""`). Antigravity runs read-only (`agy -p … --mode plan --sandbox`). Both run
+  from an empty folder and are told to answer from the prompt alone. The AI only answers; macmesh
+  checks the answer before anything runs.
+- **What it sees:** your request, the names, sizes and formats of the files you add, your Macs'
+  specs, the app profiles, and the text of project files (capped at 200,000 characters). Media is
+  never sent.
+- **Plans:** the AI chooses one of the same planners people use (`app`, `video`, `range`, `batch`)
+  or writes a raw job. macmesh refuses inputs outside the files you named and the media they use.
+  A plan that only runs app profiles or ffmpeg is **safe** and starts at once (`ai_autorun`, on by
+  default). Anything else, including a merge command that would run unsandboxed on this Mac, waits
+  for your OK and shows why.
+- **Teaching an app:** give the tool, a name and a sample project.
+  1. The AI reads the tool's help (which runs in the sandbox) and may ask for up to six more help
+     pages.
+  2. It writes a profile.
+  3. macmesh renders 12 frames of the sample twice, once whole and once in chunks, and keeps the
+     profile only if they match frame for frame.
+  4. If they don't, the AI gets the failure and tries again, up to three times.
 
-On the first run, use `--dry-run --save-job plan.json` to review a plan and
-`macmesh run plan.json` to execute it later.
+  The profile is saved in `~/.macmesh/apps/`; copy it to your other Macs.
+- **Explaining:** the job's error, its last log lines, what was asked and the app's profile go to
+  the AI, which answers with what went wrong, what to do, and where to look.
 
-> **Antigravity note:** some `agy` versions reportedly hang in `-p` mode when
-> stdout isn't a terminal. If `macmesh plan --agent antigravity` times out, run
-> it with `MACMESH_AGENT_TTY=1`, which wraps the call in `script` to give it a
-> pseudo-TTY. Check `agy --help` on your version for its headless/approval flags.
+> **Signing in:** the AI tools use their own logins. If one says it isn't signed in, run `claude`
+> (or `agy`) in Terminal once and sign in. If Antigravity hangs with no terminal, set
+> `MACMESH_AGENT_TTY=1`.
 
 ## How the scheduling handles real Macs
 
@@ -328,6 +337,8 @@ The suite starts in-process workers to stand in for Macs. It covers:
 - pairing (and a wrong code), mutual TLS jobs, and refusal of plain HTTP, foreign CAs and revoked certificates;
 - the sandbox (no home reads, no private temp reads, no writes outside, no network);
 - multi-step tasks, failure markers, exact seconds at NTSC rates, media scanning, app profiles (including a job whose media must be shipped and relinked), and dropping v0.1's GUI-app config entries;
+- the control socket and the MCP server (jobs, cancelling, lending);
+- the AI, with a fake agent standing in for Claude Code: safe plans running at once, unsafe ones waiting for an OK, plans refused for touching files you didn't name, explanations, and teaching an app whose first profile fails the test render and whose second passes;
 - permanent failure after retries, signature tampering, the program allowlist, and tar traversal.
 
 ## Known limitations / roadmap

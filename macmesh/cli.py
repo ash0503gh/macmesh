@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import PAIR_SERVICE_TYPE, __version__, config, discovery, jobspec, media, mesh, pairing, pki, profiles, toolinfo
 from .client import NodeClient, NodeError
-from .planners import ENCODE_PRESETS, PLANNERS, PRIVATE_PARAMS
+from .planners import ENCODE_PRESETS, PLANNERS
 from .scheduler import JobFailed, Scheduler
 
 
@@ -332,53 +332,26 @@ def _template(t: list[str]) -> list[str]:
 
 
 def cmd_plan(args) -> int:
-    from .planners.ai import plan_with_agent
+    from .planners.ai import plan_to_job, plan_with_agent
     cfg = config.load()
     clients = gather_nodes(cfg, args)
     if not clients:
         print("No worker nodes reachable; the planner needs to know what Macs exist.")
         return 1
-    agent = args.agent or cfg["agent"]
-    log(f"asking {agent} to plan: {args.request!r}")
+    log(f"asking {args.agent or cfg['agent']} to plan: {args.request!r}")
     try:
-        plan = plan_with_agent(args.request, args.files, [c.info for c in clients], cfg, agent)
+        plan = plan_with_agent(args.request, args.files, [c.info for c in clients], cfg, args.agent)
     except (OSError, ValueError, RuntimeError, TimeoutError) as e:
         log(f"planning failed: {e}")
         return 1
     print(f"\nPlanner: {plan['planner']}\nWhy: {plan.get('explanation', '')}")
     print("Params:", json.dumps(plan["params"], indent=2))
-    params = dict(plan["params"])
     try:
-        if plan["planner"] == "job":
-            job = params
-        else:
-            fn = PLANNERS[plan["planner"]]
-            allowed = set(fn.__code__.co_varnames[:fn.__code__.co_argcount]) - PRIVATE_PARAMS
-            unknown = set(params) - allowed
-            if unknown:
-                raise ValueError(f"unexpected params for {plan['planner']}: {sorted(unknown)}")
-            job = fn(**params)
-        if not job.get("tasks"):
-            print("\nThe planner produced no tasks.")
-            return 1
-        _check_inputs_within(job, args.files)
-    except (TypeError, ValueError, KeyError, OSError, RuntimeError) as e:
+        job = plan_to_job(plan, args.files, cfg)
+    except (ValueError, KeyError, OSError, RuntimeError) as e:
         log(f"plan rejected: {e}")
         return 1
     return execute(job, cfg, args)
-
-
-def _check_inputs_within(job: dict, files: list[str]) -> None:
-    """An AI plan may only ship the files you named (or things inside them)."""
-    roots = [Path(f).expanduser().resolve() for f in files]
-    workdir = Path(job.get("workdir") or ".").expanduser().resolve()
-    for t in job["tasks"]:
-        for name, local in t.get("inputs", {}).items():
-            p = Path(local).expanduser().resolve()
-            if p.is_relative_to(workdir):
-                continue  # produced by the planner itself (e.g. video segments)
-            if not any(p == r or r in p.parents for r in roots):
-                raise ValueError(f"{t['id']}: input {name} ({p}) is not one of the files you gave")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -492,7 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("plan", help="let Claude Code / Antigravity plan the split")
     p.add_argument("request", help='what you want, e.g. "export this at 4K HEVC"')
     p.add_argument("files", nargs="*")
-    p.add_argument("--agent", choices=["claude", "antigravity"], help="override config 'agent'")
+    p.add_argument("--agent", choices=["auto", "claude", "antigravity"], help="override config 'agent'")
     mesh_opts(p)
     p.set_defaults(fn=cmd_plan)
     return ap

@@ -9,14 +9,9 @@ shows it to you before any work is sent anywhere.
 from __future__ import annotations
 
 import json
-import os
-import platform
-import re
-import shutil
-import subprocess
 from pathlib import Path
 
-from .. import media, profiles, toolinfo
+from .. import ai, mediarefs, media, profiles, toolinfo
 from .video import ENCODE_PRESETS
 
 MEDIA_EXT = {".mov", ".mp4", ".m4v", ".mkv", ".mxf", ".avi", ".webm", ".wav", ".aif", ".aiff", ".mp3", ".m4a"}
@@ -100,6 +95,8 @@ def build_prompt(request: str, files: list[str], nodes: list[dict], tools: dict,
         "Decide how to split the user's request into independent tasks.\n\n"
         f"USER REQUEST:\n{request}\n\n"
         f"FILES:\n{json.dumps(file_info, indent=1)}\n\n"
+        f"PROJECT CONTENTS (text files among them, for reading names of comps, sequences, settings):\n"
+        f"{json.dumps(ai.project_contents(files), indent=1)}\n\n"
         f"MACS ON THE MESH:\n{json.dumps(node_info, indent=1)}\n\n"
         f"APPS (profiles):\n{json.dumps(app_info, indent=1)}\n\n"
         f"OTHER TOOLS (CLI):\n{json.dumps(tool_info, indent=1)}\n\n"
@@ -108,57 +105,81 @@ def build_prompt(request: str, files: list[str], nodes: list[dict], tools: dict,
     )
 
 
-def ask_agent(prompt: str, agent: str, agents: dict, timeout: float) -> str:
-    if agent not in agents:
-        raise ValueError(f"unknown agent {agent!r}; configured: {sorted(agents)}")
-    template = agents[agent]
-    if not shutil.which(template[0]):
-        raise FileNotFoundError(f"{template[0]!r} not found on PATH (needed for agent {agent!r})")
-    argv = [a.replace("{prompt}", prompt) for a in template]
-    if os.environ.get("MACMESH_AGENT_TTY") and platform.system() == "Darwin":
-        # Workaround for CLIs that hang when stdout is not a terminal.
-        argv = ["script", "-q", "/dev/null"] + argv
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
-        raise TimeoutError(f"{agent} did not answer within {timeout:.0f}s "
-                           "(try MACMESH_AGENT_TTY=1, or a longer agent_timeout)") from None
-    if proc.returncode != 0:
-        raise RuntimeError(f"{agent} exited {proc.returncode}: {proc.stderr.strip()[-1000:]}")
-    return proc.stdout
-
-
 def extract_plan(raw: str) -> dict:
     """Pull the plan object out of whatever the CLI printed."""
-    text = raw.strip()
-    try:  # claude --output-format json wraps the answer: {"result": "..."}
-        wrapper = json.loads(text)
-        if isinstance(wrapper, dict) and "planner" in wrapper:
-            return wrapper
-        if isinstance(wrapper, dict) and isinstance(wrapper.get("result"), str):
-            text = wrapper["result"]
-    except ValueError:
-        pass
-    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S)
-    candidates = fenced + [text[i:] for i, ch in enumerate(text) if ch == "{"]
-    decoder = json.JSONDecoder()
-    for c in candidates:
-        try:
-            obj, _ = decoder.raw_decode(c)
-        except ValueError:
-            continue
-        if isinstance(obj, dict) and "planner" in obj:
-            return obj
-    raise ValueError(f"agent reply contained no plan JSON:\n{text[:1500]}")
+    try:
+        return ai.extract_json(raw, "planner")
+    except ai.AgentError as e:
+        raise ValueError(str(e)) from None
 
 
 def plan_with_agent(request: str, files: list[str], nodes: list[dict], cfg: dict,
-                    agent: str | None = None) -> dict:
-    prompt = build_prompt(request, files, nodes, toolinfo.tools(cfg), profiles.load())
-    raw = ask_agent(prompt, agent or cfg["agent"], cfg["agents"], float(cfg["agent_timeout"]))
-    plan = extract_plan(raw)
+                    agent: str | None = None, home: Path | None = None) -> dict:
+    prompt = build_prompt(request, files, nodes, toolinfo.tools(cfg, home), profiles.load(home))
+    plan = extract_plan(ai.ask(prompt, cfg, agent))
     if plan.get("planner") not in ("app", "video", "range", "batch", "job"):
         raise ValueError(f"agent chose unknown planner {plan.get('planner')!r}")
     if not isinstance(plan.get("params"), dict):
         raise ValueError("agent plan has no params object")
     return plan
+
+
+def plan_to_job(plan: dict, files: list[str], cfg: dict, workdir: str = "", home: Path | None = None) -> dict:
+    """Turn the agent's answer into a job, through the same planners people use. Raises ValueError.
+
+    `workdir` (where the job's files go) overrides whatever the agent chose."""
+    from . import PLANNERS, PRIVATE_PARAMS
+    params = dict(plan["params"])
+    if workdir:
+        params["workdir"] = workdir
+    if plan["planner"] == "job":
+        job = params
+    else:
+        fn = PLANNERS[plan["planner"]]
+        allowed = set(fn.__code__.co_varnames[:fn.__code__.co_argcount]) - PRIVATE_PARAMS
+        unknown = set(params) - allowed
+        if unknown:
+            raise ValueError(f"unexpected params for {plan['planner']}: {sorted(unknown)}")
+        if plan["planner"] == "app":
+            params["cfg"], params["home"] = cfg, home
+        try:
+            job = fn(**params)
+        except TypeError as e:
+            raise ValueError(f"the plan's parameters don't fit: {e}") from None
+    if not job.get("tasks"):
+        raise ValueError(plan.get("explanation") or "the plan has no tasks")
+    check_inputs_within(job, files)
+    return job
+
+
+def check_inputs_within(job: dict, files: list[str]) -> None:
+    """An AI plan may only ship the files you named, things inside them, and the media they use."""
+    roots = [Path(f).expanduser().resolve() for f in files]
+    used = {Path(m) for f in files for m in mediarefs.scan(f)} if files else set()
+    workdir = Path(job.get("workdir") or ".").expanduser().resolve()
+    for t in job["tasks"]:
+        for name, local in t.get("inputs", {}).items():
+            p = Path(local).expanduser().resolve()
+            if p.is_relative_to(workdir) or p in used:
+                continue  # made by the planner (video segments), or media a named project uses
+            if not any(p == r or r in p.parents for r in roots):
+                raise ValueError(f"{t['id']}: input {name} ({p}) is not one of the files you gave")
+
+
+SAFE_PROGRAMS = {"ffmpeg", "ffprobe"}
+
+
+def unsafe_reasons(job: dict, app_names: set[str]) -> list[str]:
+    """Why a plan needs a person's OK before it runs; empty when it only uses app profiles or ffmpeg.
+
+    Workers sandbox every task anyway; what's left to guard is programs beyond the known ones and
+    merge commands, which run on this Mac without a sandbox.
+    """
+    from .. import jobspec
+    reasons = []
+    programs = {p for t in job["tasks"] for p in jobspec.programs(t)}
+    if extra := programs - SAFE_PROGRAMS - app_names:
+        reasons.append(f"runs {', '.join(sorted(extra))}, which isn't an app profile or ffmpeg")
+    if any(step["op"] == "command" for step in job.get("merge", [])):
+        reasons.append("runs a command on this Mac to put the result together")
+    return reasons

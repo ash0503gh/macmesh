@@ -30,8 +30,10 @@ DEFAULT_AGENTS = {
     # The planner only needs text in, JSON out: all agent tools are disabled.
     "claude": ["claude", "-p", "{prompt}", "--output-format", "json",
                "--tools", "", "--no-session-persistence"],
-    # Antigravity CLI. Some versions hang without a TTY; see README.
-    "antigravity": ["agy", "-p", "{prompt}"],
+    # Antigravity CLI: it can't turn its tools off, so it runs read-only (plan mode, sandboxed).
+    # Some versions hang without a TTY; see README.
+    # (--disable-slash-commands would switch plan mode off; macmesh's prompts never start with "/".)
+    "antigravity": ["agy", "-p", "{prompt}", "--output-format", "json", "--mode", "plan", "--sandbox"],
 }
 
 
@@ -69,7 +71,8 @@ def defaults() -> dict:
         "peers": [],                # static "host:port" entries (skip Bonjour)
         "allowed_programs": list(DEFAULT_ALLOWED),
         "tools": json.loads(json.dumps(DEFAULT_TOOLS)),
-        "agent": "claude",
+        "agent": "auto",            # claude | antigravity | auto (whichever is installed)
+        "ai_autorun": True,         # run AI plans at once when they only use app profiles or ffmpeg
         "agents": json.loads(json.dumps(DEFAULT_AGENTS)),
         "agent_timeout": 300,
     }

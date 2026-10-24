@@ -7,6 +7,6 @@ from .video import ENCODE_PRESETS, plan_video
 
 PLANNERS = {"video": plan_video, "range": plan_range, "batch": plan_batch, "app": plan_app}
 # Parameters an AI-written plan may not set (they'd let it choose what runs on this Mac).
-PRIVATE_PARAMS = {"cfg"}
+PRIVATE_PARAMS = {"cfg", "home"}
 
 __all__ = ["PLANNERS", "PRIVATE_PARAMS", "ENCODE_PRESETS", "plan_video", "plan_range", "plan_batch", "plan_app"]

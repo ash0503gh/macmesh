@@ -16,6 +16,12 @@ Methods:
   lend {on}               let other Macs use this one, or not (remembered)
   owner {mode}            "shared" (step aside when the owner is busy) or "idle" (only while away)
   invite / revoke {fingerprint}
+  ai / set_ai {agent?, autorun?}   which AI agent is used (Claude Code or Antigravity), autorun of safe plans
+  plan {request, paths?, macs?}    an AI plan for a free-form request; safe ones start at once
+  run_plan {id}                    start a plan that waited for a person's OK
+  teach {program, name, sample}    an AI-written app profile, kept only if a test render passes
+  explain {id}                     what went wrong with a failed job, in plain words
+  ai_task {id}                     how an AI task is going (they take a while)
 
 Joining a mesh happens before the daemon can run (it needs the certificate):
 the app runs `macmesh init` or `macmesh join CODE` first.
@@ -35,9 +41,9 @@ import time
 import uuid
 from pathlib import Path
 
-from . import config, jobspec, media, mesh, pairing, pki, profiles, toolinfo
+from . import ai, config, jobspec, media, mesh, pairing, pki, profiles, teach, toolinfo
 from .planners import plan_app, plan_video
-from .planners.ai import MEDIA_EXT
+from .planners.ai import MEDIA_EXT, plan_to_job, plan_with_agent, unsafe_reasons
 from .planners.app import probe_fps, probe_frames
 from .planners.range import NEEDS_FPS
 from .scheduler import JobFailed, Scheduler
@@ -96,10 +102,32 @@ class Job:
                 "log": self.log[-20:]}
 
 
+class AiTask:
+    """Something an AI agent is working on (a plan, a new app's profile, an explanation): slow, so polled."""
+
+    def __init__(self, kind: str):
+        self.id = uuid.uuid4().hex[:8]
+        self.kind = kind
+        self.state = "working"  # working | done | failed
+        self.steps: list[str] = []
+        self.result: dict | None = None
+        self.error = ""
+        self.pending = None  # a plan waiting for a person's OK: (job, spec, final)
+        self.created = time.time()
+
+    def step(self, text: str) -> None:
+        self.steps.append(text)
+
+    def summary(self) -> dict:
+        return {"id": self.id, "kind": self.kind, "state": self.state, "steps": self.steps[-12:],
+                "result": self.result, "error": self.error, "awaiting_ok": self.pending is not None}
+
+
 class Control:
     def __init__(self, cfg: dict, worker=None, home: Path | None = None):
         self.cfg, self.worker, self.home = cfg, worker, home or config.home()
         self.jobs: dict[str, Job] = {}
+        self.ai_tasks: dict[str, AiTask] = {}
         self.lock = threading.Lock()
         self.nodes: list = []
         self.nodes_at = 0.0
@@ -163,8 +191,8 @@ class Control:
                         "installed": name in toolinfo.programs(self.cfg, self.home)}
                 try:
                     needs_fps = any(NEEDS_FPS.search(a) for s in prof["range"]["steps"] for a in s)
-                    fps = probe_fps(prof, str(p), prof.get("vars", {}), self.cfg) if needs_fps else None
-                    info["frames"] = probe_frames(prof, str(p), prof.get("vars", {}), self.cfg, fps)
+                    fps = probe_fps(prof, str(p), prof.get("vars", {}), self.cfg, self.home) if needs_fps else None
+                    info["frames"] = probe_frames(prof, str(p), prof.get("vars", {}), self.cfg, fps, self.home)
                     info["fps"] = fps
                 except ValueError as e:
                     info["frames"], info["note"] = None, str(e)
@@ -200,18 +228,17 @@ class Control:
             # At least three chunks per slot, so a slow Mac never holds up the end for long.
             chunk = int(spec.get("chunk") or max(12, math.ceil((end - start + 1) / (3 * slots))))
             job = plan_app(app, path, start, end, chunk=chunk, fps=spec.get("fps"), vars=spec.get("vars"),
-                           workdir=str(workdir), cfg=self.cfg)
-            movie = any(m["op"] == "concat_video" for m in job["merge"])
-            final = out_root / (f"{stem} (macmesh).mov" if movie else f"{stem} (macmesh)")
+                           workdir=str(workdir), cfg=self.cfg, home=self.home)
         elif kind == "video":
             duration = media.summary(path)["duration"]
             chunk = float(spec.get("chunk") or max(5.0, duration / (3 * slots)))
-            job = plan_video(path, str(out_root / f"{stem} (macmesh).mp4"), preset=spec.get("preset", "hevc"),
+            job = plan_video(path, f"{stem}.mp4", preset=spec.get("preset", "hevc"),
                              vf=spec.get("vf", ""), chunk_seconds=chunk, workdir=str(workdir))
-            final = Path(job.pop("final"))
+            job.pop("final")
         else:
             raise ControlError("kind is \"app\" or \"video\"")
-        return {"job": jobspec.validate(job), "final": str(final)}
+        # The result lands as "<name> (macmesh)" plus its own extension (or as a folder).
+        return {"job": jobspec.validate(job), "final": str(out_root / f"{stem} (macmesh)")}
 
     @staticmethod
     def _chosen(mac: dict, spec: dict) -> bool:
@@ -219,11 +246,14 @@ class Control:
 
     def m_start(self, **spec) -> dict:
         planned = self.plan_job(spec)
-        record = Job(planned["job"], spec)
+        return self._start(planned["job"], spec, planned["final"]).summary()
+
+    def _start(self, job: dict, spec: dict, final: str) -> Job:
+        record = Job(job, spec)
         with self.lock:
             self.jobs[record.id] = record
-        threading.Thread(target=self._run, args=(record, planned["final"]), daemon=True).start()
-        return record.summary()
+        threading.Thread(target=self._run, args=(record, final), daemon=True).start()
+        return record
 
     def _run(self, record: Job, final: str) -> None:
         try:
@@ -242,14 +272,14 @@ class Control:
             media.run_merge(workdir, record.job["merge"], log=record.log.append)
             produced = next((workdir / (s.get("output") or s.get("into"))
                              for s in record.job["merge"] if s.get("output") or s.get("into")), None)
-            if produced and produced.exists() and str(produced) != final:
-                dest = _free_name(Path(final))
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(produced), dest)
-                record.output = str(dest)
+            if not (produced and produced.exists()):
+                produced = workdir / "results" if (workdir / "results").is_dir() else workdir  # batch jobs
+            dest = _free_name(Path(final + (produced.suffix if produced.is_file() else "")))
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(produced), dest)
+            record.output = str(dest)
+            if produced != workdir:
                 shutil.rmtree(workdir, ignore_errors=True)
-            else:
-                record.output = str(produced or workdir)
             record.state = "done"
         except JobFailed as e:
             record.state = "cancelled" if str(e) == "cancelled" else "failed"
@@ -349,8 +379,115 @@ class Control:
         self.cfg["revoked"] = saved["revoked"]
         return {"revoked": fp}
 
+    # ---- AI: planning, teaching, explaining ------------------------------
+    def _ai(self, kind: str, work) -> dict:
+        task = AiTask(kind)
+        with self.lock:
+            self.ai_tasks[task.id] = task
+
+        def run():
+            try:
+                task.result = work(task)
+                task.state = "done"
+            except (ai.AgentError, teach.TeachError, ValueError, ControlError, JobFailed, OSError, KeyError) as e:
+                task.state, task.error = "failed", str(e)
+            except Exception as e:  # reported, never raised into a dead thread
+                task.state, task.error = "failed", f"{type(e).__name__}: {e}"
+
+        threading.Thread(target=run, daemon=True).start()
+        return task.summary()
+
+    def m_ai(self) -> dict:
+        try:
+            using, problem = ai.pick(self.cfg), ""
+        except ai.AgentError as e:
+            using, problem = None, str(e)
+        return {"choice": self.cfg.get("agent", "auto"), "using": using, "problem": problem,
+                "available": sorted(ai.available(self.cfg)), "autorun": bool(self.cfg.get("ai_autorun", True))}
+
+    def m_set_ai(self, agent: str | None = None, autorun: bool | None = None) -> dict:
+        saved = config.load()
+        if agent is not None:
+            if agent != "auto" and agent not in self.cfg["agents"]:
+                raise ControlError(f"agent is auto or one of {', '.join(sorted(self.cfg['agents']))}")
+            self.cfg["agent"] = saved["agent"] = agent
+        if autorun is not None:
+            self.cfg["ai_autorun"] = saved["ai_autorun"] = bool(autorun)
+        config.save(saved)
+        return self.m_ai()
+
+    def m_plan(self, request: str, paths: list | None = None, macs: list | None = None) -> dict:
+        """Ask the agent to plan a free-form request. Safe plans start at once when autorun is on."""
+        paths = [str(Path(p).expanduser()) for p in (paths or [])]
+        if not request.strip():
+            raise ControlError("say what you'd like done")
+
+        def work(task: AiTask) -> dict:
+            task.step(f"Asking {ai.pick(self.cfg)} to plan it")
+            nodes = [c.info for c in self.refresh() if not macs or c.info["node_id"] in macs]
+            if not nodes:
+                raise ControlError("no Macs are available")
+            plan = plan_with_agent(request, paths, nodes, self.cfg, home=self.home)
+            task.step("Checking the plan")
+            name = re.sub(r"[^A-Za-z0-9 _.-]+", "", Path(paths[0]).stem if paths else request)[:40].strip() or "job"
+            out_root = Path(self.cfg.get("output_dir", "~/Movies/macmesh")).expanduser()
+            workdir = out_root / ".work" / f"{name}-{task.id}"
+            job = jobspec.validate(plan_to_job(plan, paths, self.cfg, workdir=str(workdir), home=self.home))
+            reasons = unsafe_reasons(job, set(profiles.load(self.home)))
+            first = job["tasks"][0]
+            result = {"explanation": plan.get("explanation", ""), "planner": plan["planner"],
+                      "tasks": len(job["tasks"]), "programs": sorted({p for t in job["tasks"] for p in jobspec.programs(t)}),
+                      "example": [" ".join(step) for step in first["steps"]],
+                      "merge": [m["op"] for m in job["merge"]], "safe": not reasons, "reasons": reasons, "job_id": None}
+            spec = {"kind": "plan", "title": name, "macs": macs, "request": request, "paths": paths}
+            final = str(out_root / f"{name} (macmesh)")
+            if not reasons and self.cfg.get("ai_autorun", True):
+                result["job_id"] = self._start(job, spec, final).id
+                task.step("Started")
+            else:
+                task.pending = (job, spec, final)
+            return result
+
+        return self._ai("plan", work)
+
+    def m_run_plan(self, id: str) -> dict:
+        task = self._ai_task(id)
+        if not task.pending:
+            raise ControlError("that plan has already run, or didn't finish")
+        record = self._start(*task.pending)
+        task.pending = None
+        task.result["job_id"] = record.id
+        return record.summary()
+
+    def m_teach(self, program: str, name: str, sample: str) -> dict:
+        return self._ai("teach", lambda task: teach.teach(program, name, sample, self.cfg, self.home, log=task.step))
+
+    def m_explain(self, id: str) -> dict:
+        record = self._job(id)
+        if record.state != "failed":
+            raise ControlError("only failed jobs need explaining")
+        app = record.spec.get("app") or (self.m_inspect(record.spec["path"]).get("app")
+                                         if record.spec.get("kind") == "app" else None)
+        profile = profiles.load(self.home).get(app) if app else None
+
+        def work(task: AiTask) -> dict:
+            task.step(f"Asking {ai.pick(self.cfg)} what went wrong")
+            return ai.explain(record.summary(), record.spec, profile, self.cfg)
+
+        return self._ai("explain", work)
+
+    def _ai_task(self, id: str) -> AiTask:
+        with self.lock:
+            if id not in self.ai_tasks:
+                raise ControlError(f"no AI task {id!r}")
+            return self.ai_tasks[id]
+
+    def m_ai_task(self, id: str) -> dict:
+        return self._ai_task(id).summary()
+
     # ---- dispatch --------------------------------------------------------
-    METHODS = {"status", "macs", "apps", "inspect", "start", "jobs", "job", "cancel", "lend", "owner", "invite", "revoke"}
+    METHODS = {"status", "macs", "apps", "inspect", "start", "jobs", "job", "cancel", "lend", "owner", "invite", "revoke",
+               "ai", "set_ai", "plan", "run_plan", "teach", "explain", "ai_task"}
 
     def call(self, method: str, params: dict):
         if method not in self.METHODS:

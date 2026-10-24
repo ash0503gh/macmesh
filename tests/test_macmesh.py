@@ -16,7 +16,7 @@ import time
 import unittest
 from pathlib import Path
 
-from macmesh import config, control, jobspec, media, mediarefs, owner, pairing, pki, profiles, sandbox, toolinfo, wire
+from macmesh import ai, config, control, jobspec, media, mediarefs, owner, pairing, pki, profiles, sandbox, toolinfo, wire
 from macmesh import mcp as mcp_module
 from macmesh import worker as worker_module
 from macmesh.client import NodeClient, NodeError
@@ -838,6 +838,142 @@ class ControlTests(MeshCase):
         self.assertIn("error", server.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                                               "params": {"name": "rm_rf"}}))
         self.assertIsNone(server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+
+
+FAKE_AGENT = """#!/usr/bin/env python3
+# Answers like `claude -p --output-format json`: {"result": "<reply>"}. Logs each prompt; replies
+# from $FAKE_AGENT_DIR: plan.json, explain.json, profile-1.json, profile-2.json (one per attempt).
+import json, os, sys
+d = os.environ["FAKE_AGENT_DIR"]
+prompt = sys.argv[sys.argv.index("-p") + 1]
+n = len([f for f in os.listdir(d) if f.startswith("prompt-")]) + 1
+open(os.path.join(d, f"prompt-{n}.txt"), "w").write(prompt)
+if "planner for macmesh" in prompt:
+    reply = open(os.path.join(d, "plan.json")).read()
+elif "job failed" in prompt:
+    reply = open(os.path.join(d, "explain.json")).read()
+else:
+    attempt = 2 if "IT FAILED THE TEST RENDER" in prompt else 1
+    reply = open(os.path.join(d, f"profile-{attempt}.json")).read()
+print(json.dumps({"type": "result", "result": "Here you go:\\n" + reply}))
+"""
+
+
+class AITests(ControlTests):
+    """Planning, teaching and explaining with a fake agent standing in for Claude Code."""
+
+    def setUp(self):
+        super().setUp()
+        self.agent_dir = self.tmp / "agent"
+        self.agent_dir.mkdir()
+        fake = self.tmp / "fake-claude"
+        fake.write_text(FAKE_AGENT)
+        fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+        os.environ["FAKE_AGENT_DIR"] = str(self.agent_dir)
+        self.ctl.cfg["agents"] = {"claude": [str(fake), "-p", "{prompt}"], "antigravity": ["/nonexistent/agy", "-p", "{prompt}"]}
+        self.ctl.cfg["agent"] = "auto"
+
+    def tearDown(self):
+        os.environ.pop("FAKE_AGENT_DIR", None)
+        super().tearDown()
+
+    def reply(self, name, obj):
+        (self.agent_dir / name).write_text(json.dumps(obj))
+
+    def wait_task(self, tid, timeout=60):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            t = self.client.call("ai_task", id=tid)
+            if t["state"] != "working":
+                return t
+            time.sleep(0.2)
+        self.fail("AI task didn't finish")
+
+    test_status_inspect_and_a_whole_project_job = None  # covered by ControlTests
+    test_cancel_and_lending = None
+    test_mcp_tools = None
+
+    def test_agent_is_picked_by_whats_installed(self):
+        info = self.client.call("ai")
+        self.assertEqual((info["choice"], info["using"], info["available"]), ("auto", "claude", ["claude"]))
+        with self.assertRaisesRegex(ai.AgentError, "isn't installed"):
+            ai.pick(self.ctl.cfg, "antigravity")
+
+    def test_safe_plan_runs_at_once_and_sees_the_project(self):
+        self.reply("plan.json", {"planner": "app", "explanation": "Render it in chunks of 10.",
+                                 "params": {"app": "fakeapp2", "project": str(self.project), "start": 0, "end": 59, "chunk": 10}})
+        task = self.wait_task(self.client.call("plan", request="render the first 60 frames", paths=[str(self.project)])["id"])
+        self.assertEqual(task["state"], "done", task)
+        r = task["result"]
+        self.assertTrue(r["safe"])
+        self.assertEqual((r["tasks"], r["programs"]), (6, ["fakeapp2"]))
+        job = self.wait_job(lambda j: self.client.call("job", id=j), r["job_id"])
+        self.assertEqual(job["state"], "done", job)
+        self.assertEqual(len(os.listdir(job["output"])), 60)
+        prompt = (self.agent_dir / "prompt-1.txt").read_text()
+        self.assertIn('\\"frames\\": 120', prompt)  # the project's contents went along
+        self.assertNotIn("pixels", prompt)  # the media didn't
+
+    def test_unsafe_plan_waits_for_ok(self):
+        self.reply("plan.json", {"planner": "job", "explanation": "Custom.", "params": {
+            "name": "custom", "tasks": [{"id": "t1", "steps": [["fakeapp2", "relink", "{in:p}", "{indir}"],
+                                                           ["fakeapp2", "render", "{in:p}", "0", "5", "{out:r}"]],
+                                         "inputs": {"p": str(self.project), "m": str(self.tmp / "footage/clip.dat")},
+                                         "outputs": {"r": "frames"}}],
+            "merge": [{"op": "command", "argv": ["true"]}]}})
+        task = self.wait_task(self.client.call("plan", request="do it my way", paths=[str(self.project)])["id"])
+        self.assertEqual(task["state"], "done", task)
+        self.assertFalse(task["result"]["safe"])
+        self.assertIn("runs a command on this Mac", task["result"]["reasons"][0])
+        self.assertTrue(task["awaiting_ok"])
+        self.assertIsNone(task["result"]["job_id"])
+        job = self.wait_job(lambda j: self.client.call("job", id=j), self.client.call("run_plan", id=task["id"])["id"])
+        self.assertEqual(job["state"], "done", job)
+
+    def test_plan_cant_reach_files_you_didnt_name(self):
+        secret = self.tmp / "secret.txt"
+        secret.write_text("private")
+        self.reply("plan.json", {"planner": "batch", "params": {"files": [str(secret)], "template": ["fakeapp2", "{in:file}"],
+                                                                "out_ext": ".txt"}})
+        task = self.wait_task(self.client.call("plan", request="process it", paths=[str(self.project)])["id"])
+        self.assertEqual(task["state"], "failed")
+        self.assertIn("not one of the files you gave", task["error"])
+
+    def test_explaining_a_failed_job(self):
+        self.project.write_text(json.dumps({"frames": 20}))  # no media: the fake app "renders" placeholders
+        prof = self.fake_profile(self.tmp / "fakeapp2")
+        prof["range"]["steps"] = prof["range"]["steps"][1:]
+        prof["media"] = "none"
+        for home in [self.home, *(n.home for n in self.nodes)]:
+            self.write_profile(home, dict(prof, extensions=[".show"], frames_probe={"args": ["info", "{project}"], "json": "frames"}))
+        job = self.wait_job(lambda j: self.client.call("job", id=j),
+                            self.client.call("start", kind="app", path=str(self.project))["id"])
+        self.assertEqual(job["state"], "failed", job)
+        self.reply("explain.json", {"summary": "The app couldn't find clip.dat.", "fix": "Keep the media with the project.",
+                                    "where": "the project"})
+        task = self.wait_task(self.client.call("explain", id=job["id"])["id"])
+        self.assertEqual(task["result"]["where"], "the project", task)
+        self.assertIn("offline", (self.agent_dir / "prompt-1.txt").read_text())  # it saw the failure
+
+    def test_teaching_an_app_keeps_only_a_profile_that_passes(self):
+        self.ctl.cfg["node_id"] = self.nodes[0].worker.cfg["node_id"]
+        home = self.nodes[0].home
+        self.ctl.home = home
+        prof = self.fake_profile(self.tmp / "fakeapp2")
+        prof.update(name="taught", extensions=[".show"], frames_probe={"args": ["info", "{project}"], "json": "frames"})
+        wrong = json.loads(json.dumps(prof))
+        wrong["range"]["steps"][1][3] = "{end}"  # off by one: the last frame of every chunk goes missing
+        self.reply("profile-1.json", {"profile": wrong, "explanation": "first try"})
+        self.reply("profile-2.json", {"profile": prof, "explanation": "Relinks, then renders frames."})
+        task = self.wait_task(self.client.call("teach", program=str(self.tmp / "fakeapp2"), name="taught",
+                                               sample=str(self.project))["id"], timeout=120)
+        self.assertEqual(task["state"], "done", task)
+        self.assertEqual(task["result"]["attempts"], 2)
+        self.assertIn("render the same whole and in 3 chunks", task["result"]["verified"])
+        self.assertTrue((home / "apps/taught.json").exists())
+        retry = (self.agent_dir / "prompt-2.txt").read_text()
+        self.assertIn("gave 11 frames, not 12", retry)  # the agent was told what failed
+        self.assertIn('"name": "filmcraft"', retry)  # and saw the shipped profiles as examples
 
 
 @unittest.skipUnless(sandbox.available(), "sandbox-exec not available")

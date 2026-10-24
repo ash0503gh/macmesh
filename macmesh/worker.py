@@ -123,9 +123,17 @@ class Worker:
             "accepting": not self.refusal(pw),
             "refusal": self.refusal(pw),
             "programs": sorted(self.programs()),
-            "fingerprints": self.fingerprints,
+            "fingerprints": self.current_fingerprints(),
             "sandboxed": self.sandboxed,
         }
+
+    def current_fingerprints(self) -> dict:
+        """Re-read, so an app taught or updated since startup shows its build (hashes are cached)."""
+        try:
+            self.fingerprints = toolinfo.fingerprints(self.cfg, self.root)
+        except OSError:
+            pass
+        return self.fingerprints
 
     def refusal(self, pw: dict) -> str:
         """Why this Mac won't take new work right now, or "" if it will."""
