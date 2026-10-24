@@ -1,0 +1,24 @@
+{
+  "name": "grade-ai-masks",
+  "workdir": "./macmesh-out/grade-ai-masks",
+  "tasks": [
+    {
+      "id": "masks-0000-0599",
+      "argv": ["grade", "export", "{in:project}", "--start", "0", "--end", "599", "--ai-masks", "--output", "{out:result}"],
+      "inputs": {"project": "./Interview.grade"},
+      "outputs": {"result": "chunks/masks-0000-0599.mov"},
+      "cost": 600
+    },
+    {
+      "id": "masks-0600-1199",
+      "argv": ["grade", "export", "{in:project}", "--start", "600", "--end", "1199", "--ai-masks", "--output", "{out:result}"],
+      "inputs": {"project": "./Interview.grade"},
+      "outputs": {"result": "chunks/masks-0600-1199.mov"},
+      "cost": 600
+    }
+  ],
+  "merge": [
+    {"op": "concat_video", "inputs": ["chunks/masks-0000-0599.mov", "chunks/masks-0600-1199.mov"],
+     "audio_from": "./Interview-source.mov", "output": "Interview-graded.mov"}
+  ]
+}

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Start the macmesh worker at login and keep it running.
+     1. Replace /usr/local/bin/macmesh with the output of `which macmesh`.
+     2. cp examples/com.macmesh.worker.plist ~/Library/LaunchAgents/
+     3. launchctl load ~/Library/LaunchAgents/com.macmesh.worker.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.macmesh.worker</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/macmesh</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/macmesh-worker.log</string>
+  <key>StandardErrorPath</key><string>/tmp/macmesh-worker.log</string>
+</dict>
+</plist>

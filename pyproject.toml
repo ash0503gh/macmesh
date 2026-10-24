@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "macmesh"
+version = "0.1.0"
+description = "AirDrop for processing power: split render/encode/AI jobs across nearby Macs."
+requires-python = ">=3.9"
+dependencies = ["zeroconf>=0.38"]
+
+[project.scripts]
+macmesh = "macmesh.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["macmesh*"]
