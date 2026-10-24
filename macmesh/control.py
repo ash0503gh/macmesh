@@ -425,6 +425,13 @@ class Control:
         self.cfg["revoked"] = saved["revoked"]
         return {"revoked": fp}
 
+    def m_stop(self) -> dict:
+        def kill():
+            time.sleep(0.1)
+            os._exit(0)
+        threading.Thread(target=kill, daemon=True).start()
+        return {"stopping": True}
+
     # ---- AI: planning, teaching, explaining ------------------------------
     def _ai(self, kind: str, work) -> dict:
         task = AiTask(kind)
@@ -532,7 +539,7 @@ class Control:
         return self._ai_task(id).summary()
 
     # ---- dispatch --------------------------------------------------------
-    METHODS = {"status", "macs", "apps", "inspect", "start", "jobs", "job", "cancel", "lend", "owner", "invite", "revoke",
+    METHODS = {"status", "macs", "apps", "inspect", "start", "jobs", "job", "cancel", "lend", "owner", "invite", "revoke", "stop",
                "ai", "set_ai", "plan", "run_plan", "teach", "explain", "ai_task"}
 
     def call(self, method: str, params: dict):

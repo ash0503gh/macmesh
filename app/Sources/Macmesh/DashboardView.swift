@@ -297,11 +297,10 @@ struct MacsPage: View {
             ToolbarItem {
                 Button {
                     inviting = true
-                    if engine.status?.holdsCa == true { Task { await engine.invite() } }
                 } label: {
                     Label("Add or Join Macs", systemImage: "plus.circle")
                 }
-                .help("Add Macs, Join a mesh, Start a new mesh, or Leave mesh")
+                .help("Add Macs, Join a mesh, Start a new mesh, or Revoke / Leave mesh")
             }
         }
         .sheet(isPresented: $inviting) { MeshSheet().environment(engine) }
@@ -313,14 +312,14 @@ struct MeshSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     enum ActionTab: String, CaseIterable, Identifiable {
-        case invite = "Add Mac"
         case join = "Join Mesh"
         case start = "Start Mesh"
-        case leave = "Leave Mesh"
+        case invite = "Add Mac"
+        case revoke = "Revoke / Leave"
         var id: Self { self }
     }
 
-    @State private var tab: ActionTab = .invite
+    @State private var tab: ActionTab = .join
     @State private var code = ""
     @State private var host = ""
     @State private var name = Host.current().localizedName ?? ""
@@ -331,26 +330,26 @@ struct MeshSheet: View {
     var body: some View {
         VStack(spacing: 16) {
             Picker("Action", selection: $tab) {
+                Text("Join Mesh").tag(ActionTab.join)
+                Text("Start Mesh").tag(ActionTab.start)
                 if engine.status?.holdsCa == true {
-                    Text("Add a Mac").tag(ActionTab.invite)
+                    Text("Add Mac").tag(ActionTab.invite)
                 }
-                Text("Join a Mesh").tag(ActionTab.join)
-                Text("Start a Mesh").tag(ActionTab.start)
-                Text("Leave Mesh").tag(ActionTab.leave)
+                Text("Revoke / Leave").tag(ActionTab.revoke)
             }
             .pickerStyle(.segmented)
             .padding(.top, 4)
 
             Group {
                 switch tab {
-                case .invite:
-                    inviteView
                 case .join:
                     joinView
                 case .start:
                     startView
-                case .leave:
-                    leaveView
+                case .invite:
+                    inviteView
+                case .revoke:
+                    revokeView
                 }
             }
             .frame(minHeight: 180)
@@ -367,7 +366,13 @@ struct MeshSheet: View {
         .padding(24)
         .frame(width: 480)
         .onAppear {
-            if engine.status?.holdsCa != true {
+            if let status = engine.status {
+                if !status.holdsCa || status.macs.count <= 1 {
+                    tab = .join
+                } else {
+                    tab = .invite
+                }
+            } else {
                 tab = .join
             }
         }
@@ -389,6 +394,11 @@ struct MeshSheet: View {
                 Text("Code valid for 10 minutes.").font(.caption).foregroundStyle(.secondary)
             } else {
                 ProgressView("Generating invite code…")
+            }
+        }
+        .task {
+            if engine.status?.holdsCa == true && engine.status?.invite.code == nil {
+                await engine.invite()
             }
         }
     }
@@ -437,19 +447,50 @@ struct MeshSheet: View {
     }
 
     @ViewBuilder
-    private var leaveView: some View {
-        VStack(spacing: 12) {
+    private var revokeView: some View {
+        VStack(spacing: 16) {
             Image(systemName: "xmark.shield").font(.system(size: 32)).foregroundStyle(.red)
-            Text("Leave / Revoke Current Mesh").font(.headline)
-            Text("Leaving this mesh removes its paired certificate so you can join a different mesh or start your own.")
-                .foregroundStyle(.secondary).font(.callout).multilineTextAlignment(.center)
+            Text("Revoke or Leave Mesh").font(.headline)
 
-            Button("Leave Mesh", role: .destructive) {
-                confirmLeave = true
+            let peers = engine.status?.macs.filter { !$0.thisMac } ?? []
+            if !peers.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Connected Macs:").font(.subheadline).foregroundStyle(.secondary)
+                    ForEach(peers) { mac in
+                        HStack {
+                            VStack(alignment: .leading) {
+                                Text(mac.name).font(.system(.body, weight: .medium))
+                                Text(mac.chip ?? "Apple Silicon").font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Revoke", role: .destructive) {
+                                Task {
+                                    await engine.revoke(mac)
+                                    await engine.tick()
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                        .padding(.vertical, 4)
+                        Divider()
+                    }
+                }
+                .padding(.horizontal)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.red)
-            .disabled(busy)
+
+            VStack(spacing: 8) {
+                Text("Leave / Reset This Mac").font(.subheadline).foregroundStyle(.secondary)
+                Text("Disconnects this Mac from the current mesh and resets its local certificate.")
+                    .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+
+                Button("Leave Mesh", role: .destructive) {
+                    confirmLeave = true
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .disabled(busy)
+            }
         }
         .confirmationDialog("Leave this mesh?", isPresented: $confirmLeave) {
             Button("Leave Mesh", role: .destructive) {

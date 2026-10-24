@@ -108,7 +108,7 @@ final class Engine {
         }
     }
 
-    private func tick() async {
+    func tick() async {
         do {
             status = try await client.call("status")
             if phase != .running {
@@ -176,7 +176,10 @@ final class Engine {
     }
 
     func revoke(_ mac: Mac) async {
-        do { let _: [String: String] = try await client.call("revoke", ["fingerprint": mac.fingerprint]) } catch {
+        do {
+            let _: [String: String] = try await client.call("revoke", ["fingerprint": mac.fingerprint])
+            await tick()
+        } catch {
             notice = error.localizedDescription
         }
     }
@@ -229,6 +232,9 @@ final class Engine {
     /// First Mac: start a new mesh. Then the daemon can run.
     func createMesh(name: String, force: Bool = false) async throws {
         guard let location else { throw ControlClient.Failure.engine("the engine is missing from this app") }
+        let _: [String: Bool]? = try? await client.call("stop")
+        daemon?.terminate()
+        daemon = nil
         var args = ["init"]
         if force { args.append("--force") }
         if !name.isEmpty { args += ["--name", name] }
@@ -240,6 +246,9 @@ final class Engine {
     /// Any other Mac: join with the code shown by `invite` on the first one.
     func join(code: String, host: String, name: String, force: Bool = false) async throws {
         guard let location else { throw ControlClient.Failure.engine("the engine is missing from this app") }
+        let _: [String: Bool]? = try? await client.call("stop")
+        daemon?.terminate()
+        daemon = nil
         var args = ["join", code.trimmingCharacters(in: .whitespaces)]
         if force { args.append("--force") }
         if !host.isEmpty { args += ["--host", host] }
