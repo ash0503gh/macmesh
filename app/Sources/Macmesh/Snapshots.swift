@@ -20,18 +20,41 @@ enum Snapshots {
         mac("Old iMac", "iMac", "Apple M1", state: "unavailable", reason: "not lending"),
     ]
 
-    static let running = Job(id: "a1", name: "Interview", state: "running", error: "", output: "", tasks: 24, done: 15,
-                             progress: 0.62, elapsed: 190, eta: 118,
-                             macs: [.init(nodeId: "a", name: "This Mac", done: 9, running: 2),
-                                    .init(nodeId: "b", name: "MacBook Air", done: 4, running: 1),
-                                    .init(nodeId: "c", name: "Mac Studio", done: 2, running: 2)],
-                             chunks: (0 ..< 24).map { i in
-                                 let macs = ["This Mac", "MacBook Air", "Mac Studio"]
-                                 let doneBy = [0, 0, 1, 0, 2, 1, 0, 2, 2, 0, 1, 2, 0, 2, 2]
-                                 return i < 15 ? Job.Chunk(state: "done", mac: macs[doneBy[i]])
-                                     : i < 20 ? Job.Chunk(state: "running", mac: macs[i % 3]) : Job.Chunk(state: "pending", mac: "")
+    static let songs = ["It's My Birthday.mp3", "Closer (Remix).mp3", "We Found Love.mp3", "Talk Dirty.mp3",
+                        "Love You No More.mp3", "Get Free.mp3", "We Own It.mp3", "That Bass.mp3", "Firestone.mp3", "Wiggle.mp3"]
+    static func load(_ base: Double, _ gpu: Double, duty: Double? = nil) -> [Job.LoadPoint] {
+        (0 ..< 75).map { i in
+            let t = Double(i)
+            return Job.LoadPoint(at: 1000 + t * 2, cpu: max(0, base + 8 * sin(t / 4) + (i < 6 ? -base + t * base / 6 : 0)),
+                                 gpu: max(0, gpu + 12 * sin(t / 3 + 1)), cores: 10, duty: duty, limit: 0.9)
+        }
+    }
+    static let running = Job(id: "a1", name: "Hip hop stems", state: "running", error: "", output: "", tasks: 10, done: 6,
+                             progress: 0.68, elapsed: 254, eta: 107,
+                             macs: [.init(nodeId: "a", name: "This Mac", done: 2, running: 2,
+                                          doing: [.init(label: "Firestone.mp3", phase: "running", since: 52, bytes: 0, total: 0),
+                                                  .init(label: "Wiggle.mp3", phase: "queued", since: 40, bytes: 0, total: 0)],
+                                          sent: 0, received: 61_000_000, upRate: 0, downRate: 0, load: load(31, 64)),
+                                    .init(nodeId: "b", name: "Sonakshi\u{2019}s MacBook Air", done: 4, running: 2,
+                                          doing: [.init(label: "That Bass.mp3", phase: "running", since: 21, bytes: 0, total: 0),
+                                                  .init(label: "We Own It.mp3", phase: "uploading", since: 2, bytes: 5_400_000, total: 9_100_000)],
+                                          sent: 46_200_000, received: 132_000_000, upRate: 2_700_000, downRate: 0, load: load(24, 78, duty: 0.72))],
+                             chunks: songs.enumerated().map { i, song in
+                                 let mac = [1, 0, 1, 1, 0, 1, 1, 1, 0, 0][i] == 0 ? "This Mac" : "Sonakshi\u{2019}s MacBook Air"
+                                 return i < 6 ? Job.Chunk(state: "done", mac: mac, label: song, phase: "done", seconds: [79, 109, 72, 53, 105, 64][i], attempts: 1)
+                                     : i == 6 ? Job.Chunk(state: "running", mac: mac, label: song, phase: "uploading", seconds: 2, attempts: 0)
+                                     : i < 9 ? Job.Chunk(state: "running", mac: mac, label: song, phase: i == 7 ? "running" : "running", seconds: i == 7 ? 21 : 52, attempts: 0)
+                                     : Job.Chunk(state: "running", mac: mac, label: song, phase: "queued", seconds: 40, attempts: 0)
                              },
-                             speedup: 2.4, created: 0, kind: "app")
+                             speedup: 1.9, created: 0, kind: "batch",
+                             events: [
+                                 .init(at: 1_792_878_701, text: "job Hip hop stems (2ecf6214): 10 tasks on This Mac[7.1], Sonakshi\u{2019}s MacBook Air[4.8]"),
+                                 .init(at: 1_792_878_714, text: "  → Love You No More.mp3 on Sonakshi\u{2019}s MacBook Air (upload 12.3s)"),
+                                 .init(at: 1_792_878_793, text: "  ✓ Love You No More.mp3 on Sonakshi\u{2019}s MacBook Air in 79.2s  [1/10]"),
+                                 .init(at: 1_792_878_811, text: "  ✓ It's My Birthday.mp3 on This Mac in 109.3s  [2/10]"),
+                                 .init(at: 1_792_878_955, text: "  ✓ That Bass.mp3 on Sonakshi\u{2019}s MacBook Air in 64.3s  [6/10]"),
+                                 .init(at: 1_792_878_957, text: "  → We Own It.mp3 on Sonakshi\u{2019}s MacBook Air (upload 4.3s)"),
+                             ])
     static let finished = [
         Job(id: "b1", name: "Launch ad (motion)", state: "done", error: "", output: "/tmp/x.mov", tasks: 8, done: 8, progress: 1,
             elapsed: 74, eta: nil, macs: [.init(nodeId: "a", name: "This Mac", done: 5, running: 0)], chunks: [],
@@ -135,6 +158,20 @@ enum Snapshots {
             ("dashboard-firewall-only", dash(.jobs, engine(status(jobs: finished, blockedFirewall: true)))),
             ("menubar-request", AnyView(PopoverView().environment(engine(status(jobs: [], requests: true))))),
             ("menubar-idle", AnyView(PopoverView().environment(engine(idle)))),
+            ("menubar-icons", AnyView(HStack(spacing: 28) {
+                ForEach(0 ..< 3) { i in
+                    Image(nsImage: MenuBarLabel.icon(working: i == 1, waiting: i == 2))
+                        .resizable().interpolation(.high).frame(width: 96, height: 64)
+                }
+            }.padding(24).background(Color(white: 0.93)))),
+            ("install-banners", AnyView(VStack(spacing: 10) {
+                ForEach(["asking", "installing", "done", "failed"], id: \.self) { state in
+                    InstallRequestBanner(request: .init(program: "demucs-stem",
+                        summary: "Demucs stem separation: Python packages and the htdemucs model, about 1 GB",
+                        by: "Ashwin\u{2019}s MacBook Pro", state: state, detail: "Step 2 of 3: pip install demucs==4.1.0",
+                        error: "step 2 failed (exit 1): No space left on device"))
+                }
+            }.padding(20).frame(width: 560).environment(engine(idle)))),
         ]
         NSApplication.shared.setActivationPolicy(.prohibited)
         NSApp.appearance = NSAppearance(named: dark ? .darkAqua : .aqua)

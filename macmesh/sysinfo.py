@@ -88,3 +88,63 @@ def power() -> dict:
         "on_battery": "Battery Power" in out,
         "battery_pct": int(pct.group(1)) if pct else None,
     }
+
+
+# ---- live load, for the job view's CPU and GPU graphs -----------------------------------------
+def gpu_percent() -> float | None:
+    """The whole GPU's load right now (macOS shows it per process only to an administrator)."""
+    m = re.search(r'"Device Utilization %"=(\d+)', _run("ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator", timeout=5))
+    return float(m.group(1)) if m else None
+
+
+def _cpu_seconds(text: str) -> float:
+    """ps's TIME column: "MMM:SS.cc" or "H:MM:SS.cc"."""
+    total = 0.0
+    for part in text.split(":"):
+        total = total * 60 + float(part)
+    return total
+
+
+def process_table() -> dict[int, tuple[int, float]]:
+    """pid -> (parent pid, CPU seconds used so far)."""
+    table = {}
+    for line in _run("ps", "-axo", "pid=,ppid=,time=", timeout=5).splitlines():
+        parts = line.split()
+        if len(parts) == 3:
+            try:
+                table[int(parts[0])] = (int(parts[1]), _cpu_seconds(parts[2]))
+            except ValueError:
+                pass
+    return table
+
+
+class LoadMeter:
+    """CPU used by groups of processes (each task's process and its children), from the change in
+    their CPU time between two samples, as a share of the whole Mac (100 = every core busy)."""
+
+    def __init__(self):
+        self.last: dict[int, float] = {}
+        self.last_at = 0.0
+        self.cores = os.cpu_count() or 1
+
+    def sample(self, roots: dict[str, list[int]], now: float) -> dict[str, float]:
+        """roots: group -> root pids. Returns group -> CPU % of the Mac since the previous sample."""
+        table = process_table()
+        children: dict[int, list[int]] = {}
+        for pid, (ppid, _) in table.items():
+            children.setdefault(ppid, []).append(pid)
+        interval = now - self.last_at if self.last_at else 0.0
+        out = {}
+        for group, pids in roots.items():
+            used, stack, seen = 0.0, list(pids), set()
+            while stack:
+                pid = stack.pop()
+                if pid in seen or pid not in table:
+                    continue
+                seen.add(pid)
+                used += max(0.0, table[pid][1] - self.last.get(pid, table[pid][1]))
+                stack.extend(children.get(pid, []))
+            out[group] = round(min(100.0, used / interval / self.cores * 100), 1) if interval > 0 else 0.0
+        self.last = {pid: cpu for pid, (_, cpu) in table.items()}
+        self.last_at = now
+        return out

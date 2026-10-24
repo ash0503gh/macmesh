@@ -37,6 +37,9 @@ Applications and opens it. Then:
    number appears on both Macs; if they match, click *Allow* on the first Mac. No code to type.
    (*Use a code instead* is there for networks where Bonjour doesn't get through.)
 
+For now a mesh holds **two Macs**. A third is turned away with a clear message until you remove one
+(*Your mesh*, then *Remove…*).
+
 The first time, macOS asks whether macmesh may find devices on your local network: allow it, or the
 Macs can't see each other. If the macOS firewall blocks incoming connections, macmesh says so and
 offers *Allow…* (it adds macmesh's engine to the firewall's allowed apps; macOS asks for an
@@ -51,6 +54,10 @@ The app isn't notarized by Apple, so the first time you open it, Control-click i
 What each Mac needs for the work it shares:
 
 - **ffmpeg** for video jobs: `brew install ffmpeg`.
+- **Tools with an install recipe** (such as `demucs-stem` for stem separation) set themselves up:
+  when a job needs one that a Mac lacks, that Mac shows *"Ashwin's MacBook Pro needs demucs-stem
+  on this Mac"* with *Allow*. After Allow, it installs into `~/.macmesh/tools` (no administrator
+  password) and joins the job while it's still running.
 - **The apps' command-line tools** for app jobs, at the same version on every Mac. The FilmCraft and
   EffectCraft profiles expect `filmcraft-cli` and `effectcraft-cli` in `~/.local/bin`. The Grade profile
   expects Grade with `grade-cli` in `~/Applications/Grade.app` (Grade's `make install`). Each Mac's
@@ -61,13 +68,14 @@ What each Mac needs for the work it shares:
 `app/` is a native macOS app (SwiftUI) on top of the engine:
 
 - **Dashboard window:** the sidebar has five pages.
-  - **Jobs:** the running job, updated live, with progress (counting chunks still running), time left once each Mac's speed is measured, how much faster it is than one Mac, and a map of which Mac did which chunk. *Helping other Macs* lists work this Mac is doing for others. Below it, the job history with *Show in Finder*.
+  - **Jobs:** the running job, updated live, with progress (counting chunks still running), time left once each Mac's speed is measured, how much faster it is than one Mac, and a map of which Mac did which chunk. Below that, a card per Mac shows what it's doing right now (sending a file, working on it for 0:52, fetching the result), a 2-minute graph of the CPU this job uses there and the Mac's GPU load, and how much has gone to and from it. Then every chunk with its Mac and time, and a live activity feed. *Helping other Macs* lists work this Mac is doing for others. Below it, the job history with *Show in Finder*.
   - **Macs:** every Mac on the mesh, with chip, cores, memory, power and what it's doing. *Your mesh* shows Macs asking to join (with the number to compare), how to add a Mac, *Remove…* and *Leave this mesh…*.
   - **Apps:** the app profiles, and whether this Mac has each app.
-  - **Lending:** lend this Mac or not, *step aside when I need it* or *only while I'm away*, and open at login.
+  - **Lending:** lend this Mac or not, *step aside when I need it* or *only while I'm away*, how much of the Mac may be used (50–95%, 90% to start), and open at login.
   - **Security:** encryption, this Mac's certificate, and removing a Mac.
 - **New job:** a sheet that opens from the toolbar, or when you drop a file on the window or open one with macmesh. macmesh recognises the project, its app and its length, asks for anything missing (an EffectCraft composition, say), lets you pick the Macs, and starts the job. Results land in `~/Movies/macmesh`.
-- **Menu bar icon:** what's running, *Lend this Mac*, and *Open macmesh*. It keeps lending going with the window closed.
+- **Menu bar icon:** what's running, *Lend this Mac*, and *Open macmesh*. It keeps lending going with the window closed. When a Mac asks to join or to install something, the window comes forward.
+- **Appearance:** Match System, Light or Dark, from the toolbar or the View menu. The version is at the bottom of the sidebar and the menu.
 - **First run:** the meshes found nearby, each with *Join*, and *Start a mesh* for the first Mac.
 
 The app carries its own Python and engine, so a Mac only needs the app. Build it with:
@@ -86,7 +94,7 @@ Under the hood, `macmesh serve` listens on `~/.macmesh/control.sock` (only your 
 
 ## For AI agents (MCP)
 
-`macmesh mcp` is an MCP server (stdio) with these tools: `get_status`, `list_apps`, `inspect_file`, `start_job`, `get_job`, `list_jobs`, `cancel_job`, `set_lending` and `create_invite`. It talks to the running engine, so jobs an agent starts show up in the app. For Claude Code:
+`macmesh mcp` is an MCP server (stdio) with these tools: `get_status`, `list_apps`, `inspect_file`, `start_job` (one project or video, or `files` for a batch such as stem separation), `get_job` (with what each Mac is doing, its CPU and GPU load, and events), `list_jobs`, `cancel_job`, `set_lending` (on or off, the lending mode, and how much of the Mac may be used), `create_invite`, `answer_join_request` and `answer_install_request`. The last two are for when the user has said yes; the server tells agents never to answer them on their own. It talks to the running engine, so jobs an agent starts show up in the app. For Claude Code:
 
 ```sh
 claude mcp add macmesh -- /Applications/macmesh.app/Contents/Resources/engine/bin/macmesh mcp
@@ -176,6 +184,10 @@ A profile gives:
   the render failed even though the app exited 0. Some apps render grey
   placeholders for missing media.
 - **Sandbox needs:** extra folders the app must read or write.
+- **An install recipe** (optional): what to set up on a Mac that lacks the program, as argument
+  lists run with macmesh's own Python in `~/.macmesh/tools/<name>`. The recipe is always the lending
+  Mac's own; the Mac asking can only name the program. `macmesh/apps/demucs-stem.json` is an example.
+  A profile without `range` is a plain tool for batch jobs (one task per file).
 - **The frame rate,** for apps that take seconds instead of frames
   (`fps_probe`, or `--fps`).
 
@@ -226,7 +238,9 @@ the next section). The AI works on the parts that have no rule yet:
 
 - **Which AI:** `agent` is `auto` (Claude Code if it's installed, else Antigravity), `claude` or
   `antigravity` (the app's *AI* page, or `macmesh config agent …`). It runs each one's command-line
-  tool with your existing subscription. Claude Code runs with its tools turned off
+  tool with your existing subscription, and finds it where its installer put it (Antigravity's
+  `~/.gemini/bin`, `~/.local/bin`, npm and Homebrew folders, and your login shell's PATH), even
+  though the app's engine starts with macOS's bare PATH. Claude Code runs with its tools turned off
   (`claude -p … --tools ""`). Antigravity runs read-only (`agy -p … --mode plan --sandbox`). Both run
   from an empty folder and are told to answer from the prompt alone. The AI only answers; macmesh
   checks the answer before anything runs.
@@ -270,12 +284,15 @@ the next section). The AI works on the parts that have no rule yet:
   it comes back.
 - **Shutdown / logout:** the worker catches SIGTERM and hands its chunks back
   at once, so nothing waits for a timeout.
-- **The owner needs their Mac (owner first):** each worker watches CPU use by
-  everything except macmesh's own tasks, total GPU use while someone is at the
-  keyboard, and keyboard/mouse idle time. When the owner is busy (by default:
-  over 50% CPU or 60% GPU) it stops taking work and **pauses** running tasks
-  (SIGSTOP). If the owner is calm again for 10 s, the tasks resume. If not,
-  after 30 s the tasks are **handed back** and run on another Mac. With
+- **The owner needs their Mac (owner first):** the whole Mac, the owner's apps
+  and macmesh's work together, stays at or under the owner's limit (90% of CPU
+  and GPU unless they set otherwise on the *Lending* page). Every second the
+  worker measures the Mac and runs macmesh's tasks for just part of each 0.1 s
+  (SIGSTOP/SIGCONT), so they **slow down smoothly** as the owner needs more and
+  speed up again when they're done. Only when the owner leaves less than 10% of
+  the CPU does it stop taking work and **pause** the tasks. If the owner is
+  calm again for 10 s, they resume. If not, after 30 s the tasks are **handed
+  back** and run on another Mac. With
   `macmesh config owner '{"mode": "idle"}'` a Mac only works while nobody has
   touched it for 2 minutes. Tasks also run under a macOS QoS clamp
   (`priority`, default `utility`), so macOS favours the owner's apps anyway.
@@ -337,7 +354,9 @@ the next section). The AI works on the parts that have no rule yet:
   arrival. After each job, the coordinator deletes what it uploaded
   (`--keep-blobs` to keep it for the next job), and workers delete anything
   unused for `blob_ttl` (default 30 minutes). Task folders are deleted as soon
-  as results are fetched.
+  as results are fetched. Results are saved only on the Mac that started the
+  job (its `~/Movies/macmesh`); a lending Mac keeps nothing but programs its
+  owner allowed to be installed (`~/.macmesh/tools`).
 - **Still on you:** keep FileVault on, because cached media is not separately
   encrypted on disk. Tasks run as your user, not a separate low-privilege
   account. There are no memory limits per task. Don't add `sh`/`python3` to
@@ -352,12 +371,14 @@ python3 -m unittest discover -s tests -v
 
 The suite starts in-process workers to stand in for Macs. It covers:
 - the frame-exact video stitch, frame-range renders with a fake app, and batch jobs;
-- a node dying mid-job, a node going silent (detected within seconds), shutdown handing work back, and a busy owner getting their Mac back (pause, resume, yield);
+- a node dying mid-job, a node going silent (detected within seconds), shutdown handing work back, a busy owner getting their Mac back (pause, resume, yield), and the governor keeping the Mac under its limit (a real task held to a quarter of the CPU);
 - build matching, and blob cleanup and expiry;
-- pairing by code (and a wrong code), pairing by request (allowed, refused, and a broken commitment), mutual TLS jobs, and refusal of plain HTTP, foreign CAs and revoked certificates;
+- pairing by code (and a wrong code), pairing by request (allowed, refused, and a broken commitment), the two-Mac limit, mutual TLS jobs, and refusal of plain HTTP, foreign CAs and revoked certificates;
 - the sandbox (no home reads, no private temp reads, no writes outside, no network);
 - multi-step tasks, failure markers, exact seconds at NTSC rates, media scanning, app profiles (including a job whose media must be shipped and relinked), and dropping v0.1's GUI-app config entries;
-- the control socket and the MCP server (jobs, cancelling, lending);
+- the control socket and the MCP server (jobs, cancelling, lending), and a running job's live details (what each Mac is doing, bytes moved, CPU sampled, events);
+- install recipes: an allowed install joining a running job, a declined one leaving the Mac out, and nothing running before Allow;
+- the progress estimate not counting chunks queued behind another, and finding Antigravity in `~/.gemini/bin`;
 - the AI, with a fake agent standing in for Claude Code: safe plans running at once, unsafe ones waiting for an OK, plans refused for touching files you didn't name, explanations, and teaching an app whose first profile fails the test render and whose second passes;
 - permanent failure after retries, signature tampering, the program allowlist, and tar traversal.
 

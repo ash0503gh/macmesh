@@ -16,7 +16,7 @@ import time
 import unittest
 from pathlib import Path
 
-from macmesh import ai, config, control, jobspec, media, mediarefs, owner, pairing, pki, profiles, sandbox, toolinfo, wire
+from macmesh import ai, config, control, jobspec, media, mediarefs, owner, pairing, pki, profiles, sandbox, sysinfo, toolinfo, wire
 from macmesh import mcp as mcp_module
 from macmesh import worker as worker_module
 from macmesh.client import NodeClient, NodeError
@@ -24,6 +24,7 @@ from macmesh.planners import plan_app, plan_batch, plan_range, plan_video
 from macmesh.planners.range import exact_fps
 from macmesh.planners.ai import extract_plan
 from macmesh.scheduler import JobFailed, Scheduler
+from macmesh import scheduler as scheduler_module
 from macmesh.worker import Worker, make_server
 
 TOKEN = "test-token"
@@ -138,6 +139,22 @@ class JobSpecTests(unittest.TestCase):
         self.assertEqual(extract_plan('text {"planner": "video", "params": {}} more')["planner"], "video")
         with self.assertRaises(ValueError):
             extract_plan("no json here")
+
+
+class EstimateTests(unittest.TestCase):
+    def test_a_chunk_queued_behind_another_is_not_counted_as_running(self):
+        class Fake:
+            address, name, info = "air:7477", "air", {"slots": 1, "hardware": {"score": 1.0}}
+        job = {"name": "j", "workdir": tempfile.mkdtemp(), "merge": [],
+               "tasks": [{"id": f"t{i}", "argv": ["x"], "cost": 10.0} for i in range(3)]}
+        s = Scheduler(job, [Fake()])
+        node, now = s.nodes[0], time.time()
+        node.speeds = [1.0]  # 10 s per chunk
+        s.tasks[0].copies["air:7477"] = now - 20  # running for 5 s: its Mac freed up 5 s ago
+        s.tasks[1].copies["air:7477"] = now - 20  # queued behind it
+        node.free_at = now - 5
+        progress, _ = s.estimate(20)
+        self.assertAlmostEqual(progress, 5 / 30, places=2)
 
 
 class MeshCase(unittest.TestCase):
@@ -313,6 +330,90 @@ class Relay:
             s.close()
 
 
+class InstallTests(MeshCase):
+    """A Mac without the job's program is asked to set it up; its owner decides."""
+
+    def setUp(self):
+        super().setUp()
+        self.nodes[1].stop()
+        air = self.tmp / "air"
+        (air / "apps").mkdir(parents=True, exist_ok=True)
+        (air / "apps" / "fakeapp.json").write_text(json.dumps({
+            "name": "fakeapp", "program": {"path": str(air / "tools" / "fakeapp" / "fakeapp")},
+            "install": {"summary": "The fake renderer", "files": {"fakeapp": FAKE_RENDERER},
+                        "executable": ["fakeapp"], "steps": [["{python}", "-c", "print('setting up')"]]}}))
+        self.nodes[1] = Node(self.tmp, "air", {})
+
+    def answer(self, allow: bool):
+        installer = self.nodes[1].worker.installer
+
+        def owner():
+            for _ in range(200):
+                if any(r["state"] == "asking" for r in installer.list()):
+                    installer.decide("fakeapp", allow)
+                    return
+                time.sleep(0.02)
+        threading.Thread(target=owner, daemon=True).start()
+
+    def run_with_installs(self, job, clients=None):
+        lines = []
+        os.environ["FAKE_DELAY"] = "0.4"
+        old, scheduler_module.INSTALL_RECHECK = scheduler_module.INSTALL_RECHECK, 0.3
+        try:
+            self.run_job(job, clients, log=lines.append,
+                         installer=lambda client, prog: client.request_install(prog, "pro"))
+        finally:
+            os.environ.pop("FAKE_DELAY")
+            scheduler_module.INSTALL_RECHECK = old
+        return lines
+
+    def test_an_allowed_install_joins_the_running_job(self):
+        self.answer(True)
+        lines = self.run_with_installs(self.range_job(frames=800))
+        self.assertEqual(len(os.listdir(self.tmp / "out/frames")), 800)
+        self.assertTrue(any("asked air to install fakeapp" in m for m in lines), lines)
+        self.assertTrue(any("air installed fakeapp: using it now" in m for m in lines), lines)
+        self.assertTrue(any(" on air in " in m for m in lines), lines)
+        self.assertIn("fakeapp", self.nodes[1].worker.programs())
+
+    def test_a_declined_install_leaves_the_mac_out(self):
+        self.answer(False)
+        lines = self.run_with_installs(self.range_job(frames=400))
+        self.assertEqual(len(os.listdir(self.tmp / "out/frames")), 400)
+        self.assertEqual(self.nodes[1].worker.installer.states(), {"fakeapp": "declined"})
+        self.assertFalse(any(" on air in " in m for m in lines), lines)
+        self.assertNotIn("fakeapp", self.nodes[1].worker.programs())
+
+    def test_a_job_only_the_declining_mac_could_run_fails(self):
+        self.answer(False)
+        with self.assertRaisesRegex(JobFailed, "no node has 'fakeapp'"):
+            self.run_with_installs(self.range_job(frames=100), clients=[self.nodes[1].client()])
+
+    def test_the_program_appears_only_once_its_install_has_finished(self):
+        air = self.tmp / "air"
+        prof = json.loads((air / "apps" / "fakeapp.json").read_text())
+        prof["install"]["steps"] = [["{python}", "-c", "import time; time.sleep(1.5)"]]
+        (air / "apps" / "fakeapp.json").write_text(json.dumps(prof))
+        installer = self.nodes[1].worker.installer
+        installer.ask("fakeapp", "pro")
+        installer.decide("fakeapp", True)
+        time.sleep(0.5)
+        self.assertEqual(installer.states(), {"fakeapp": "installing"})
+        self.assertNotIn("fakeapp", self.nodes[1].worker.programs())  # not before it works
+        for _ in range(100):
+            if installer.states()["fakeapp"] != "installing":
+                break
+            time.sleep(0.05)
+        self.assertEqual(installer.states(), {"fakeapp": "done"})
+        self.assertIn("fakeapp", self.nodes[1].worker.programs())
+
+    def test_only_this_macs_own_recipes_run(self):
+        installer = self.nodes[1].worker.installer
+        self.assertEqual(installer.ask("not-a-tool", "pro")["state"], "unavailable")
+        self.assertEqual(installer.ask("fakeapp", "pro")["state"], "asking")
+        self.assertFalse((self.tmp / "air" / "tools").exists())  # nothing runs before Allow
+
+
 class ResilienceTests(MeshCase):
     """Macs that vanish, shut down, or whose owner needs them back."""
 
@@ -387,24 +488,53 @@ class OwnerTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_watch_rules(self):
-        policy = dict(config.defaults()["owner"])
-        sample = {"cpu": 0.1, "gpu": 0.2, "idle": 300.0}
+        policy = dict(config.defaults()["owner"])  # shared, limit 90%
+        sample = {"cpu": 0.5, "idle": 300.0}
         w = owner.OwnerWatch(policy, sample=lambda ours: sample)
-        self.assertEqual(w.busy(set(), paused=False), "")
-        sample["cpu"] = 0.8
+        self.assertEqual(w.busy(set(), paused=False), "")  # the Governor makes room; no need to stop
+        sample["cpu"] = 0.85  # leaves us under 10%: step aside
         self.assertIn("CPU", w.busy(set(), paused=False))
-        # GPU only counts while someone is at the keyboard (or our tasks are paused)...
-        sample.update(cpu=0.1, gpu=0.9, idle=300.0)
-        self.assertEqual(w.busy(set(), paused=False), "")
-        sample["idle"] = 2.0
-        self.assertIn("GPU", w.busy(set(), paused=False))
-        # ...and if it goes quiet the moment we pause, it was ours: ignore the GPU for a while.
-        sample["gpu"] = 0.05
-        self.assertEqual(w.busy(set(), paused=True), "")
-        sample["gpu"] = 0.9
-        self.assertEqual(w.busy(set(), paused=False), "")
-        idle = owner.OwnerWatch(dict(policy, mode="idle"), sample=lambda ours: {"cpu": 0, "gpu": 0, "idle": 5.0})
+        idle = owner.OwnerWatch(dict(policy, mode="idle"), sample=lambda ours: {"cpu": 0, "idle": 5.0})
         self.assertIn("active", idle.busy(set(), paused=False))
+
+    def test_governor_keeps_the_mac_under_the_limit(self):
+        owner_load = {"cpu": 0.0, "gpu": 0.0}
+        # Our task alone would use 30% of the CPU and 99% of the GPU; it gets `duty` of the time.
+        g = owner.Governor({"limit": 0.9}, sample=lambda: {"cpu": min(1.0, owner_load["cpu"] + 0.3 * g.duty),
+                                                           "gpu": min(1.0, owner_load["gpu"] + 0.99 * g.duty)})
+        for _ in range(15):
+            g.step()
+        self.assertLessEqual(0.99 * g.duty, 0.91)  # the GPU held at about 90%...
+        self.assertGreater(g.duty, 0.8)            # ...slowing only as much as needed
+        owner_load["cpu"] = 0.8  # the owner starts something big: back right off
+        for _ in range(10):
+            g.step()
+        self.assertLessEqual(0.8 + 0.3 * g.duty, 0.92)
+        owner_load["cpu"] = 0.1  # they're done: speed up again
+        for _ in range(15):
+            g.step()
+        self.assertGreater(g.duty, 0.8)
+
+    def test_governor_slows_running_tasks(self):
+        cfg = config.defaults()
+        cfg.update(node_name="t", token=TOKEN, port=0, tools={"busy": {"path": "/bin/sh"}})
+        w = Worker(cfg, home=self.tmp / "g", owner_sample=lambda ours: {"cpu": 0.0, "idle": None},
+                   governor_sample=lambda: {"cpu": 0.0, "gpu": None})
+        w.governor.duty = 0.25  # as if the Mac were busy: run a quarter of the time
+        w.governor.step = w.governor.reset = lambda: 0.25
+        task = w.submit({"task_id": "y", "argv": ["busy", "-c", "while :; do :; done"]})
+        for _ in range(100):
+            if task.proc:
+                break
+            time.sleep(0.05)
+        time.sleep(1.0)
+        t0 = sysinfo.process_table()[task.proc.pid][1]
+        time.sleep(3.0)
+        used = sysinfo.process_table()[task.proc.pid][1] - t0
+        w.cancel("y")
+        w.stopped.set()
+        self.assertLess(used, 1.6)   # a quarter of 3 s, give or take; unthrottled would be ~3 s
+        self.assertGreater(used, 0.3)
 
     def test_pause_resume_then_yield(self):
         sample = {"cpu": 0.0, "gpu": None, "idle": None}
@@ -531,8 +661,9 @@ class TLSTests(unittest.TestCase):
         self.assertFalse(pki.ready(self.b))
         self.assertNotEqual(self.cfg_b["token"], TOKEN)
 
-    def request(self, decide: bool | None):
+    def request(self, decide: bool | None, cfg: dict | None = None, home: Path | None = None):
         """Ask to join; the first Mac's side decides once the request shows up. Returns (numbers seen, error)."""
+        cfg, home = cfg or self.cfg_b, home or self.b
         server = pairing.PairingServer(self.cfg_a, 0, home=self.a, host="127.0.0.1")
         seen, error = {}, None
 
@@ -549,7 +680,7 @@ class TLSTests(unittest.TestCase):
 
         threading.Thread(target=first_mac, daemon=True).start()
         try:
-            pairing.request_join(self.cfg_b, [f"127.0.0.1:{server.port}"], home=self.b,
+            pairing.request_join(cfg, [f"127.0.0.1:{server.port}"], home=home,
                                  on_number=lambda n: seen.update(new=n))
         except pairing.PairingError as e:
             error = str(e)
@@ -571,6 +702,17 @@ class TLSTests(unittest.TestCase):
         self.assertIn("didn't let this one in", error)
         self.assertFalse(pki.ready(self.b))
         self.assertNotEqual(self.cfg_b["token"], TOKEN)
+
+    def test_a_mesh_takes_two_macs_for_now(self):
+        self.assertIsNone(self.request(True)[1])
+        third_cfg, third = config.defaults(), self.tmp / "mini"
+        seen, error = self.request(True, third_cfg, third)
+        self.assertIn("already has 2 Macs", error)
+        self.assertNotIn("new", seen)  # refused before any number was shown
+        self.assertFalse(pki.ready(third))
+        self.assertIsNone(self.request(True)[1])  # the Mac already in may ask again
+        self.cfg_a["revoked"] = [pki.own_fingerprint(self.b)]  # removing it makes room
+        self.assertIsNone(self.request(True, third_cfg, third)[1])
 
     def test_a_broken_commitment_is_refused(self):
         server = pairing.PairingServer(self.cfg_a, 0, home=self.a, host="127.0.0.1")
@@ -637,6 +779,7 @@ case "$1" in
   info) cat "$2" ;;
   relink) test -f "$3/clip.dat" || { echo "no media in $3"; exit 4; }; echo relinked > "$2.linked" ;;
   render) test -f "$2.linked" || { echo '{"offline": ["clip.dat"]}'; exit 0; }
+          if [ -n "$FAKE_BUSY" ]; then end=$(($(date +%s) + FAKE_BUSY)); while [ "$(date +%s)" -lt $end ]; do i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; done; fi
           mkdir -p "$5"; i=$3; while [ $i -lt $4 ]; do echo "$i" > "$5/frame_$(printf %05d $i).txt"; i=$((i+1)); done ;;
 esac
 """
@@ -863,6 +1006,33 @@ class ControlTests(MeshCase):
         self.assertEqual(len(os.listdir(job["output"])), 120)
         self.assertEqual(self.client.call("jobs")[0]["id"], job["id"])
 
+    def test_a_running_job_shows_what_each_mac_is_doing(self):
+        os.environ["FAKE_BUSY"] = "6"  # each chunk keeps a core busy for 6 s
+        seen_running, seen_cpu = False, False
+        try:
+            job = self.client.call("start", kind="app", path=str(self.project), chunk=60)
+            deadline = time.time() + 60
+            while time.time() < deadline:
+                job = self.client.call("job", id=job["id"])
+                for mac in job["macs"]:
+                    if any(d["phase"] == "running" and d["label"].startswith("Frames ") for d in mac["doing"]):
+                        seen_running = True
+                    if any(point["cpu"] > 5 and point["cores"] for point in mac["load"]):
+                        seen_cpu = True
+                if job["state"] in ("done", "failed", "cancelled"):
+                    break
+                time.sleep(0.3)
+        finally:
+            os.environ.pop("FAKE_BUSY")
+        self.assertEqual(job["state"], "done", job)
+        self.assertTrue(seen_running, "no Mac ever showed a chunk running")
+        self.assertTrue(seen_cpu, "no CPU used by the job was ever sampled")
+        self.assertEqual([c["label"] for c in job["chunks"]], ["Frames 0\u201359", "Frames 60\u2013119"])
+        self.assertTrue(all(c["phase"] == "done" and c["seconds"] >= 4.5 for c in job["chunks"]), job["chunks"])
+        self.assertGreater(sum(m["sent"] for m in job["macs"]), 0)  # the project and its media went out
+        self.assertTrue(any("on pro in" in e["text"] for e in job["events"]), job["events"])
+        self.assertTrue(all(e["at"] > job["created"] - 1 for e in job["events"]))
+
     def test_cancel_and_lending(self):
         os.environ["FAKE_DELAY"] = "1"
         try:
@@ -900,6 +1070,18 @@ class ControlTests(MeshCase):
         self.assertIn("error", server.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                                               "params": {"name": "rm_rf"}}))
         self.assertIsNone(server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+        # 0.3.4: batches, the owner's limit, and answering requests (only with the user's yes)
+        tools = {t["name"]: t for t in server.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/list"})["result"]["tools"]}
+        self.assertTrue({"files", "template", "out_ext"} <= set(tools["start_job"]["inputSchema"]["properties"]))
+        self.assertTrue({"answer_join_request", "answer_install_request"} <= set(tools))
+        self.assertIn("give path", call("start_job")["content"][0]["text"])
+        st = json.loads(call("set_lending", limit=0.8, mode="shared")["content"][0]["text"])
+        self.assertEqual((st["limit"], st["owner_mode"]), (0.8, "shared"))
+        self.assertEqual(config.load()["owner"]["limit"], 0.8)
+        self.assertTrue(call("set_lending", limit=0.99)["isError"])
+        gone = call("answer_install_request", program="demucs-stem", allow=True)
+        self.assertTrue(gone["isError"])
+        self.assertIn("gone", gone["content"][0]["text"])
 
 
 FAKE_AGENT = """#!/usr/bin/env python3
@@ -919,6 +1101,27 @@ else:
     reply = open(os.path.join(d, f"profile-{attempt}.json")).read()
 print(json.dumps({"type": "result", "result": "Here you go:\\n" + reply}))
 """
+
+
+class AgentLookupTests(unittest.TestCase):
+    def test_finds_antigravity_where_its_installer_puts_it(self):
+        home = Path(tempfile.mkdtemp())
+        agy = home / ".gemini/bin/agy"
+        agy.parent.mkdir(parents=True)
+        agy.write_text("#!/bin/sh\n")
+        agy.chmod(0o755)
+        old = dict(os.environ)
+        os.environ.update(HOME=str(home), PATH="/usr/bin:/bin")  # the app's engine gets a bare PATH
+        saved, ai._login_path = ai._login_path, []
+        try:
+            cfg = config.defaults()
+            self.assertEqual(ai.available(cfg).get("antigravity"), str(agy))
+            self.assertTrue(ai._agent_env(str(agy))["PATH"].startswith(str(agy.parent) + ":"))
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+            ai._login_path = saved
+            shutil.rmtree(home, ignore_errors=True)
 
 
 class AITests(ControlTests):

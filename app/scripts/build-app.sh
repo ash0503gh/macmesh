@@ -27,6 +27,7 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$engine/lib"
 cp "$bin/Macmesh" "$app/Contents/MacOS/"
 cp Support/Info.plist "$app/Contents/"
+cp Support/icon/AppIcon.icns "$app/Contents/Resources/"   # from scripts/make-icon.swift
 tar -xzf "$tarball" -C "$engine"   # unpacks to engine/python
 rsync -a --exclude __pycache__ ../macmesh "$engine/lib/"
 

@@ -17,6 +17,7 @@ struct PopoverView: View {
                 }
             }
             ForEach(engine.status?.invite.requests ?? []) { JoinRequestBanner(request: $0, compact: true) }
+            ForEach((engine.status?.installs ?? []).filter { $0.state != "declined" }) { InstallRequestBanner(request: $0, compact: true) }
             switch engine.phase {
             case .running:
                 ForEach(engine.activeJobs) { job in
@@ -64,6 +65,8 @@ struct PopoverView: View {
                     NSApp.activate()
                 }
                 .keyboardShortcut("o")
+                Spacer()
+                Text(Format.appVersion).font(.caption2).foregroundStyle(.tertiary)
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }.keyboardShortcut("q")
             }

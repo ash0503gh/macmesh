@@ -2,8 +2,8 @@
 
 CPU is attributed exactly: everything that isn't a macmesh task (or the worker
 itself) counts as the owner's. GPU use can't be split by process without root
-(powermetrics), so it's read as a total and only trusted while the owner is at
-the keyboard; once our tasks are paused the reading is the owner's alone.
+(powermetrics), so the Governor keeps the whole GPU (and CPU) under the owner's
+limit by slowing our tasks, rather than guessing whose GPU work it is.
 """
 
 from __future__ import annotations
@@ -54,47 +54,84 @@ def idle_seconds() -> float | None:
 
 
 class OwnerWatch:
-    """Decides, sample by sample, whether the owner needs the Mac.
+    """Decides, sample by sample, whether the owner needs the Mac back entirely.
 
-    busy() takes the process groups of our running tasks and whether they're
-    paused right now (then every GPU cycle is the owner's). It returns a reason
+    In "shared" mode the Governor already slows our tasks so the owner has room on CPU and GPU;
+    this only says "step aside" once the owner leaves us less than 10% of the CPU under their
+    limit. In "idle" mode, any recent keyboard or mouse use does. busy() returns a reason
     string while the owner is busy, else "". `sample` is injectable for tests.
     """
-
-    GPU_BACKOFF = 120.0  # after a GPU reading turned out to be ours, ignore the GPU this long
 
     def __init__(self, policy: dict, sample=None):
         self.policy = policy
         self.sample = sample or self._sample
-        self.gpu_ignored_until = 0.0
-        self.gpu_triggered = False
 
     @staticmethod
     def _sample(ours: set[int]) -> dict:
-        return {"cpu": owner_cpu(ours), "gpu": gpu_utilization(), "idle": idle_seconds()}
+        return {"cpu": owner_cpu(ours), "idle": idle_seconds()}
 
     def busy(self, ours: set[int], paused: bool) -> str:
-        p, s, now = self.policy, self.sample(ours), time.time()
-        idle = s["idle"]
+        p, s = self.policy, self.sample(ours)
         if p.get("mode") == "idle":
+            idle = s["idle"]
             if idle is not None and idle < p["idle_seconds"]:
                 return f"owner active {idle:.0f}s ago"
             return ""
-        if s["cpu"] > p["cpu"]:
-            self.gpu_triggered = False
+        if s["cpu"] > min(0.95, max(0.5, float(p.get("limit", 0.9)))) - 0.10:
             return f"owner using {s['cpu']:.0%} CPU"
-        gpu = s["gpu"]
-        if gpu is None:
-            return ""
-        if paused and self.gpu_triggered:
-            if gpu > p["gpu"]:
-                return f"owner using {gpu:.0%} GPU"
-            # We paused for the GPU and it went quiet at once: it was our own task.
-            self.gpu_triggered = False
-            self.gpu_ignored_until = now + self.GPU_BACKOFF
-            return ""
-        at_keyboard = idle is not None and idle < 10
-        if gpu > p["gpu"] and (paused or at_keyboard) and now >= self.gpu_ignored_until:
-            self.gpu_triggered = True
-            return f"owner using {gpu:.0%} GPU"
         return ""
+
+
+class Governor:
+    """Keeps the whole Mac, the owner's work and macmesh's together, at or under the owner's limit
+    (90% unless they chose otherwise), for CPU and GPU alike.
+
+    macmesh's tasks run for `duty` of every short period and are stopped (SIGSTOP) for the rest.
+    Each step measures the Mac and nudges `duty`: down in proportion when the Mac is over the
+    limit, back up gently when there's room. So an idle owner gets ~90% of the Mac working for
+    others, and a busy owner gets whatever they need, with macmesh slowing rather than stopping.
+    `sample` is injectable for tests: () -> {"cpu": 0-1 whole Mac, "gpu": 0-1 or None}.
+    """
+
+    FLOOR = 0.05   # never slower than this; if the owner leaves less room than that, the worker steps aside
+    MARGIN = 0.05  # speed back up only when the Mac is this far under the limit
+
+    def __init__(self, policy: dict, sample=None):
+        self.policy = policy
+        self.duty = 1.0
+        self.last = {"cpu": None, "gpu": None}
+        self.sample = sample or self._sample
+        self._cpu_times: dict[int, float] = {}
+        self._cpu_at = 0.0
+
+    @property
+    def limit(self) -> float:
+        return min(0.95, max(0.5, float(self.policy.get("limit", 0.9))))
+
+    def _sample(self) -> dict:
+        from .sysinfo import gpu_percent, process_table
+        now, table = time.time(), process_table()
+        cpu = None
+        if self._cpu_at:
+            used = sum(max(0.0, t - self._cpu_times.get(pid, t)) for pid, (_, t) in table.items())
+            cpu = used / max(now - self._cpu_at, 0.1) / (os.cpu_count() or 1)
+        self._cpu_times, self._cpu_at = {pid: t for pid, (_, t) in table.items()}, now
+        gpu = gpu_percent()
+        return {"cpu": cpu, "gpu": None if gpu is None else gpu / 100.0}
+
+    def step(self) -> float:
+        s = self.sample()
+        self.last = s
+        loads = [v for v in (s.get("cpu"), s.get("gpu")) if v is not None]
+        if not loads:
+            return self.duty
+        over = max(loads) - self.limit
+        if over > 0.01:
+            self.duty = max(self.FLOOR, self.duty * (1 - min(0.6, over * 2.5)))
+        elif over < -self.MARGIN:
+            self.duty = min(1.0, self.duty + 0.08)
+        return self.duty
+
+    def reset(self) -> None:
+        """Nothing is running: start at full speed next time, measuring afresh."""
+        self.duty, self._cpu_at = 1.0, 0.0

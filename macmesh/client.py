@@ -87,11 +87,25 @@ class NodeClient:
         self.info = info
         return info
 
+    def request_install(self, program: str, by: str) -> dict:
+        """Ask this Mac to set up `program` (its owner decides). Returns {"state", ...}."""
+        code, body = self._json("POST", "/install", {"program": program, "by": by})
+        if code != 200:
+            raise NodeError(f"{self.address}: /install returned {code}: {body.get('error', '')}")
+        return body
+
+    def usage(self) -> dict:
+        """CPU per job and the GPU's load, sampled every 2 s while tasks run: {"jobs", "gpu", "cores", "at"}."""
+        code, body = self._json("GET", "/usage")
+        if code != 200:
+            raise NodeError(f"{self.address}: /usage returned {code}")
+        return body
+
     def has_blob(self, sha: str) -> bool:
         code, _ = self._request("HEAD", f"/blobs/{sha}")
         return code == 200
 
-    def put_blob(self, sha: str, path: Path) -> None:
+    def put_blob(self, sha: str, path: Path, progress=None) -> None:
         size = path.stat().st_size
         req_path = f"/blobs/{sha}"
         conn = None
@@ -105,6 +119,8 @@ class NodeClient:
             with open(path, "rb") as f:
                 for block in iter(lambda: f.read(wire.CHUNK), b""):
                     conn.send(block)
+                    if progress:
+                        progress(len(block))
             resp = conn.getresponse()
             data = resp.read()
         except (OSError, http.client.HTTPException) as e:
@@ -135,7 +151,7 @@ class NodeClient:
             raise NodeError(f"{self.address}: lost task {task_id} (worker restarted?)")
         return body
 
-    def download(self, task_id: str, name: str, dest: Path) -> None:
+    def download(self, task_id: str, name: str, dest: Path, progress=None) -> None:
         path = f"/tasks/{task_id}/out/{name}"
         tmp = dest.with_name(dest.name + ".part")
         conn = None
@@ -146,7 +162,10 @@ class NodeClient:
             if resp.status != 200:
                 raise NodeError(f"{self.address}: download {name} returned {resp.status}")
             with open(tmp, "wb") as f:
-                shutil.copyfileobj(resp, f, wire.CHUNK)
+                for block in iter(lambda: resp.read(wire.CHUNK), b""):
+                    f.write(block)
+                    if progress:
+                        progress(len(block))
             os.replace(tmp, dest)
         except (OSError, http.client.HTTPException) as e:
             raise NodeError(f"{self.address}: download failed: {e}") from e

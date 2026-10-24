@@ -11,12 +11,28 @@ struct MeshStatus: Decodable, Equatable {
     var running: Int
     var paused: Int
     var ownerMode: String?
+    var limit: Double?   // the most of this Mac (CPU and GPU, owner + macmesh) to use, 0.5-0.95
+    var duty: Double?    // how much of the time macmesh's tasks run right now, to stay under it
     var tls: Bool
     var holdsCa: Bool
     var fingerprint: String
     var outputDir: String
     var mesh: String?
     var firewall: Firewall?
+    var version: String?
+    var installs: [InstallRequest]?
+
+    /// Another Mac's job needs a program this Mac lacks; its owner decides whether to set it up.
+    struct InstallRequest: Decodable, Equatable, Identifiable {
+        var program: String
+        var summary: String
+        var description: String?
+        var by: String
+        var state: String   // asking, installing, done, failed, declined
+        var detail: String?
+        var error: String?
+        var id: String { program }
+    }
     var invite: Invite
     var macs: [Mac]
     var jobs: [Job]
@@ -28,6 +44,8 @@ struct MeshStatus: Decodable, Equatable {
         var joined: String?
         var error: String?
         var requests: [JoinRequest]?
+        var full: Bool?
+        var maxMacs: Int?
     }
 
     /// A Mac asking to join (on the Mac that started the mesh): allow it if the numbers match.
@@ -88,18 +106,54 @@ struct Job: Decodable, Equatable, Identifiable {
     var speedup: Double?
     var created: Double
     var kind: String?
+    var events: [Event]?
 
     struct JobMac: Decodable, Equatable {
         var nodeId: String?
         var name: String
         var done: Int
         var running: Int
+        var doing: [Activity]?
+        var sent: Int?
+        var received: Int?
+        var upRate: Double?
+        var downRate: Double?
+        var load: [LoadPoint]?
+        var installing: [String]?
+    }
+
+    /// What one copy of a chunk is doing on a Mac: uploading, queued, running, paused or downloading.
+    struct Activity: Decodable, Equatable {
+        var label: String
+        var phase: String
+        var since: Double   // seconds in this phase
+        var bytes: Int
+        var total: Int
+    }
+
+    /// One sample of a Mac's load: CPU used by this job (100 = every core) and the whole GPU.
+    struct LoadPoint: Decodable, Equatable {
+        var at: Double
+        var cpu: Double
+        var gpu: Double?
+        var cores: Int?
+        var duty: Double?
+        var limit: Double?
+    }
+
+    struct Event: Decodable, Equatable {
+        var at: Double
+        var text: String
     }
 
     /// One chunk of the job: its state and the Mac that did it (or is doing it).
     struct Chunk: Decodable, Equatable {
         var state: String
         var mac: String
+        var label: String?
+        var phase: String?
+        var seconds: Double?
+        var attempts: Int?
     }
 
     var isActive: Bool { ["starting", "running", "merging", "paused"].contains(state) }
@@ -139,6 +193,38 @@ struct Inspection: Decodable, Equatable {
 }
 
 enum Format {
+    /// "12 MB", "1.4 GB".
+    static func bytes(_ n: Int) -> String {
+        n == 0 ? "\u{2013}" : ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
+    }
+
+    /// "0:52", "12:05", "1:02:03".
+    static func clock(_ seconds: Double) -> String {
+        let s = max(0, Int(seconds.rounded()))
+        return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
+                         : String(format: "%d:%02d", s / 60, s % 60)
+    }
+
+    /// The scheduler's log line in plain words: "→ x on Air" becomes "Started x on Air".
+    static func event(_ line: String) -> String {
+        var t = line.trimmingCharacters(in: .whitespaces)
+        let rules: [(String, String)] = [("→ ", "Started "), ("✓ ", "Finished "), ("↻ ", "Copied "), ("✗ ", ""),
+                                         ("! ", ""), ("? ", "")]
+        for (prefix, word) in rules where t.hasPrefix(prefix) {
+            t = word + t.dropFirst(prefix.count)
+            break
+        }
+        t = t.replacingOccurrences(of: #"\s+\[\d+/\d+\]$"#, with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: ": duplicating on ", with: " to ")
+        t = t.replacingOccurrences(of: " (straggler)", with: " to finish sooner")
+        return t
+    }
+
+    /// This app's version, as "v0.3.4".
+    static var appVersion: String {
+        "v" + ((Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev")
+    }
+
     /// "2 min", "45 s", "1 h 5 min".
     static func duration(_ seconds: Double) -> String {
         let s = Int(seconds.rounded())

@@ -115,7 +115,8 @@ def extract_plan(raw: str) -> dict:
 
 def plan_with_agent(request: str, files: list[str], nodes: list[dict], cfg: dict,
                     agent: str | None = None, home: Path | None = None) -> dict:
-    prompt = build_prompt(request, files, nodes, toolinfo.tools(cfg, home), profiles.load(home))
+    apps = {k: p for k, p in profiles.load(home).items() if p.get("range")}  # the rest are plain tools
+    prompt = build_prompt(request, files, nodes, toolinfo.tools(cfg, home), apps)
     plan = extract_plan(ai.ask(prompt, cfg, agent))
     if plan.get("planner") not in ("app", "video", "range", "batch", "job"):
         raise ValueError(f"agent chose unknown planner {plan.get('planner')!r}")

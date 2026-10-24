@@ -215,3 +215,63 @@ struct FirewallBanner: View {
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.orange.opacity(0.1)))
     }
 }
+
+/// On a lending Mac: another Mac's job needs a program this one lacks. Nothing installs until Allow.
+struct InstallRequestBanner: View {
+    @Environment(Engine.self) private var engine
+    var request: MeshStatus.InstallRequest
+    var compact = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                icon
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).fontWeight(.medium)
+                    Text(detail).font(.callout).foregroundStyle(.secondary).lineLimit(compact ? 3 : 4)
+                }
+            }
+            if request.state == "asking" {
+                HStack {
+                    Spacer()
+                    Button("Don't allow") { Task { await engine.decideInstall(request, allow: false) } }
+                    Button("Allow") { Task { await engine.decideInstall(request, allow: true) } }.buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(tint.opacity(0.1)))
+    }
+
+    @ViewBuilder private var icon: some View {
+        switch request.state {
+        case "installing": ProgressView().controlSize(.small)
+        case "done": Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case "failed": Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        default: Image(systemName: "shippingbox").foregroundStyle(Color.accentColor)
+        }
+    }
+
+    private var tint: Color {
+        request.state == "failed" ? .orange : request.state == "done" ? .green : .accentColor
+    }
+
+    private var title: String {
+        switch request.state {
+        case "installing": "Installing \(request.program)\u{2026}"
+        case "done": "Installed \(request.program)"
+        case "failed": "Couldn't install \(request.program)"
+        default: "\(request.by) needs \(request.program) on this Mac"
+        }
+    }
+
+    private var detail: String {
+        switch request.state {
+        case "installing": request.detail.flatMap { $0.isEmpty ? nil : $0 } ?? "Setting it up\u{2026}"
+        case "done": "This Mac can help with \(request.program) jobs now."
+        case "failed": request.error ?? "Something went wrong."
+        default: "To help with its job: \(request.summary). It goes into macmesh's own folder, with no administrator password."
+        }
+    }
+}

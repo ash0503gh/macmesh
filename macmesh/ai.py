@@ -20,7 +20,11 @@ from pathlib import Path
 
 # In order of preference for agent "auto".
 AGENT_ORDER = ["claude", "antigravity"]
-SEARCH = ["~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+# Where agent installers put their CLIs, for when the app's engine runs with macOS's bare PATH.
+# (Antigravity's installer uses ~/.gemini/bin and doesn't add it to the shell's PATH.)
+SEARCH = ["~/.local/bin", "~/.gemini/bin", "~/.antigravity/bin", "~/.claude/local", "~/.npm-global/bin",
+          "~/.bun/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+_login_path: list[str] | None = None
 MEDIA_EXT = {".mov", ".mp4", ".m4v", ".mkv", ".mxf", ".avi", ".webm", ".wav", ".aif", ".aiff", ".mp3", ".m4a",
              ".flac", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".dpx", ".psd", ".heic", ".gif"}
 FILE_LIMIT = 64_000      # characters of one project file
@@ -31,15 +35,31 @@ class AgentError(RuntimeError):
     pass
 
 
+def _login_shell_path() -> list[str]:
+    """The PATH a Terminal window gets (asked once), which the app's engine doesn't inherit."""
+    global _login_path
+    if _login_path is None:
+        try:
+            out = subprocess.run([os.environ.get("SHELL") or "/bin/zsh", "-lic", "echo __PATH__$PATH"],
+                                 capture_output=True, text=True, timeout=5, stdin=subprocess.DEVNULL).stdout
+            _login_path = next((line[8:].split(":") for line in out.splitlines() if line.startswith("__PATH__")), [])
+        except (OSError, subprocess.SubprocessError):
+            _login_path = []
+    return _login_path
+
+
+def _search_path() -> list[str]:
+    folders = os.environ.get("PATH", "").split(":") + [str(Path(f).expanduser()) for f in SEARCH] + _login_shell_path()
+    return list(dict.fromkeys(f for f in folders if f))
+
+
 def _which(program: str) -> str | None:
-    found = shutil.which(program)
-    if found:
-        return found
-    for folder in SEARCH:
-        candidate = Path(folder).expanduser() / program
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    return None
+    return shutil.which(program, path=":".join(_search_path()))
+
+
+def _agent_env(exe: str) -> dict:
+    """The agent's own folder first, then everything else it may need (node for npm-installed CLIs)."""
+    return dict(os.environ, PATH=":".join(dict.fromkeys([str(Path(exe).parent)] + _search_path())))
 
 
 def available(cfg: dict) -> dict[str, str]:
@@ -109,7 +129,7 @@ def _run(prompt: str, cfg: dict, agent: str | None = None) -> str:
     with tempfile.TemporaryDirectory(prefix="macmesh-agent-") as empty:
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
-                                  stdin=subprocess.DEVNULL, cwd=empty)
+                                  stdin=subprocess.DEVNULL, cwd=empty, env=_agent_env(argv[0]))
         except subprocess.TimeoutExpired:
             raise AgentError(f"{name} didn't answer within {timeout:.0f} s") from None
         except OSError as e:

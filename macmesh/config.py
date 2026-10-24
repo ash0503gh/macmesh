@@ -62,8 +62,9 @@ def defaults() -> dict:
         # Owner first: pause tasks while this Mac's owner needs it, give them back if it lasts.
         # mode "shared" yields to heavy use, "idle" runs only while nobody touches the Mac,
         # "off" never yields. cpu/gpu are the owner's share of the Mac that counts as heavy use.
-        "owner": {"mode": "shared", "cpu": 0.5, "gpu": 0.6, "idle_seconds": 120,
-                  "calm_seconds": 10, "yield_after": 30},
+        "owner": {"mode": "shared", "idle_seconds": 120,
+                  "calm_seconds": 10, "yield_after": 30,
+                  "limit": 0.9},  # the whole Mac (owner + macmesh) stays at or under this, CPU and GPU
         "blob_ttl": 1800,           # seconds an unused uploaded file is kept
         "sandbox": True,            # run tasks under sandbox-exec (no network, writes only to the task)
         "tls": True,                # mutual TLS with certificates from the mesh's CA (see `macmesh invite`)

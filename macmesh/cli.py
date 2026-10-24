@@ -362,7 +362,7 @@ def cmd_apps(args) -> int:
         print(f"{name:<14} {status:<14} {build[:26]:<26} {p.get('description', '')}")
         if args.verbose:
             print(f"  profile: {p['source']}\n  program: {here.get(name) or p['program']['path']}")
-            for i, step in enumerate(p["range"]["steps"], 1):
+            for i, step in enumerate((p.get("range") or {}).get("steps", []), 1):
                 print(f"  step {i}: {name} {' '.join(step)}")
     return 0
 

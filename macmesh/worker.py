@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from . import __version__, config, owner, pki, sandbox, sysinfo, toolinfo, wire
+from . import __version__, config, install, owner, pki, sandbox, sysinfo, toolinfo, wire
 
 PLACEHOLDER = re.compile(r"\{(in|out):([A-Za-z0-9_.-]+)\}")
 SHA = re.compile(r"^[0-9a-f]{64}$")
@@ -41,6 +41,8 @@ TASK_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 LOG_TAIL = 4000
 MAX_JSON = 1 << 20
 OWNER_POLL = 2.0
+GOVERN_EVERY = 1.0   # seconds between measurements of the whole Mac
+DUTY_PERIOD = 0.1    # tasks run for duty x this, then stop for the rest
 GC_EVERY = 60.0
 ACTIVE = ("queued", "running", "paused")
 QOS = {"utility", "background", "maintenance"}
@@ -80,7 +82,7 @@ class Task:
 
 
 class Worker:
-    def __init__(self, cfg: dict, home: Path | None = None, owner_sample=None):
+    def __init__(self, cfg: dict, home: Path | None = None, owner_sample=None, governor_sample=None):
         self.cfg = cfg
         self.root = home or config.home()
         self.blobs = self.root / "blobs"
@@ -98,12 +100,18 @@ class Worker:
         self.draining = ""        # why this worker is going away, or ""
         self.stopped = threading.Event()
         self.watch = owner.OwnerWatch(cfg["owner"], sample=owner_sample)
+        self.installer = install.Installer(self.root, have=lambda name: name in self.programs())
+        self.load = {"at": 0.0, "gpu": None, "jobs": {}, "cores": os.cpu_count() or 1}
+        threading.Thread(target=self._load_loop, daemon=True).start()
         self._busy_since = 0.0
         self._calm_since: float | None = None
         self.collect_garbage()
         threading.Thread(target=self._gc_loop, daemon=True).start()
+        self.governor = owner.Governor(cfg["owner"], sample=governor_sample)
         if cfg["owner"].get("mode") != "off":
             threading.Thread(target=self._owner_loop, daemon=True).start()
+            threading.Thread(target=self._govern_loop, daemon=True).start()
+            threading.Thread(target=self._duty_loop, daemon=True).start()
 
     # ---- capabilities -------------------------------------------------
     def programs(self) -> dict[str, str]:
@@ -128,6 +136,7 @@ class Worker:
             "programs": sorted(self.programs()),
             "fingerprints": self.current_fingerprints(),
             "sandboxed": self.sandboxed,
+            "installs": self.installer.states(),
         }
 
     def current_fingerprints(self) -> dict:
@@ -233,6 +242,23 @@ class Worker:
             if SHA.match(sha) and old and self.delete_blob(sha):
                 removed += 1
         return removed
+
+    def _load_loop(self) -> None:
+        """While tasks run, sample their CPU (per asking job) and the GPU every 2 s for job views."""
+        meter = sysinfo.LoadMeter()
+        while not self.stopped.wait(2.0):
+            with self.lock:
+                roots: dict[str, list[int]] = {}
+                for t in self.tasks.values():
+                    if t.state == "running" and t.proc:
+                        job = str((t.spec.get("origin") or {}).get("job_id") or "local")
+                        roots.setdefault(job, []).append(t.proc.pid)
+            if not roots and not self.load["jobs"]:
+                meter.last_at = 0.0  # idle: start afresh next time
+                continue
+            jobs = meter.sample(roots, time.time())
+            self.load = {"at": time.time(), "gpu": sysinfo.gpu_percent(), "jobs": jobs, "cores": meter.cores,
+                         "duty": round(self.governor.duty, 2), "limit": self.governor.limit}
 
     def _gc_loop(self) -> None:
         while not self.stopped.wait(GC_EVERY):
@@ -453,6 +479,8 @@ class Worker:
         with self.lock:
             live = [t for t in self.tasks.values() if t.state in ("running", "paused") and t.proc]
         reason = self.watch.busy({t.proc.pid for t in live}, any(t.state == "paused" for t in live))
+        if not reason and live and self.governor.duty <= self.governor.FLOOR:
+            reason = f"owner needs more than {1 - self.governor.limit + self.governor.FLOOR:.0%} of this Mac"
         if reason:
             self._calm_since = None
             if not self.owner_busy:
@@ -466,6 +494,40 @@ class Worker:
             if now - self._calm_since >= float(p["calm_seconds"]):
                 self.owner_busy = ""
                 self.resume_all()
+
+    # ---- staying under the owner's limit ---------------------------------
+    def _govern_loop(self) -> None:
+        """Every second while tasks run, measure the Mac and set how much of the time they may run."""
+        while not self.stopped.wait(GOVERN_EVERY):
+            with self.lock:
+                active = any(t.state in ("running", "paused") for t in self.tasks.values())
+            try:
+                self.governor.step() if active else self.governor.reset()
+            except Exception:  # measuring must never take the worker down
+                pass
+
+    def _duty_loop(self) -> None:
+        """Run tasks for `duty` of every DUTY_PERIOD and stop them for the rest (only running
+        tasks: ones the owner watch paused stay paused)."""
+        stopped = False
+        while not self.stopped.is_set():
+            duty = self.governor.duty
+            if stopped:
+                self._govern_signal(signal.SIGCONT)
+                stopped = False
+            if duty >= 0.999:
+                time.sleep(DUTY_PERIOD)
+                continue
+            time.sleep(DUTY_PERIOD * duty)
+            self._govern_signal(signal.SIGSTOP)
+            stopped = True
+            time.sleep(DUTY_PERIOD * (1 - duty))
+
+    def _govern_signal(self, sig: int) -> None:
+        with self.lock:
+            for t in self.tasks.values():
+                if t.state == "running":
+                    self._signal(t, sig)
 
     def _owner_loop(self) -> None:
         while not self.stopped.wait(OWNER_POLL):
@@ -557,6 +619,8 @@ class Handler(BaseHTTPRequestHandler):
         p = self._parts()
         if p == ["info"]:
             return self._reply(200, self.worker.info())
+        if p == ["usage"]:
+            return self._reply(200, self.worker.load)
         if len(p) >= 2 and p[0] == "tasks":
             task = self.worker.tasks.get(p[1])
             if not task:
@@ -595,6 +659,12 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         if not self._auth(body):
             return
+        if self._parts() == ["install"]:
+            try:
+                req = json.loads(body)
+                return self._reply(200, self.worker.installer.ask(str(req["program"]), str(req.get("by", "another Mac"))))
+            except (ValueError, KeyError, TypeError):
+                return self._reply(400, {"error": "say which program to install"})
         if self._parts() != ["tasks"]:
             return self._reply(404, {"error": "not found"})
         refusal = self.worker.refusal(sysinfo.power())

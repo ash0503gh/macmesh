@@ -6,6 +6,7 @@ struct LendingSettings: View {
     @Environment(Engine.self) private var engine
     @State private var atLogin = SMAppService.mainApp.status == .enabled
     @State private var loginNote: String?
+    @State private var limit: Double?
 
     var body: some View {
         Form {
@@ -27,8 +28,27 @@ struct LendingSettings: View {
                     }
                     Text(status.ownerMode == "idle"
                          ? "Work stops as soon as you touch the keyboard or trackpad, and starts again after two minutes away."
-                         : "When your own apps need the CPU or GPU, macmesh pauses at once and hands the work to another Mac if it lasts.")
+                         : "When your own apps need the CPU or GPU, macmesh slows its work to make room. It hands the work to another Mac only if you leave it almost nothing.")
                         .font(.callout).foregroundStyle(.secondary)
+                }
+                Section {
+                    let value = limit ?? status.limit ?? 0.9
+                    LabeledContent("Use at most") {
+                        HStack {
+                            Slider(value: Binding(get: { value }, set: { limit = $0 }), in: 0.5...0.95, step: 0.05) { editing in
+                                if !editing, let limit { Task { await engine.setOwnerLimit(limit) } }
+                            }
+                            .frame(width: 220)
+                            Text("\(Int((value * 100).rounded()))%").monospacedDigit().frame(width: 40, alignment: .trailing)
+                        }
+                    }
+                    if status.running > 0, let duty = status.duty, duty < 0.97 {
+                        LabeledContent("Right now", value: "Others' work runs at \(Int((duty * 100).rounded()))% speed to stay under it")
+                    }
+                } header: {
+                    Text("How much of this Mac")
+                } footer: {
+                    Text("This Mac as a whole, your apps and other Macs' work together, stays at or under this much of its CPU and GPU. The rest is always yours.")
                 }
             } else {
                 Text("macmesh isn't running.").foregroundStyle(.secondary)

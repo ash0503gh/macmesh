@@ -29,6 +29,7 @@ from .client import NodeClient, NodeError, TaskRejected
 POLL = 0.5
 HEARTBEAT_MISSES = 2  # status polls in a row a Mac may miss before its task moves elsewhere
 NODE_COOLDOWN = 10.0
+INSTALL_RECHECK = 5.0  # how often to see whether a Mac asked to install something has it now
 BUSY_COOLDOWN = 30.0  # a Mac that refused work (owner busy, battery, disk) is asked again after this
 MAX_NODE_ERRORS = 6  # per task: give up if Macs keep vanishing
 
@@ -46,6 +47,9 @@ class TaskState:
     failed_on: set = field(default_factory=set)
     excluded: set = field(default_factory=set)  # nodes that can't run it at all
     copies: dict = field(default_factory=dict)  # node address -> start time
+    # node address -> what that copy is doing: {"phase", "since", "bytes", "total"}; phases are
+    # uploading, queued, running, paused, downloading
+    phase: dict = field(default_factory=dict)
     done_by: str = ""
     elapsed: float = 0.0
     last_error: str = ""
@@ -64,7 +68,25 @@ class NodeState:
     speeds: list = field(default_factory=list)  # cost units per second, measured
     completed: int = 0
     busy_seconds: float = 0.0
+    free_at: float = 0.0  # when a chunk last left this Mac, so the next queued one started then
     mismatched: set = field(default_factory=set)  # programs whose build differs from the coordinator's
+    installing: set = field(default_factory=set)  # programs this Mac was asked to set up and may still
+    sent: int = 0        # bytes uploaded to this Mac for the job
+    received: int = 0    # bytes of results fetched back
+    transfers: list = field(default_factory=list)  # (time, bytes up, bytes down), recent, for speeds
+
+    def moved(self, up: int = 0, down: int = 0) -> None:
+        now = time.time()
+        self.sent += up
+        self.received += down
+        self.transfers.append((now, up, down))
+        while self.transfers and now - self.transfers[0][0] > 5:
+            self.transfers.pop(0)
+
+    def rates(self) -> tuple[float, float]:
+        """Bytes per second up and down over the last few seconds."""
+        recent = [t for t in list(self.transfers) if time.time() - t[0] <= 3]
+        return sum(t[1] for t in recent) / 3, sum(t[2] for t in recent) / 3
 
     @property
     def capacity(self) -> int:
@@ -83,7 +105,8 @@ class NodeState:
 class Scheduler:
     def __init__(self, job: dict, clients: list[NodeClient], log=print,
                  max_attempts: int = 3, speculate: bool = True, reference: dict | None = None,
-                 match: str = "version", keep_blobs: bool = False, origin: dict | None = None):
+                 match: str = "version", keep_blobs: bool = False, origin: dict | None = None,
+                 installer=None):
         self.job = job
         self.job_id = uuid.uuid4().hex[:8]
         self.workdir = Path(job["workdir"]).expanduser().resolve()
@@ -105,21 +128,19 @@ class Scheduler:
         self.keep_blobs = keep_blobs
         # Who asked for this job ({"node_id", "name"}): workers show it, and skip their own Mac's.
         self.origin = dict(origin or {}, job=job["name"], job_id=self.job_id)
+        # installer(client, program) -> {"state"}: asks a Mac that lacks a program to set it up.
+        self.installer = installer
+        self._install_checked = 0.0
 
     # ---- public -------------------------------------------------------
     def run(self) -> dict:
         if not self.nodes:
             raise JobFailed("no worker nodes available")
         self._check_builds()
-        for t in self.tasks:
-            if not any(n.can_run(t.spec) for n in self.nodes):
-                missing = [p for p in jobspec.programs(t.spec)
-                           if not any(p in n.client.info.get("programs", []) and p not in n.mismatched for n in self.nodes)]
-                prog = (missing or jobspec.programs(t.spec))[0]
-                if any(prog in n.mismatched for n in self.nodes):
-                    raise JobFailed(f"{t.id}: every Mac with '{prog}' has a different build from this one "
-                                    "(install the same version, or use --match none)")
-                raise JobFailed(f"{t.id}: no node has '{prog}' installed/allowed")
+        self._ask_installs()
+        problem = self._unrunnable()
+        if problem:
+            raise JobFailed(problem)
         self.workdir.mkdir(parents=True, exist_ok=True)
         started = time.time()
         self.log(f"job {self.job['name']} ({self.job_id}): {len(self.tasks)} tasks on "
@@ -129,6 +150,7 @@ class Scheduler:
                 while not self._finished():
                     if self.fatal:
                         raise JobFailed(self.fatal)
+                    self._recheck_installs()
                     self._dispatch()
                     self.cond.wait(timeout=1.0)
         finally:
@@ -144,22 +166,99 @@ class Scheduler:
                       for n in self.nodes},
         }
 
-    def _check_builds(self) -> None:
+    def _check_builds(self, nodes: list | None = None) -> None:
         if self.reference is None or self.match == "none":
             return
         programs = {p for t in self.tasks for p in jobspec.programs(t.spec)}
         for prog in sorted(programs):
             ours = self.reference.get(prog)
             if ours is None:
-                self.log(f"  ? {prog} isn't on this Mac: can't check the other Macs' builds of it")
+                if nodes is None:
+                    self.log(f"  ? {prog} isn't on this Mac: can't check the other Macs' builds of it")
                 continue
-            for n in self.nodes:
+            for n in nodes or self.nodes:
                 theirs = n.client.info.get("fingerprints", {}).get(prog)
                 if prog in n.client.info.get("programs", []) and not toolinfo.same_build(ours, theirs, self.match):
                     n.mismatched.add(prog)
                     seen = toolinfo.describe(theirs) if theirs else "unknown build"
                     self.log(f"  ✗ {n.client.name}: {prog} is {seen}, this Mac has {toolinfo.describe(ours)}; "
                              "not using it for these tasks")
+
+    def _unrunnable(self) -> str:
+        """Why some task can't run on any Mac (and none is setting up what it needs), or ""."""
+        for t in self.tasks:
+            if t.state == "done" or any(n.can_run(t.spec) for n in self.nodes):
+                continue
+            missing = [p for p in jobspec.programs(t.spec)
+                       if not any(p in n.client.info.get("programs", []) and p not in n.mismatched for n in self.nodes)]
+            prog = (missing or jobspec.programs(t.spec))[0]
+            if any(prog in n.installing for n in self.nodes):
+                continue
+            if any(prog in n.mismatched for n in self.nodes):
+                return (f"{t.id}: every Mac with '{prog}' has a different build from this one "
+                        "(install the same version, or use --match none)")
+            return f"{t.id}: no node has '{prog}' installed/allowed"
+        return ""
+
+    def _ask_installs(self) -> None:
+        """Ask each Mac without a program the job needs to set it up; its owner decides."""
+        if not self.installer:
+            return
+        needed = {p for t in self.tasks for p in jobspec.programs(t.spec)}
+        for n in self.nodes:
+            for prog in sorted(needed - set(n.client.info.get("programs", []))):
+                try:
+                    reply = self.installer(n.client, prog)
+                except (NodeError, OSError) as e:
+                    self.log(f"  ? couldn't ask {n.client.name} to install {prog}: {e}")
+                    continue
+                state = reply.get("state")
+                if state in ("asking", "installing"):
+                    n.installing.add(prog)
+                    self.log(f"  ? asked {n.client.name} to install {prog}: "
+                             + ("waiting for its owner to allow it" if state == "asking" else "installing"))
+                elif state == "declined":
+                    self.log(f"  ✗ {n.client.name}'s owner didn't want {prog} installed")
+
+    def _recheck_installs(self) -> None:
+        """Every few seconds, see whether Macs asked to install something have it now (cond held)."""
+        waiting = [n for n in self.nodes if n.installing and not n.probing]
+        if not waiting or time.time() - self._install_checked < INSTALL_RECHECK:
+            return
+        self._install_checked = time.time()
+
+        def check(node: NodeState):
+            try:
+                info = node.client.fetch_info()
+            except NodeError:
+                info = None
+            with self.cond:
+                node.probing = False
+                if info is None:
+                    return
+                for prog in sorted(node.installing):
+                    state = info.get("installs", {}).get(prog)
+                    if prog in info.get("programs", []):
+                        node.installing.discard(prog)
+                        self._check_builds([node])
+                        if prog in node.mismatched:
+                            self.log(f"  ✗ {node.client.name} installed {prog}, but not the same build as this Mac")
+                        else:
+                            self.log(f"  ✓ {node.client.name} installed {prog}: using it now")
+                            for t in self.tasks:  # anything it failed or refused before had no program to run
+                                t.failed_on.discard(node.client.address)
+                                t.excluded.discard(node.client.address)
+                    elif state not in ("asking", "installing"):
+                        node.installing.discard(prog)
+                        self.log(f"  ✗ {node.client.name} didn't install {prog} ({state or 'request gone'})")
+                problem = self._unrunnable()
+                if problem and not self.fatal:
+                    self.fatal = problem
+                self.cond.notify_all()
+
+        for n in waiting:
+            n.probing = True
+            threading.Thread(target=check, args=(n,), daemon=True).start()
 
     def _forget_blobs(self) -> None:
         """Ask every Mac to delete what this job uploaded: media shouldn't linger on lent Macs."""
@@ -176,16 +275,29 @@ class Scheduler:
         total = sum(t.spec["cost"] for t in self.tasks) or 1.0
         known = any(n.speeds for n in self.nodes)
         by_address = {n.client.address: n for n in self.nodes}
+        # A Mac holds one chunk more than it runs (the next one uploads meanwhile), so only its
+        # oldest `slots` chunks are running, and each started when the Mac last freed up.
+        queued: dict[str, list] = {}
+        for t in list(self.tasks):
+            if t.state != "done":
+                for address, sent in list(t.copies.items()):
+                    queued.setdefault(address, []).append((sent, t))
+        running: dict[tuple, float] = {}
+        for address, copies in queued.items():
+            node = by_address.get(address)
+            if node:
+                for sent, t in sorted(copies, key=lambda c: c[0])[:int(node.client.info.get("slots", 1))]:
+                    running[(t.id, address)] = max(sent, node.free_at)
         done = 0.0
         for t in list(self.tasks):
             cost = t.spec["cost"]
             if t.state == "done":
                 done += cost
-            elif known and t.copies:
+            elif known:
                 shares = []
-                for address, started in list(t.copies.items()):
-                    node = by_address.get(address)
-                    speed = self._speed(node) if node else 0
+                for address in list(t.copies):
+                    node, started = by_address.get(address), running.get((t.id, address))
+                    speed = self._speed(node) if node and started else 0
                     if speed > 0:
                         shares.append(min(0.95, (now - started) * speed / cost))
                 done += max(shares, default=0.0) * cost
@@ -313,12 +425,15 @@ class Scheduler:
         outcome, detail, elapsed = "error", "", 0.0
         try:
             t0 = time.time()
+            blobs = {name: self._blob(local) for name, local in task.spec["inputs"].items()}
+            step = self._phase(task, c, "uploading", total=sum(p.stat().st_size for _, _, p in blobs.values()))
             inputs = {}
             for name, local in task.spec["inputs"].items():
-                sha, kind, path = self._blob(local)
+                sha, kind, path = blobs[name]
                 inputs[name] = {"blob": sha, "kind": kind, "filename": Path(local).name}
-                self._ensure_uploaded(c, sha, path)
+                self._ensure_uploaded(c, sha, path, node, step)
             upload_s = time.time() - t0
+            self._phase(task, c, "queued")
             c.submit({
                 "task_id": remote_id, "steps": task.spec["steps"], "fail_if": task.spec.get("fail_if", []),
                 "origin": self.origin,
@@ -344,6 +459,8 @@ class Scheduler:
                 if st["state"] == "done":
                     elapsed = st["elapsed"]
                     break
+                if task.phase.get(c.address, {}).get("phase") != st["state"]:
+                    self._phase(task, c, st["state"])
                 if st["state"] == "yielded":
                     outcome, detail = "yielded", st["error"]
                     return
@@ -354,7 +471,7 @@ class Scheduler:
             if self._done_elsewhere(task, c.address):
                 outcome = "superseded"
                 return
-            self._fetch_outputs(task, c, remote_id, st["outputs"])
+            self._fetch_outputs(task, c, remote_id, st["outputs"], node)
             outcome = "done"
         except TaskRejected as e:
             outcome = "busy" if e.code == 503 else ("excluded" if e.code == 403 else "error")
@@ -387,21 +504,44 @@ class Scheduler:
                     self.blob_cache[key] = (wire.sha256_file(p), "file", p)
             return self.blob_cache[key]
 
-    def _ensure_uploaded(self, c: NodeClient, sha: str, path: Path) -> None:
+    def _phase(self, task: TaskState, c: NodeClient, phase: str, total: int = 0) -> dict:
+        """Note what this copy of the task is doing now, for the job view."""
+        entry = {"phase": phase, "since": time.time(), "bytes": 0, "total": total}
+        task.phase[c.address] = entry
+        return entry
+
+    def _ensure_uploaded(self, c: NodeClient, sha: str, path: Path, node: NodeState | None = None,
+                         step: dict | None = None) -> None:
+        def sent(n: int) -> None:
+            if node:
+                node.moved(up=n)
+            if step:
+                step["bytes"] += n
+
         with self.blob_lock:
             lock = self.upload_locks.setdefault((c.address, sha), threading.Lock())
         with lock:
             if not c.has_blob(sha):
-                c.put_blob(sha, path)
+                c.put_blob(sha, path, progress=sent)
+            elif step:
+                step["bytes"] += path.stat().st_size  # already there from an earlier chunk
 
-    def _fetch_outputs(self, task: TaskState, c: NodeClient, remote_id: str, manifest: dict) -> None:
+    def _fetch_outputs(self, task: TaskState, c: NodeClient, remote_id: str, manifest: dict,
+                       node: NodeState | None = None) -> None:
+        step = self._phase(task, c, "downloading", total=sum(int(m.get("size") or 0) for m in manifest.values()))
+
+        def got_bytes(n: int) -> None:
+            step["bytes"] += n
+            if node:
+                node.moved(down=n)
+
         tmpdir = Path(tempfile.mkdtemp(dir=self.workdir, prefix=".dl-"))
         try:
             staged = {}
             for name, dest in task.spec["outputs"].items():
                 meta = manifest[name]
                 got = tmpdir / name
-                c.download(remote_id, name, got)
+                c.download(remote_id, name, got, progress=got_bytes)
                 if wire.sha256_file(got) != meta["sha256"]:
                     raise NodeError(f"{c.address}: output {name} corrupted in transfer")
                 if meta["kind"] == "dir":
@@ -426,7 +566,9 @@ class Scheduler:
     def _record(self, task: TaskState, node: NodeState, outcome: str, detail: str, elapsed: float) -> None:
         with self.cond:
             node.in_flight -= 1
+            node.free_at = time.time()
             task.copies.pop(node.client.address, None)
+            task.phase.pop(node.client.address, None)
             name = node.client.name
             if outcome == "done":
                 task.elapsed = elapsed

@@ -17,6 +17,9 @@ joins one of two ways:
 
 Either way the new Mac sends a signing request for its own key (which never leaves it) and gets
 back its certificate, the CA and the mesh token.
+
+A mesh holds at most MAX_MACS Macs for now. The first Mac keeps a list of the Macs it let in
+(tls/members.json); those, and any Macs it can see on the network, count, unless revoked.
 """
 
 from __future__ import annotations
@@ -40,10 +43,35 @@ EXPIRY = 600.0
 MAX_FAILURES = 3
 MAX_MESSAGE = 64 * 1024
 DECISION_WAIT = 150.0  # how long a join request waits for someone to click Allow
+MAX_MACS = 2  # the first Mac included
 
 
 class PairingError(RuntimeError):
     pass
+
+
+def _members_path(home: Path | None) -> Path:
+    return pki.paths(home)["dir"] / "members.json"
+
+
+def members(home: Path | None = None, revoked: list | None = None) -> dict[str, dict]:
+    """The Macs this one let in: node id -> {"name", "fingerprint", "at"}, leaving out revoked ones."""
+    try:
+        found = json.loads(_members_path(home).read_text())
+    except (OSError, ValueError):
+        return {}
+    gone = set(revoked or [])
+    return {k: v for k, v in found.items() if isinstance(v, dict) and v.get("fingerprint") not in gone}
+
+
+def _add_member(home: Path | None, node_id: str, name: str, cert: str) -> None:
+    path = _members_path(home)
+    try:
+        found = json.loads(path.read_text())
+    except (OSError, ValueError):
+        found = {}
+    found[node_id] = {"name": name, "fingerprint": pki.fingerprint_pem(cert), "at": time.time()}
+    path.write_text(json.dumps(found, indent=2))
 
 
 def new_code() -> str:
@@ -97,8 +125,10 @@ def _send(sock: ssl.SSLSocket, obj: dict) -> None:
 class PairingServer:
     """Listens for new Macs: join requests (approved with decide()) and one-time codes (set_code())."""
 
-    def __init__(self, cfg: dict, port: int, home: Path | None = None, host: str = "0.0.0.0", on_change=None):
+    def __init__(self, cfg: dict, port: int, home: Path | None = None, host: str = "0.0.0.0", on_change=None,
+                 seen=None):
         self.cfg, self.home, self.on_change = cfg, home, on_change or (lambda: None)
+        self.seen = seen or (lambda: set())  # node ids of the Macs on the network right now
         self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         p = pki.paths(home)
@@ -142,6 +172,19 @@ class PairingServer:
         r["event"].set()
         return True
 
+    def others(self) -> set[str]:
+        """The other Macs in this mesh (not this one)."""
+        ids = set(members(self.home, self.cfg.get("revoked"))) | {n for n in self.seen() if n}
+        return ids - {self.cfg["node_id"]}
+
+    def full(self, node_id: str = "") -> bool:
+        """Whether a new Mac (not one already in, asking again) would go over MAX_MACS."""
+        return node_id not in self.others() and 1 + len(self.others()) >= MAX_MACS
+
+    def _full_error(self) -> str:
+        return (f"This mesh already has {MAX_MACS} Macs, the most for now. To add this one, remove a Mac "
+                f"on {self.cfg.get('node_name', 'the first Mac')} first (Your mesh, then Remove…).")
+
     def close(self) -> None:
         self.closed.set()
         try:
@@ -170,8 +213,9 @@ class PairingServer:
         except (OSError, ssl.SSLError, PairingError, pki.PKIError):
             pass
 
-    def _issue(self, csr: str, node_id: str) -> dict:
+    def _issue(self, csr: str, node_id: str, name: str) -> dict:
         cert = pki.sign(csr, node_id, self.home)
+        _add_member(self.home, node_id, name, cert)
         return {"cert": cert, "ca": pki.paths(self.home)["ca_crt"].read_text(), "token": self.cfg["token"]}
 
     def _joined(self, name: str) -> None:
@@ -192,7 +236,10 @@ class PairingServer:
                         self.code, self.last_error = None, f"{MAX_FAILURES} wrong codes: the code was cancelled"
             _send(s, {"error": "wrong or expired code (or someone is in the middle)"})
             return
-        issued = self._issue(csr, node_id)
+        if self.full(node_id):
+            _send(s, {"error": self._full_error()})
+            return
+        issued = self._issue(csr, node_id, str(msg.get("name") or node_id))
         with self.lock:
             self.code = None  # one use
         _send(s, {**issued, "mac": _mac(code, "accept", self.fingerprint, _sha(issued["cert"]), _sha(issued["ca"]),
@@ -202,6 +249,9 @@ class PairingServer:
     def _request(self, s: ssl.SSLSocket, msg: dict) -> None:
         csr, node_id, name = msg.get("csr", ""), str(msg.get("node_id", "")), str(msg.get("name") or "A Mac")[:64]
         commit = str(msg.get("commit", ""))
+        if self.full(node_id):
+            _send(s, {"error": self._full_error()})
+            return
         ni = secrets.token_hex(16)
         _send(s, {"ni": ni})
         nj = str(_read_line(s).get("nj", ""))
@@ -217,8 +267,10 @@ class PairingServer:
         s.settimeout(DECISION_WAIT + 10)
         try:
             request["event"].wait(DECISION_WAIT)
-            if request["allow"]:
-                _send(s, self._issue(csr, node_id))
+            if request["allow"] and self.full(node_id):  # another Mac got in while this one waited
+                _send(s, {"error": self._full_error()})
+            elif request["allow"]:
+                _send(s, self._issue(csr, node_id, name))
                 self._joined(name)
             else:
                 _send(s, {"error": "the other Mac didn't let this one in" if request["allow"] is False

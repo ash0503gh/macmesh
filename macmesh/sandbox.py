@@ -18,6 +18,7 @@ to a program it starts.
 from __future__ import annotations
 
 import subprocess
+import sys
 from functools import lru_cache
 from pathlib import Path
 
@@ -94,6 +95,8 @@ def wrap(argv: list[str], task_dir: Path, tool_cfg: dict, name: str = "sandbox.s
     if rules is False:
         return argv
     prof = task_dir / name
-    prof.write_text(profile(task_dir, argv[0], rules.get("read", []), rules.get("write", [])))
+    # {engine}: macmesh's own Python, which tools installed by a recipe (install.py) run on.
+    read = [r.replace("{engine}", sys.prefix) for r in rules.get("read", [])]
+    prof.write_text(profile(task_dir, argv[0], read, rules.get("write", [])))
     # Run the real path: the sandbox checks a symlinked one (e.g. .build/release) against ~ too.
     return [SANDBOX_EXEC, "-f", str(prof), str(_real(argv[0])), *argv[1:]]

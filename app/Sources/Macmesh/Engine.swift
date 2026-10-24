@@ -192,6 +192,10 @@ final class Engine {
         do { status = try await client.call("lend", ["on": on]) } catch { notice = error.localizedDescription }
     }
 
+    func setOwnerLimit(_ limit: Double) async {
+        do { status = try await client.call("owner", ["limit": limit]) } catch { notice = error.localizedDescription }
+    }
+
     func setOwnerMode(_ mode: String) async {
         do { status = try await client.call("owner", ["mode": mode]) } catch { notice = error.localizedDescription }
     }
@@ -306,6 +310,24 @@ final class Engine {
         do { let _: MeshStatus.Invite = try await client.call("approve", ["id": request.id, "allow": allow]); await tick() } catch {
             notice = error.localizedDescription
         }
+    }
+
+    /// The owner's answer to another Mac asking this one to install a program.
+    func decideInstall(_ request: MeshStatus.InstallRequest, allow: Bool) async {
+        do {
+            struct Answer: Decodable { var program: String }
+            let _: Answer = try await client.call("install", ["program": request.program, "allow": allow])
+            await tick()
+        } catch {
+            notice = error.localizedDescription
+        }
+    }
+
+    /// Requests that need the owner (a Mac asking to join, or to install something), so the
+    /// window can come forward when a new one arrives.
+    var waitingOnOwner: Set<String> {
+        Set((status?.invite.requests ?? []).map { "join:\($0.id)" }
+            + (status?.installs ?? []).filter { $0.state == "asking" }.map { "install:\($0.program)" })
     }
 
     /// Lets the firewall pass the engine, through macOS's own administrator prompt.

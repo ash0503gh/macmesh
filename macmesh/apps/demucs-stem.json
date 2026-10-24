@@ -1,0 +1,58 @@
+{
+  "name": "demucs-stem",
+  "description": "Splits a song into four stems (vocals, drums, bass, other) with Demucs, as a zip of MP3s",
+  "notes": "A batch tool: one task per song, `demucs-stem {in:file} {out:result}` with out_ext .zip. Uses the GPU (MPS).",
+  "usage": "demucs-stem {in:file} {out:result}  (result: a .zip of vocals, drums, bass and other MP3s)",
+  "program": {
+    "path": "~/.macmesh/tools/demucs-stem/demucs-stem",
+    "version_args": [
+      "--version"
+    ]
+  },
+  "sandbox": {
+    "read": [
+      "~/.macmesh/tools/demucs-stem",
+      "~/.cache/torch",
+      "{engine}",
+      "/opt/homebrew"
+    ],
+    "write": []
+  },
+  "install": {
+    "summary": "Demucs stem separation: Python packages and the htdemucs model, about 1 GB",
+    "size_gb": 1.5,
+    "files": {
+      "demucs-stem": "#!/bin/bash\n# Installed by macmesh: splits a song into vocals, drums, bass and other (Demucs htdemucs).\nset -euo pipefail\nif [ \"${1:-}\" = \"--version\" ]; then\n    echo \"demucs-stem 1.0.0\"\n    exit 0\nfi\nINPUT=\"${1:-}\"\nOUTPUT=\"${2:-}\"\nif [ -z \"$INPUT\" ] || [ -z \"$OUTPUT\" ]; then\n    echo \"Usage: demucs-stem <input_file> <output_zip>\" >&2\n    exit 1\nfi\nTMP_DIR=\"$(mktemp -d \"${TMPDIR:-/tmp}/demucs_stem.XXXXXX\")\"\ntrap 'rm -rf \"$TMP_DIR\"' EXIT\n\"{dir}/env/bin/demucs\" -n htdemucs -d mps --mp3 --filename \"{stem}.{ext}\" -o \"$TMP_DIR\" \"$INPUT\"\nmkdir -p \"$(dirname \"$OUTPUT\")\"\n(cd \"$TMP_DIR/htdemucs\" && /usr/bin/zip -q -9 -j \"$OUTPUT\" *.mp3)\n"
+    },
+    "executable": [
+      "demucs-stem"
+    ],
+    "steps": [
+      [
+        "{python}",
+        "-m",
+        "venv",
+        "{dir}/env"
+      ],
+      [
+        "{dir}/env/bin/pip",
+        "install",
+        "--progress-bar",
+        "off",
+        "demucs==4.1.0",
+        "torch==2.14.1",
+        "torchaudio==2.11.0",
+        "numpy==2.5.4",
+        "soundfile==0.14.0",
+        "lameenc==1.9.0",
+        "einops==0.8.2",
+        "julius==0.2.8"
+      ],
+      [
+        "{dir}/env/bin/python",
+        "-c",
+        "from demucs.pretrained import get_model; get_model('htdemucs')"
+      ]
+    ]
+  }
+}

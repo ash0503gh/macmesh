@@ -27,6 +27,21 @@ app means adding a file, in macmesh/apps/ (examples shipped with macmesh) or
   "fail_if": ["\"missing\":\\s*[1-9]"]          # regexes: output that means failure despite exit 0
 }
 
+A profile without "range" is a plain tool, for batch jobs (one task per file).
+
+"install" says how a Mac that lacks the program can set it up, after its owner clicks Allow:
+  "install": {
+    "summary": "Demucs stem separation (about 1 GB)",   # what the owner is asked to allow
+    "size_gb": 1.0,                                      # free space it needs
+    "files": {"myapp-cli": "#!/bin/sh\nexec {dir}/env/bin/myapp \"$@\"\n"},  # written after the steps
+    "executable": ["myapp-cli"],
+    "steps": [["{python}", "-m", "venv", "{dir}/env"],                  # argument lists, no shell
+              ["{dir}/env/bin/pip", "install", "myapp==1.2.3"]]
+  }
+It runs in ~/.macmesh/tools/<name> ({dir}) with macmesh's own Python ({python}), without the
+sandbox (it downloads) and without administrator rights. "program.path" should point into {dir}.
+The recipe is always the lending Mac's own: another Mac can only ask for a program by name.
+
 Steps are the tool's arguments without the program name. Range placeholders:
 {start} {end} (inclusive), {end_excl}, {count}, {index}, {start_s} {end_s}
 (seconds, needs the frame rate) and {fps}; plus {in:project} {out:result}
@@ -64,12 +79,28 @@ def validate(p: dict) -> dict:
         raise ProfileError("\"program\" needs a \"path\"")
     _strings(prog.get("version_args", []), "program.version_args")
     rng = p.get("range")
-    if not isinstance(rng, dict) or not isinstance(rng.get("steps"), list) or not rng["steps"]:
-        raise ProfileError("\"range\" needs \"steps\": a list of argument lists")
-    for i, step in enumerate(rng["steps"]):
-        _strings(step, f"range.steps[{i}]")
-    if rng.get("merge", "auto") not in ("auto", "concat", "dirs", "none"):
-        raise ProfileError("range.merge is auto, concat, dirs or none")
+    if rng is not None:
+        if not isinstance(rng, dict) or not isinstance(rng.get("steps"), list) or not rng["steps"]:
+            raise ProfileError("\"range\" needs \"steps\": a list of argument lists")
+        for i, step in enumerate(rng["steps"]):
+            _strings(step, f"range.steps[{i}]")
+        if rng.get("merge", "auto") not in ("auto", "concat", "dirs", "none"):
+            raise ProfileError("range.merge is auto, concat, dirs or none")
+    inst = p.get("install")
+    if inst is not None:
+        if not isinstance(inst, dict) or not isinstance(inst.get("summary"), str):
+            raise ProfileError("install needs a \"summary\" to show the Mac's owner")
+        if not isinstance(inst.get("steps"), list) or not inst["steps"]:
+            raise ProfileError("install needs \"steps\": a list of argument lists")
+        for i, step in enumerate(inst["steps"]):
+            if not _strings(step, f"install.steps[{i}]"):
+                raise ProfileError(f"install.steps[{i}] is empty")
+        files = inst.get("files", {})
+        if not isinstance(files, dict) or not all(isinstance(v, str) and NAME.match(k) for k, v in files.items()):
+            raise ProfileError("install.files maps plain file names to their text")
+        for name in _strings(inst.get("executable", []), "install.executable"):
+            if name not in files:
+                raise ProfileError(f"install.executable names {name!r}, which isn't in install.files")
     for pattern in _strings(p.get("fail_if", []), "fail_if"):
         try:
             re.compile(pattern)
@@ -120,8 +151,9 @@ def load(home: Path | None = None) -> dict[str, dict]:
 
 def tool_entry(p: dict) -> dict:
     """The profile as an entry of the config's `tools` table."""
+    steps = (p.get("range") or {}).get("steps", [])
     entry = {"path": p["program"]["path"], "description": p.get("description", ""),
-             "usage": " ; then ".join(" ".join([p["name"], *step]) for step in p["range"]["steps"])}
+             "usage": " ; then ".join(" ".join([p["name"], *step]) for step in steps) or p.get("usage", "")}
     if p["program"].get("version_args"):
         entry["version_args"] = p["program"]["version_args"]
     if "sandbox" in p:

@@ -36,6 +36,7 @@ struct DashboardView: View {
                 .safeAreaInset(edge: .top, spacing: 0) { banners }
                 .navigationTitle(page.rawValue)
                 .toolbar {
+                    ToolbarItem(placement: .automatic) { AppearanceMenu() }
                     ToolbarItem(placement: .primaryAction) {
                         Button { newJob = true } label: { Label("New job", systemImage: "plus") }
                             .help("Split a project or video across your Macs")
@@ -88,15 +89,20 @@ struct DashboardView: View {
     @ViewBuilder
     private var banners: some View {
         if engine.phase == .running, let status = engine.status,
-           !(status.invite.requests ?? []).isEmpty || status.firewall?.blocked == true {
+           !(status.invite.requests ?? []).isEmpty || status.firewall?.blocked == true || !installs(status).isEmpty {
             VStack(spacing: 8) {
                 ForEach(status.invite.requests ?? []) { JoinRequestBanner(request: $0) }
+                ForEach(installs(status)) { InstallRequestBanner(request: $0) }
                 if let firewall = status.firewall, firewall.blocked { FirewallBanner(firewall: firewall) }
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
             .background(.bar)
         }
+    }
+
+    private func installs(_ status: MeshStatus) -> [MeshStatus.InstallRequest] {
+        (status.installs ?? []).filter { $0.state != "declined" }
     }
 
     private var meshBadge: some View {
@@ -108,6 +114,8 @@ struct DashboardView: View {
                     .font(.caption2).foregroundStyle(.secondary)
             }
             Spacer()
+            Text(Format.appVersion).font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
+                .help("macmesh \(Format.appVersion)")
         }
         .padding(12)
     }
@@ -281,6 +289,7 @@ struct LiveJob: View {
                 }
                 .font(.caption).foregroundStyle(.secondary)
             }
+            JobDetails(job: job, color: color)
         }
         .padding(18)
         .background(RoundedRectangle(cornerRadius: 14).fill(Color.primary.opacity(0.035)))
@@ -363,7 +372,13 @@ struct MeshSheet: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 SectionLabel("Add a Mac")
-                if status?.holdsCa == true {
+                if status?.holdsCa == true, status?.invite.full == true {
+                    if let joined = status?.invite.joined {
+                        Label("\(joined) joined", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    }
+                    Text("This mesh has \(status?.invite.maxMacs ?? 2) Macs, the most for now. To add a different Mac, remove one below first.")
+                        .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                } else if status?.holdsCa == true {
                     Text("On the other Mac, install macmesh and open it. It finds \u{201C}\(status?.name ?? "this Mac")\u{201D} on the network: click Join there, then Allow here when the numbers match.")
                         .fixedSize(horizontal: false, vertical: true)
                     if let joined = status?.invite.joined {

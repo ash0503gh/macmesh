@@ -67,6 +67,8 @@ def plan_app(app: str, project: str, start: int, end: int, chunk: int = 100, fps
     if app not in known:
         raise ValueError(f"no app profile called {app!r} (have: {', '.join(sorted(known)) or 'none'}); see `macmesh apps`")
     prof = known[app]
+    if not prof.get("range"):
+        raise ValueError(f"{app} is a tool for batch jobs (one task per file), not an app that renders frame ranges")
     vars = {**prof.get("vars", {}), **(vars or {})}
     rng = prof["range"]
     if fps is None and any(NEEDS_FPS.search(a) for step in rng["steps"] for a in step):
