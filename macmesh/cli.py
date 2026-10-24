@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import __version__, config, discovery, jobspec, media
+from . import PAIR_SERVICE_TYPE, __version__, config, discovery, jobspec, media, pairing, pki, toolinfo
 from .client import NodeClient, NodeError
 from .planners import ENCODE_PRESETS, PLANNERS
 from .scheduler import JobFailed, Scheduler
@@ -32,9 +32,10 @@ def gather_nodes(cfg: dict, args) -> list[NodeClient]:
         addrs += discovery.browse(getattr(args, "discover_seconds", 2.0))
     if not addrs:
         addrs = [f"127.0.0.1:{cfg['port']}"]  # at least this Mac, if its daemon runs
+    tls = pki.context(server=False) if cfg.get("tls", True) else None
     clients, seen = [], set()
     for addr in dict.fromkeys(addrs):
-        c = NodeClient(addr, cfg["token"])
+        c = NodeClient(addr, cfg["token"], tls=tls, revoked=cfg.get("revoked", []))
         try:
             info = c.fetch_info()
         except NodeError as e:
@@ -58,10 +59,17 @@ def print_nodes(clients: list[NodeClient]) -> None:
         cores = f"{hw['perf_cores']}+{hw['eff_cores']}"
         power = "battery " + (f"{pw['battery_pct']}%" if pw["battery_pct"] is not None else "") if pw["on_battery"] else "AC"
         if not i.get("accepting", True):
-            power += " (paused)"
+            power += f" (not taking work: {i.get('refusal') or 'paused'})"
+        elif i.get("paused"):
+            power += " (owner busy: tasks paused)"
         model = hw["model"] + (" ❄" if hw["fanless"] else "")
         print(f"{i['node_name'][:18]:<18} {model[:18]:<18} {hw['chip'][:16]:<16} {cores:>6} "
               f"{hw['memory_gb']:>4}G {hw['score']:>6} {i['slots']:>5}  {power:<13} {', '.join(i['programs'])}")
+    if any(c.fingerprint for c in clients):
+        print("\ncertificates (for `macmesh revoke`):")
+        for c in clients:
+            sandboxed = "sandboxed" if c.info.get("sandboxed") else "NOT sandboxed"
+            print(f"  {c.info['node_name'][:18]:<18} {c.fingerprint}  {sandboxed}")
 
 
 # ---- running a job -------------------------------------------------------
@@ -103,7 +111,8 @@ def execute(job: dict, cfg: dict, args) -> int:
     print()
     if not confirm(args):
         return 1
-    sched = Scheduler(job, clients, log=log, max_attempts=args.retries, speculate=not args.no_speculate)
+    sched = Scheduler(job, clients, log=log, max_attempts=args.retries, speculate=not args.no_speculate,
+                      reference=toolinfo.fingerprints(cfg), match=args.match, keep_blobs=args.keep_blobs)
     try:
         result = sched.run()
     except JobFailed as e:
@@ -135,27 +144,101 @@ def execute(job: dict, cfg: dict, args) -> int:
 
 
 # ---- commands --------------------------------------------------------------
-def cmd_init(args) -> int:
-    p = config.config_path()
-    if p.exists() and not args.force:
-        cfg = config.load()
-        print(f"Already initialised ({p}). Use --force to overwrite.")
-    else:
-        cfg = config.defaults()
+def _apply_init_args(cfg: dict, args) -> None:
     if args.name:
         cfg["node_name"] = args.name
-    if args.token:
-        cfg["token"] = args.token
     if args.port:
         cfg["port"] = args.port
     if args.slots:
         cfg["slots"] = args.slots
+
+
+def cmd_init(args) -> int:
+    """Start a new mesh on this Mac: it holds the mesh's certificate authority."""
+    p = config.config_path()
+    if p.exists() and not args.force:
+        cfg = config.load()
+        print(f"Already initialised ({p}). Use --force to start a new mesh (other Macs must join again).")
+        _apply_init_args(cfg, args)
+        config.save(cfg)
+        return 0
+    cfg = config.defaults()
+    _apply_init_args(cfg, args)
+    shutil.rmtree(pki.paths()["dir"], ignore_errors=True)
+    pki.create_ca(cfg["node_id"])
+    pki.self_issue(cfg["node_id"])
     config.save(cfg)
     print(f"config: {p}")
     print(f"node:   {cfg['node_name']} ({cfg['node_id']}) port {cfg['port']}")
-    print("\nOn your other Mac(s), join this mesh with:\n")
-    print(f"  macmesh init --token {cfg['token']}\n")
+    print(f"cert:   {pki.own_fingerprint()}")
+    print("\nThis Mac now holds the mesh's certificate authority. To add another Mac, run")
+    print("`macmesh invite` here and `macmesh join <code>` there.")
     print("Then run `macmesh serve` on every Mac (this one included).")
+    return 0
+
+
+def cmd_invite(args) -> int:
+    cfg = config.load()
+    if not pki.paths()["ca_key"].exists():
+        print("This Mac doesn't hold the mesh's certificate authority; invite from the Mac you ran `macmesh init` on.")
+        return 1
+    code = pairing.new_code()
+    port = args.port or int(cfg["port"]) + 1
+    invite = pairing.Invite(cfg, code, port)
+    ad = discovery.advertise(cfg, PAIR_SERVICE_TYPE, port)
+    print(f"\nOn the new Mac, run:\n\n  macmesh join {code}\n")
+    print(f"(waiting up to {pairing.EXPIRY / 60:.0f} minutes; if it can't find this Mac, add --host <this Mac's address>:{port})",
+          flush=True)
+    try:
+        name = invite.wait()
+    finally:
+        if ad:
+            ad.close()
+    print(f"Paired {name}. It can serve once it runs `macmesh serve`.")
+    return 0
+
+
+def cmd_join(args) -> int:
+    p = config.config_path()
+    cfg = config.load() if p.exists() else config.defaults()
+    if p.exists() and pki.ready() and not args.force:
+        print("This Mac already belongs to a mesh. Use --force to leave it and join another.")
+        return 1
+    _apply_init_args(cfg, args)
+    if args.host:
+        address = args.host if ":" in args.host else f"{args.host}:{int(cfg['port']) + 1}"
+    else:
+        found = discovery.browse(3.0, PAIR_SERVICE_TYPE)
+        if not found:
+            print("No open invite found. Run `macmesh invite` on the first Mac, or pass --host <address>.")
+            return 1
+        if len(found) > 1:
+            print("More than one Mac is inviting: " + ", ".join(found) + ". Pick one with --host.")
+            return 1
+        address = found[0]
+    if args.force:
+        shutil.rmtree(pki.paths()["dir"], ignore_errors=True)
+    pairing.join(cfg, args.code, address)
+    config.save(cfg)
+    print(f"Joined the mesh through {address}.")
+    print(f"node:   {cfg['node_name']} ({cfg['node_id']})")
+    print(f"cert:   {pki.own_fingerprint()}")
+    print("Now run `macmesh serve` here.")
+    return 0
+
+
+def cmd_revoke(args) -> int:
+    cfg = config.load()
+    fp = args.fingerprint.lower().replace(":", "")
+    if len(fp) != 64 or any(c not in "0123456789abcdef" for c in fp):
+        raise ValueError("give the full 64-character certificate fingerprint (see `macmesh nodes`)")
+    if fp == pki.own_fingerprint():
+        raise ValueError("that's this Mac's own certificate")
+    if fp not in cfg["revoked"]:
+        cfg["revoked"].append(fp)
+    config.save(cfg)
+    print(f"This Mac now refuses {fp[:16]}…  Run the same command on every other Mac in the mesh,")
+    print("and restart `macmesh serve` here.")
     return 0
 
 
@@ -296,14 +379,35 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--retries", type=int, default=3, help="attempts per task before failing")
             p.add_argument("--no-speculate", action="store_true", help="don't duplicate straggler chunks")
             p.add_argument("--workdir", help="where results are collected")
+            p.add_argument("--match", default="version", choices=["version", "hash", "none"],
+                           help="only use Macs whose program build matches this Mac's (default: same version, "
+                                "or same binary when there's no version)")
+            p.add_argument("--keep-blobs", action="store_true",
+                           help="leave uploaded inputs on the other Macs for the next job (default: delete)")
 
-    p = sub.add_parser("init", help="create this Mac's config / join a mesh")
-    p.add_argument("--name")
-    p.add_argument("--token", help="shared mesh token from your first Mac")
-    p.add_argument("--port", type=int)
-    p.add_argument("--slots", type=int, help="tasks to run at once (default 1)")
-    p.add_argument("--force", action="store_true")
+    def node_opts(p):
+        p.add_argument("--name")
+        p.add_argument("--port", type=int)
+        p.add_argument("--slots", type=int, help="tasks to run at once (default 1)")
+        p.add_argument("--force", action="store_true")
+
+    p = sub.add_parser("init", help="start a new mesh on this Mac (it holds the certificate authority)")
+    node_opts(p)
     p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("invite", help="let one more Mac join (shows a one-time code)")
+    p.add_argument("--port", type=int, help="pairing port (default: worker port + 1)")
+    p.set_defaults(fn=cmd_invite)
+
+    p = sub.add_parser("join", help="join a mesh with the code from `macmesh invite`")
+    p.add_argument("code")
+    p.add_argument("--host", help="the inviting Mac's address[:port], if Bonjour can't find it")
+    node_opts(p)
+    p.set_defaults(fn=cmd_join)
+
+    p = sub.add_parser("revoke", help="refuse a Mac's certificate from now on (run on every Mac)")
+    p.add_argument("fingerprint")
+    p.set_defaults(fn=cmd_revoke)
 
     p = sub.add_parser("serve", help="run the worker daemon on this Mac")
     p.add_argument("--host", default="0.0.0.0")
@@ -375,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
     args.template = template
     try:
         return args.fn(args) or 0
-    except (jobspec.JobError, ValueError, FileNotFoundError) as e:
+    except (jobspec.JobError, ValueError, FileNotFoundError, pki.PKIError, pairing.PairingError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 

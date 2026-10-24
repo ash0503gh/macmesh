@@ -1,13 +1,19 @@
 """The daemon every Mac runs: accepts signed tasks, runs them, serves results.
 
-Endpoints (all signed, see wire.py):
-  GET    /info                    node capabilities, load and power state
+Endpoints (all signed, see wire.py; over mutual TLS unless `tls` is off):
+  GET    /info                    node capabilities, load, power and owner state
   HEAD   /blobs/<sha256>          200 if the blob is already cached here
   PUT    /blobs/<sha256>          upload a blob (re-hashed on arrival)
+  DELETE /blobs/<sha256>          forget a blob (409 while a task still uses it)
   POST   /tasks                   queue a task (JSON, see jobspec.py)
   GET    /tasks/<id>              status, exit code, log tail, output manifest
   GET    /tasks/<id>/out/<name>   download an output (dirs arrive as .tar)
   DELETE /tasks/<id>              cancel and/or clean up
+
+The owner comes first: while they need the Mac, running tasks are paused
+(SIGSTOP) and no new ones are accepted; if it lasts, the tasks are handed back
+("yielded") for other Macs to run. Shutting the worker down (SIGTERM, as at
+logout or shutdown) hands back everything at once.
 """
 
 from __future__ import annotations
@@ -18,6 +24,7 @@ import os
 import re
 import shutil
 import signal
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -26,13 +33,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from . import __version__, config, sysinfo, wire
+from . import __version__, config, owner, pki, sandbox, sysinfo, toolinfo, wire
 
 PLACEHOLDER = re.compile(r"\{(in|out):([A-Za-z0-9_.-]+)\}")
 SHA = re.compile(r"^[0-9a-f]{64}$")
 TASK_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 LOG_TAIL = 4000
 MAX_JSON = 1 << 20
+OWNER_POLL = 2.0
+GC_EVERY = 60.0
+ACTIVE = ("queued", "running", "paused")
+QOS = {"utility", "background", "maintenance"}
 
 
 class Task:
@@ -40,7 +51,8 @@ class Task:
         self.spec = spec
         self.id = spec["task_id"]
         self.dir = root / self.id
-        self.state = "queued"  # queued -> running -> done | failed | cancelled
+        # queued -> running <-> paused -> done | failed | cancelled | yielded
+        self.state = "queued"
         self.returncode: int | None = None
         self.error = ""
         self.proc: subprocess.Popen | None = None
@@ -60,11 +72,14 @@ class Task:
             "elapsed": (self.finished or time.time()) - self.started if self.started else 0,
         }
 
+    def blobs(self) -> set[str]:
+        return {inp["blob"] for inp in self.spec.get("inputs", {}).values()}
+
 
 class Worker:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, home: Path | None = None, owner_sample=None):
         self.cfg = cfg
-        self.root = config.home()
+        self.root = home or config.home()
         self.blobs = self.root / "blobs"
         self.work = self.root / "work"
         self.blobs.mkdir(parents=True, exist_ok=True)
@@ -74,26 +89,26 @@ class Worker:
         self.lock = threading.Lock()
         self.slots = threading.Semaphore(int(cfg["slots"]))
         self.extract_lock = threading.Lock()
+        self.fingerprints = toolinfo.fingerprints(cfg)
+        self.sandboxed = bool(cfg.get("sandbox")) and sandbox.available()
+        self.owner_busy = ""      # why the owner needs the Mac right now, or ""
+        self.draining = ""        # why this worker is going away, or ""
+        self.stopped = threading.Event()
+        self.watch = owner.OwnerWatch(cfg["owner"], sample=owner_sample)
+        self._busy_since = 0.0
+        self._calm_since: float | None = None
+        self.collect_garbage()
+        threading.Thread(target=self._gc_loop, daemon=True).start()
+        if cfg["owner"].get("mode") != "off":
+            threading.Thread(target=self._owner_loop, daemon=True).start()
 
     # ---- capabilities -------------------------------------------------
     def programs(self) -> dict[str, str]:
-        """Allowed program name -> resolved executable, for those present here."""
-        found = {}
-        for name in self.cfg["allowed_programs"]:
-            path = shutil.which(name)
-            if path:
-                found[name] = path
-        for name, tool in self.cfg["tools"].items():
-            path = tool.get("path", "")
-            if path and os.access(path, os.X_OK):
-                found[name] = path
-            elif shutil.which(name):
-                found[name] = shutil.which(name)
-        return found
+        return toolinfo.programs(self.cfg)
 
     def info(self) -> dict:
         with self.lock:
-            active = [t for t in self.tasks.values() if t.state in ("queued", "running")]
+            active = [t for t in self.tasks.values() if t.state in ACTIVE]
         pw = sysinfo.power()
         return {
             "version": __version__,
@@ -101,25 +116,43 @@ class Worker:
             "node_name": self.cfg["node_name"],
             "slots": int(self.cfg["slots"]),
             "running": sum(t.state == "running" for t in active),
+            "paused": sum(t.state == "paused" for t in active),
             "queued": sum(t.state == "queued" for t in active),
             "hardware": sysinfo.hardware(),
             "power": pw,
-            "accepting": self.accepting(pw),
+            "accepting": not self.refusal(pw),
+            "refusal": self.refusal(pw),
             "programs": sorted(self.programs()),
+            "fingerprints": self.fingerprints,
+            "sandboxed": self.sandboxed,
         }
 
-    def accepting(self, pw: dict) -> bool:
+    def refusal(self, pw: dict) -> str:
+        """Why this Mac won't take new work right now, or "" if it will."""
+        if self.draining:
+            return self.draining
+        if self.owner_busy:
+            return self.owner_busy
+        free_gb = shutil.disk_usage(self.root).free / 2**30
+        if free_gb < float(self.cfg.get("min_free_gb", 0)):
+            return f"disk nearly full ({free_gb:.1f} GB free)"
         if not pw["on_battery"]:
-            return True
+            return ""
         if not self.cfg["accept_on_battery"]:
-            return False
-        return pw["battery_pct"] is None or pw["battery_pct"] >= self.cfg["min_battery"]
+            return "on battery"
+        if pw["battery_pct"] is not None and pw["battery_pct"] < self.cfg["min_battery"]:
+            return f"battery at {pw['battery_pct']}%"
+        return ""
+
+    def accepting(self, pw: dict) -> bool:
+        return not self.refusal(pw)
 
     # ---- blobs --------------------------------------------------------
     def put_blob(self, sha: str, stream, length: int) -> None:
         dest = self.blobs / sha
         if dest.exists():
             _drain(stream, length)
+            _touch(dest)
             return
         h = hashlib.sha256()
         fd, tmp = tempfile.mkstemp(dir=self.blobs, prefix=".up-")
@@ -140,6 +173,13 @@ class Worker:
             if os.path.exists(tmp):
                 os.unlink(tmp)
 
+    def has_blob(self, sha: str) -> bool:
+        path = self.blobs / sha
+        if path.exists():
+            _touch(path)  # about to be used: keep it from expiring
+            return True
+        return False
+
     def extracted(self, sha: str) -> Path:
         """Directory inputs are tars; unpack each one once and clone per task."""
         target = self.blobs / f"{sha}.d"
@@ -149,6 +189,44 @@ class Worker:
                 wire.safe_extract(self.blobs / sha, tmp)
                 tmp.rename(target)
         return target
+
+    def blobs_in_use(self) -> set[str]:
+        with self.lock:
+            return set().union(*(t.blobs() for t in self.tasks.values() if t.state in ACTIVE))
+
+    def delete_blob(self, sha: str) -> bool:
+        """Remove a blob and its unpacked copy. False while an active task needs it."""
+        with self.extract_lock:
+            if sha in self.blobs_in_use():
+                return False
+            (self.blobs / sha).unlink(missing_ok=True)
+            shutil.rmtree(self.blobs / f"{sha}.d", ignore_errors=True)
+        return True
+
+    def collect_garbage(self) -> int:
+        """Delete blobs nobody has used for `blob_ttl` seconds: media shouldn't linger on lent Macs."""
+        cutoff = time.time() - float(self.cfg.get("blob_ttl", 1800))
+        removed = 0
+        for path in list(self.blobs.iterdir()):
+            try:
+                old = path.stat().st_mtime < cutoff
+            except FileNotFoundError:  # went with its blob or unpacked copy
+                continue
+            sha = path.name.removesuffix(".d")
+            if path.name.startswith("."):  # half-done upload or unpack
+                if old:
+                    shutil.rmtree(path, ignore_errors=True) if path.is_dir() else path.unlink(missing_ok=True)
+                continue
+            if SHA.match(sha) and old and self.delete_blob(sha):
+                removed += 1
+        return removed
+
+    def _gc_loop(self) -> None:
+        while not self.stopped.wait(GC_EVERY):
+            try:
+                self.collect_garbage()
+            except OSError:
+                pass
 
     # ---- tasks --------------------------------------------------------
     def submit(self, spec: dict) -> Task:
@@ -164,7 +242,7 @@ class Worker:
         for name, inp in spec.get("inputs", {}).items():
             if not SHA.match(inp.get("blob", "")):
                 raise ValueError(f"input {name}: bad blob hash")
-            if not (self.blobs / inp["blob"]).exists():
+            if not self.has_blob(inp["blob"]):
                 raise FileNotFoundError(f"input {name}: blob not uploaded")
             _check_filename(inp.get("filename", ""))
         for fname in spec.get("outputs", {}).values():
@@ -179,24 +257,27 @@ class Worker:
 
     def _run(self, task: Task, exe: str) -> None:
         with self.slots:
-            if task.state == "cancelled":
-                return
-            task.state = "running"
+            while self.owner_busy and task.state == "queued":
+                time.sleep(0.5)  # don't start new work while the owner needs the Mac
+            with self.lock:
+                if task.state != "queued":
+                    return
+                task.state = "running"
             task.started = time.time()
             try:
                 argv = self._prepare(task, exe)
                 rc = self._execute(task, argv)
                 task.returncode = rc
-                if task.state == "cancelled":
+                if task.state in ("cancelled", "yielded"):
                     return
                 if rc != 0:
                     task.state = "failed"
-                    task.error = f"exit code {rc}"
+                    task.error = task.error or f"exit code {rc}"
                 else:
                     self._collect(task)
                     task.state = "done"
             except Exception as e:  # report anything to the coordinator
-                if task.state != "cancelled":
+                if task.state not in ("cancelled", "yielded"):
                     task.state, task.error = "failed", f"{type(e).__name__}: {e}"
             finally:
                 task.finished = time.time()
@@ -204,6 +285,7 @@ class Worker:
     def _prepare(self, task: Task, exe: str) -> list[str]:
         (task.dir / "in").mkdir(parents=True)
         (task.dir / "out").mkdir()
+        (task.dir / "tmp").mkdir()
         paths = {}
         for name, inp in task.spec.get("inputs", {}).items():
             dest = task.dir / "in" / inp["filename"]
@@ -223,16 +305,26 @@ class Worker:
             return PLACEHOLDER.sub(sub, arg)
 
         argv = [exe] + [expand(a) for a in task.spec["argv"][1:]]
+        if self.sandboxed:
+            argv = sandbox.wrap(argv, task.dir, self.cfg["tools"].get(task.spec["argv"][0], {}))
+        priority = self.cfg.get("priority", "normal")
+        if priority in QOS and sysinfo.IS_MAC:
+            # A QoS clamp makes macOS favour the owner's apps over this task.
+            argv = ["taskpolicy", "-c", priority, *argv]
         (task.dir / "argv.json").write_text(json.dumps(argv, indent=1))
         return argv
 
     def _execute(self, task: Task, argv: list[str]) -> int:
         nice = int(self.cfg.get("nice", 0))
+        env = dict(os.environ, TMPDIR=str(task.dir / "tmp"))
         with open(task.dir / "task.log", "wb") as log:
-            task.proc = subprocess.Popen(
-                argv, cwd=task.dir, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                preexec_fn=(lambda: os.nice(nice)) if nice else None, start_new_session=True,
-            )
+            with self.lock:
+                if task.state != "running":
+                    return -1
+                task.proc = subprocess.Popen(
+                    argv, cwd=task.dir, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
+                    preexec_fn=(lambda: os.nice(nice)) if nice else None, start_new_session=True,
+                )
             awake = None
             if sysinfo.IS_MAC:
                 # Keep the Mac from idle-sleeping while this task runs.
@@ -265,14 +357,90 @@ class Worker:
     def cancel(self, tid: str) -> bool:
         with self.lock:
             task = self.tasks.pop(tid, None)
-        if not task:
-            return False
-        if task.state in ("queued", "running"):
-            task.state = "cancelled"
-            if task.proc and task.proc.poll() is None:
-                _kill(task.proc)
+            if not task:
+                return False
+            was = task.state
+            if was in ACTIVE:
+                task.state = "cancelled"
+        if was in ACTIVE and task.proc and task.proc.poll() is None:
+            _kill(task.proc)
         shutil.rmtree(task.dir, ignore_errors=True)
         return True
+
+    # ---- the owner comes first ----------------------------------------
+    def _signal(self, task: Task, sig: int) -> None:
+        if task.proc and task.proc.poll() is None:
+            try:
+                os.killpg(task.proc.pid, sig)
+            except OSError:
+                pass
+
+    def pause_all(self) -> None:
+        with self.lock:
+            running = [t for t in self.tasks.values() if t.state == "running" and t.proc]
+            for t in running:
+                t.state = "paused"
+        for t in running:
+            self._signal(t, signal.SIGSTOP)
+
+    def resume_all(self) -> None:
+        with self.lock:
+            paused = [t for t in self.tasks.values() if t.state == "paused"]
+            for t in paused:
+                t.state = "running"
+        for t in paused:
+            self._signal(t, signal.SIGCONT)
+
+    def yield_all(self, reason: str) -> int:
+        """Give every unfinished task back to its coordinator, which runs it elsewhere."""
+        with self.lock:
+            active = [t for t in self.tasks.values() if t.state in ACTIVE]
+            for t in active:
+                t.state, t.error = "yielded", reason
+        for t in active:
+            if t.proc and t.proc.poll() is None:
+                self._signal(t, signal.SIGCONT)  # a stopped process can't act on SIGTERM
+                _kill(t.proc)
+        return len(active)
+
+    def check_owner(self, now: float | None = None) -> None:
+        """One step of the owner watch (the loop calls this every OWNER_POLL seconds)."""
+        now = time.time() if now is None else now
+        p = self.cfg["owner"]
+        with self.lock:
+            live = [t for t in self.tasks.values() if t.state in ("running", "paused") and t.proc]
+        reason = self.watch.busy({t.proc.pid for t in live}, any(t.state == "paused" for t in live))
+        if reason:
+            self._calm_since = None
+            if not self.owner_busy:
+                self._busy_since = now
+            self.owner_busy = reason
+            self.pause_all()
+            if now - self._busy_since >= float(p["yield_after"]):
+                self.yield_all(f"yielded: {reason}")
+        elif self.owner_busy:
+            self._calm_since = self._calm_since or now
+            if now - self._calm_since >= float(p["calm_seconds"]):
+                self.owner_busy = ""
+                self.resume_all()
+
+    def _owner_loop(self) -> None:
+        while not self.stopped.wait(OWNER_POLL):
+            try:
+                self.check_owner()
+            except Exception:  # measuring must never take the worker down
+                pass
+
+    def drain(self, reason: str) -> int:
+        self.draining = reason
+        return self.yield_all(f"yielded: {reason}")
+
+
+def _touch(path: Path) -> None:
+    try:
+        os.utime(path)
+    except OSError:
+        pass
 
 
 def _check_filename(name: str) -> None:
@@ -302,6 +470,14 @@ def _drain(stream, length: int) -> None:
 class Handler(BaseHTTPRequestHandler):
     worker: Worker
     protocol_version = "HTTP/1.1"
+    timeout = 60  # a connection silent this long is dropped
+
+    def setup(self):
+        if isinstance(self.request, ssl.SSLSocket):
+            # Handshake here, in the request's own thread, so a slow client can't stall accept().
+            self.request.settimeout(self.timeout)
+            self.request.do_handshake()
+        super().setup()
 
     def log_message(self, fmt, *args):  # quiet; the CLI prints its own progress
         if os.environ.get("MACMESH_DEBUG"):
@@ -317,6 +493,12 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def _auth(self, body: bytes | None) -> bool:
+        if isinstance(self.connection, ssl.SSLSocket):
+            der = self.connection.getpeercert(binary_form=True)
+            if not der or pki.fingerprint_der(der) in set(self.worker.cfg.get("revoked", [])):
+                self.close_connection = True
+                self._reply(401, {"error": "certificate revoked"})
+                return False
         if wire.verify(self.worker.cfg["token"], self.command, self.path, self.headers, body):
             return True
         self.close_connection = True
@@ -346,7 +528,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth(b""):
             return
         p = self._parts()
-        ok = len(p) == 2 and p[0] == "blobs" and SHA.match(p[1]) and (self.worker.blobs / p[1]).exists()
+        ok = len(p) == 2 and p[0] == "blobs" and SHA.match(p[1]) and self.worker.has_blob(p[1])
         self._reply(200 if ok else 404)
 
     def do_PUT(self):
@@ -372,8 +554,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self._parts() != ["tasks"]:
             return self._reply(404, {"error": "not found"})
-        if not self.worker.accepting(sysinfo.power()):
-            return self._reply(503, {"error": "not accepting work (battery policy)"})
+        refusal = self.worker.refusal(sysinfo.power())
+        if refusal:
+            return self._reply(503, {"error": f"not accepting work ({refusal})"})
         try:
             task = self.worker.submit(json.loads(body))
         except PermissionError as e:
@@ -390,6 +573,10 @@ class Handler(BaseHTTPRequestHandler):
         p = self._parts()
         if len(p) == 2 and p[0] == "tasks" and self.worker.cancel(p[1]):
             return self._reply(200, {"deleted": p[1]})
+        if len(p) == 2 and p[0] == "blobs" and SHA.match(p[1]):
+            if self.worker.delete_blob(p[1]):
+                return self._reply(200, {"deleted": p[1]})
+            return self._reply(409, {"error": "blob in use"})
         self._reply(404, {"error": "no such task"})
 
     def _send_file(self, path: Path) -> None:
@@ -401,24 +588,52 @@ class Handler(BaseHTTPRequestHandler):
             shutil.copyfileobj(f, self.wfile, wire.CHUNK)
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # Refused handshakes (wrong CA, plain HTTP, port scans) and dropped clients are routine.
+        if os.environ.get("MACMESH_DEBUG"):
+            super().handle_error(request, client_address)
+
+
+def make_server(worker: Worker, host: str, port: int, tls: ssl.SSLContext | None) -> ThreadingHTTPServer:
+    handler = type("BoundHandler", (Handler,), {"worker": worker})
+    server = Server((host, port), handler)
+    if tls is not None:
+        server.socket = tls.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
+    return server
+
+
 def serve(cfg: dict, host: str = "0.0.0.0", advertise: bool = True) -> None:
     worker = Worker(cfg)
-    handler = type("BoundHandler", (Handler,), {"worker": worker})
-    server = ThreadingHTTPServer((host, int(cfg["port"])), handler)
-    server.daemon_threads = True
+    tls = pki.context(server=True) if cfg.get("tls", True) else None
+    server = make_server(worker, host, int(cfg["port"]), tls)
     ad = None
     if advertise:
         from . import discovery
         ad = discovery.advertise(cfg)
+
+    def on_term(signum, frame):
+        # Logout, shutdown or launchctl stop: hand work back at once, then let pollers see it.
+        n = worker.drain("worker shutting down")
+        print(f"shutting down: handed back {n} task(s)", flush=True)
+        threading.Thread(target=lambda: (time.sleep(2), server.shutdown()), daemon=True).start()
+
+    signal.signal(signal.SIGTERM, on_term)
     hw = sysinfo.hardware()
     print(f"macmesh worker '{cfg['node_name']}' on :{cfg['port']}  "
           f"[{hw['model']} · {hw['chip']} · score {hw['score']} · {cfg['slots']} slot(s)]")
     print(f"programs: {', '.join(sorted(worker.programs())) or '(none found)'}")
+    print(f"transport: {'mutual TLS' if tls else 'plain HTTP (tls is off)'} · "
+          f"sandbox: {'on' if worker.sandboxed else 'OFF'} · owner mode: {cfg['owner'].get('mode')} · "
+          f"priority: {cfg.get('priority', 'normal')}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        worker.drain("worker stopped")
     finally:
+        worker.stopped.set()
         if ad:
             ad.close()
         server.server_close()

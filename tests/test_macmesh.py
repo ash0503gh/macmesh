@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import tarfile
@@ -13,15 +14,15 @@ import tempfile
 import threading
 import time
 import unittest
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-from macmesh import config, jobspec, media, wire
+from macmesh import config, jobspec, media, owner, pairing, pki, sandbox, toolinfo, wire
+from macmesh import worker as worker_module
 from macmesh.client import NodeClient, NodeError
 from macmesh.planners import plan_batch, plan_range, plan_video
 from macmesh.planners.ai import extract_plan
 from macmesh.scheduler import JobFailed, Scheduler
-from macmesh.worker import Handler, Worker
+from macmesh.worker import Worker, make_server
 
 TOKEN = "test-token"
 HAVE_FFMPEG = bool(shutil.which("ffmpeg"))
@@ -38,21 +39,27 @@ i=$start; while [ $i -le $end ]; do echo "$i" > "$out/frame_$(printf %05d $i).tx
 
 
 class Node:
-    """An in-process worker on an ephemeral port, standing in for one Mac."""
+    """An in-process worker on an ephemeral port, standing in for one Mac.
 
-    def __init__(self, root: Path, name: str, tools: dict, slots: int = 1):
-        os.environ["MACMESH_HOME"] = str(root / name)
+    The owner watch is off unless `owner` is given (the test machine's real load
+    would pause tasks at random); with tls=True the node's identity must already
+    be in <root>/<name>/tls.
+    """
+
+    def __init__(self, root: Path, name: str, tools: dict, slots: int = 1, tls: bool = False,
+                 owner: dict | None = None, owner_sample=None, **extra):
+        self.home = root / name
+        os.environ["MACMESH_HOME"] = str(self.home)
         cfg = config.defaults()
-        cfg.update(node_name=name, token=TOKEN, slots=slots, port=0, tools=tools)
-        self.worker = Worker(cfg)
-        handler = type("H", (Handler,), {"worker": self.worker})
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        self.server.daemon_threads = True
+        cfg.update(node_name=name, token=TOKEN, slots=slots, port=0, tools=tools, **extra)
+        cfg["owner"].update(owner or {"mode": "off"})
+        self.worker = Worker(cfg, home=self.home, owner_sample=owner_sample)
+        self.server = make_server(self.worker, "127.0.0.1", 0, pki.context(True, self.home) if tls else None)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.address = f"127.0.0.1:{self.server.server_address[1]}"
 
-    def client(self) -> NodeClient:
-        c = NodeClient(self.address, TOKEN, timeout=5)
+    def client(self, tls=None, address: str = "", **kw) -> NodeClient:
+        c = NodeClient(address or self.address, TOKEN, timeout=kw.pop("timeout", 5), tls=tls, **kw)
         c.fetch_info()
         return c
 
@@ -131,7 +138,9 @@ class JobSpecTests(unittest.TestCase):
             extract_plan("no json here")
 
 
-class MeshTests(unittest.TestCase):
+class MeshCase(unittest.TestCase):
+    """Two in-process Macs and a fake renderer; no tests of its own."""
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         renderer = self.tmp / "fakeapp"
@@ -148,18 +157,23 @@ class MeshTests(unittest.TestCase):
             n.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def range_job(self, frames=400, chunk=50):
+    def range_job(self, frames=400, chunk=50, out="out"):
         return jobspec.validate(plan_range(
             "fakeapp", str(self.project), 0, frames - 1,
             ["render", "{in:project}", "--start", "{start}", "--end", "{end}", "--output", "{out:result}"],
-            chunk=chunk, workdir=str(self.tmp / "out")))
+            chunk=chunk, workdir=str(self.tmp / out)))
 
-    def run_job(self, job, **kw):
-        sched = Scheduler(job, [n.client() for n in self.nodes], log=lambda m: None, **kw)
+    def run_job(self, job, clients=None, **kw):
+        sched = Scheduler(job, clients or [n.client() for n in self.nodes], log=kw.pop("log", lambda m: None), **kw)
         result = sched.run()
         media.run_merge(Path(job["workdir"]), job["merge"], log=lambda m: None)
         return result
 
+    def blobs(self, node):
+        return [b for b in os.listdir(node.worker.blobs) if not b.endswith(".d") and not b.startswith(".")]
+
+
+class MeshTests(MeshCase):
     def test_bad_token_is_rejected(self):
         with self.assertRaises(NodeError):
             NodeClient(self.nodes[0].address, "wrong", timeout=5).fetch_info()
@@ -174,10 +188,23 @@ class MeshTests(unittest.TestCase):
             self.assertEqual(os.listdir(n.worker.work), [])
 
     def test_project_uploaded_once_per_node(self):
+        self.run_job(self.range_job(), keep_blobs=True)
+        for n in self.nodes:
+            self.assertEqual(len(self.blobs(n)), 1)
+
+    def test_uploads_are_deleted_after_the_job(self):
         self.run_job(self.range_job())
         for n in self.nodes:
-            blobs = [b for b in os.listdir(n.worker.blobs) if not b.endswith(".d")]
-            self.assertEqual(len(blobs), 1)
+            self.assertEqual(os.listdir(n.worker.blobs), [])
+
+    def test_unused_blobs_expire(self):
+        self.run_job(self.range_job(), keep_blobs=True)
+        n = self.nodes[0]
+        n.worker.cfg["blob_ttl"] = 3600
+        self.assertEqual(n.worker.collect_garbage(), 0)
+        n.worker.cfg["blob_ttl"] = -1  # everything counts as old
+        self.assertEqual(n.worker.collect_garbage(), 1)
+        self.assertEqual(os.listdir(n.worker.blobs), [])
 
     def test_failing_chunk_fails_job_with_log(self):
         (self.project / "fail_at_100").write_text("")
@@ -233,6 +260,341 @@ class MeshTests(unittest.TestCase):
                                capture_output=True, text=True).stdout.strip()
         self.assertEqual(count, "720")
         self.assertIsNotNone(media.summary(out)["audio"])
+
+
+class Relay:
+    """A TCP relay to a worker. cut() makes it swallow traffic, like a Mac that slept or left Wi-Fi."""
+
+    def __init__(self, target: str):
+        host, _, port = target.rpartition(":")
+        self.target = (host, int(port))
+        self.sock = socket.create_server(("127.0.0.1", 0))
+        self.address = f"127.0.0.1:{self.sock.getsockname()[1]}"
+        self.cut_at = 0.0
+        self.open: list[socket.socket] = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def cut(self) -> None:
+        self.cut_at = time.time()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                a, _ = self.sock.accept()
+            except OSError:
+                return
+            self.open.append(a)
+            if self.cut_at:
+                continue  # accepted, never answered
+            b = socket.create_connection(self.target)
+            self.open.append(b)
+            for src, dst in ((a, b), (b, a)):
+                threading.Thread(target=self._pipe, args=(src, dst), daemon=True).start()
+
+    def _pipe(self, src, dst) -> None:
+        while True:
+            try:
+                data = src.recv(65536)
+            except OSError:
+                return
+            if not data:
+                return
+            if not self.cut_at:
+                try:
+                    dst.sendall(data)
+                except OSError:
+                    return
+
+    def close(self) -> None:
+        self.sock.close()
+        for s in self.open:
+            s.close()
+
+
+class ResilienceTests(MeshCase):
+    """Macs that vanish, shut down, or whose owner needs them back."""
+
+    def test_silent_node_is_dropped_within_seconds(self):
+        os.environ["FAKE_DELAY"] = "0.3"
+        relay = Relay(self.nodes[1].address)
+        lines = []
+        try:
+            clients = [self.nodes[0].client(), self.nodes[1].client(address=relay.address, timeout=2)]
+            threading.Timer(1.0, relay.cut).start()
+            self.run_job(self.range_job(frames=800), clients=clients,
+                         log=lambda m: lines.append((time.time(), m)))
+        finally:
+            os.environ.pop("FAKE_DELAY")
+            relay.close()
+        self.assertEqual(len(os.listdir(self.tmp / "out/frames")), 800)
+        # Its work moves on after two missed 2 s polls (or a duplicate starts), not a 30 s socket timeout.
+        moved = [t for t, m in lines if "re-queued" in m or "duplicating" in m]
+        self.assertTrue(moved, lines)
+        self.assertLess(moved[0] - relay.cut_at, 8.0, lines)
+
+    def test_shutdown_hands_work_back(self):
+        os.environ["FAKE_DELAY"] = "0.3"
+        lines = []
+        try:
+            threading.Timer(1.0, lambda: self.nodes[1].worker.drain("worker shutting down")).start()
+            self.run_job(self.range_job(frames=800), log=lines.append)
+        finally:
+            os.environ.pop("FAKE_DELAY")
+        self.assertEqual(len(os.listdir(self.tmp / "out/frames")), 800)
+        self.assertTrue(any("handed back" in m and "shutting down" in m for m in lines), lines)
+
+    def test_busy_owner_gets_their_mac_back(self):
+        busy = {"cpu": 0.0}
+        self.nodes[1].stop()
+        old_poll = worker_module.OWNER_POLL
+        worker_module.OWNER_POLL = 0.1
+        try:
+            self.nodes[1] = Node(self.tmp, "air2", self.tools, owner={"mode": "shared", "yield_after": 0.3},
+                                 owner_sample=lambda ours: {"cpu": busy["cpu"], "gpu": None, "idle": None})
+            os.environ["FAKE_DELAY"] = "0.3"
+            lines = []
+            threading.Timer(1.0, lambda: busy.update(cpu=0.9)).start()
+            result = self.run_job(self.range_job(frames=800), log=lines.append)
+        finally:
+            worker_module.OWNER_POLL = old_poll
+            os.environ.pop("FAKE_DELAY")
+        self.assertEqual(len(os.listdir(self.tmp / "out/frames")), 800)
+        self.assertTrue(any("handed back" in m and "owner using 90% CPU" in m for m in lines), lines)
+        self.assertFalse(self.nodes[1].client().info["accepting"])
+
+
+class OwnerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_watch_rules(self):
+        policy = dict(config.defaults()["owner"])
+        sample = {"cpu": 0.1, "gpu": 0.2, "idle": 300.0}
+        w = owner.OwnerWatch(policy, sample=lambda ours: sample)
+        self.assertEqual(w.busy(set(), paused=False), "")
+        sample["cpu"] = 0.8
+        self.assertIn("CPU", w.busy(set(), paused=False))
+        # GPU only counts while someone is at the keyboard (or our tasks are paused)...
+        sample.update(cpu=0.1, gpu=0.9, idle=300.0)
+        self.assertEqual(w.busy(set(), paused=False), "")
+        sample["idle"] = 2.0
+        self.assertIn("GPU", w.busy(set(), paused=False))
+        # ...and if it goes quiet the moment we pause, it was ours: ignore the GPU for a while.
+        sample["gpu"] = 0.05
+        self.assertEqual(w.busy(set(), paused=True), "")
+        sample["gpu"] = 0.9
+        self.assertEqual(w.busy(set(), paused=False), "")
+        idle = owner.OwnerWatch(dict(policy, mode="idle"), sample=lambda ours: {"cpu": 0, "gpu": 0, "idle": 5.0})
+        self.assertIn("active", idle.busy(set(), paused=False))
+
+    def test_pause_resume_then_yield(self):
+        sample = {"cpu": 0.0, "gpu": None, "idle": None}
+        cfg = config.defaults()
+        cfg.update(node_name="t", token=TOKEN, port=0, tools={"sleep": {"path": "/bin/sleep"}})
+        cfg["owner"].update(mode="off", calm_seconds=10, yield_after=30)  # off: steps are driven by hand here
+        w = Worker(cfg, home=self.tmp / "n", owner_sample=lambda ours: sample)
+        task = w.submit({"task_id": "s", "argv": ["sleep", "30"]})
+        for _ in range(100):
+            if task.proc:
+                break
+            time.sleep(0.05)
+
+        def proc_state():
+            return subprocess.run(["ps", "-o", "stat=", "-p", str(task.proc.pid)], capture_output=True,
+                                  text=True).stdout.strip()
+
+        sample["cpu"] = 0.9
+        w.check_owner(now=100)
+        self.assertEqual(task.state, "paused")
+        self.assertTrue(proc_state().startswith("T"), proc_state())  # stopped
+        self.assertFalse(w.accepting({"on_battery": False, "battery_pct": None}))
+        sample["cpu"] = 0.0
+        w.check_owner(now=105)
+        self.assertEqual(task.state, "paused")  # calm, but not for long enough yet
+        w.check_owner(now=116)
+        self.assertEqual(task.state, "running")
+        self.assertFalse(proc_state().startswith("T"))
+        sample["cpu"] = 0.9
+        w.check_owner(now=120)
+        w.check_owner(now=151)
+        self.assertEqual(task.state, "yielded")
+        task.proc.wait(timeout=10)
+        w.stopped.set()
+
+
+class BuildMatchTests(MeshCase):
+    def other_build(self):
+        other = self.tmp / "fakeapp-v2"
+        other.write_text(FAKE_RENDERER + "# v2\n")
+        other.chmod(other.stat().st_mode | stat.S_IEXEC)
+        return other
+
+    def test_mismatched_build_is_not_used(self):
+        self.nodes[1].worker.cfg["tools"] = {"fakeapp": {"path": str(self.other_build())}}
+        self.nodes[1].worker.fingerprints = toolinfo.fingerprints(self.nodes[1].worker.cfg)
+        reference = toolinfo.fingerprints(self.nodes[0].worker.cfg)
+        lines = []
+        result = self.run_job(self.range_job(), reference=reference, log=lines.append)
+        self.assertEqual(result["nodes"]["air"]["tasks"], 0, result)
+        self.assertTrue(any("air: fakeapp is" in m and "not using it" in m for m in lines), lines)
+        result = self.run_job(self.range_job(out="out2"), reference=reference, match="none")
+        self.assertGreater(result["nodes"]["air"]["tasks"], 0, result)
+
+    def test_no_matching_build_anywhere_fails_clearly(self):
+        reference = {"fakeapp": {"sha256": "0" * 64, "version": ""}}
+        with self.assertRaisesRegex(JobFailed, "different build"):
+            self.run_job(self.range_job(), reference=reference)
+
+    def test_version_beats_hash_when_both_known(self):
+        a = {"sha256": "a" * 64, "version": "ffmpeg version 7.1"}
+        self.assertTrue(toolinfo.same_build(a, {"sha256": "b" * 64, "version": "ffmpeg version 7.1"}, "version"))
+        self.assertFalse(toolinfo.same_build(a, {"sha256": "b" * 64, "version": "ffmpeg version 7.1"}, "hash"))
+        self.assertFalse(toolinfo.same_build(a, {"sha256": "b" * 64, "version": ""}, "version"))
+
+
+class BlobInUseTests(MeshCase):
+    def test_blob_in_use_is_not_deleted(self):
+        n = self.nodes[0]
+        n.worker.cfg["tools"] = {"sleep": {"path": "/bin/sleep"}}
+        f = self.tmp / "input.bin"
+        f.write_bytes(b"secret media")
+        sha = wire.sha256_file(f)
+        c = n.client()
+        c.put_blob(sha, f)
+        c.submit({"task_id": "s", "argv": ["sleep", "30"],
+                  "inputs": {"x": {"blob": sha, "kind": "file", "filename": "input.bin"}}})
+        self.assertFalse(c.delete_blob(sha))
+        c.delete("s")
+        self.assertTrue(c.delete_blob(sha))
+        self.assertFalse(c.has_blob(sha))
+
+
+def make_ca_mac(home: Path, node_id: str) -> None:
+    pki.create_ca(node_id, home)
+    pki.self_issue(node_id, home)
+
+
+class TLSTests(unittest.TestCase):
+    """Pairing with a code, then mutual TLS between the paired Macs."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.a, self.b = self.tmp / "pro", self.tmp / "air"
+        make_ca_mac(self.a, "aaaa")
+        self.cfg_a = dict(config.defaults(), token=TOKEN)
+        self.cfg_b = config.defaults()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def pair(self, code_for_joiner: str = ""):
+        code = pairing.new_code()
+        invite = pairing.Invite(self.cfg_a, code, port=0, home=self.a, host="127.0.0.1")
+        result = {}
+        t = threading.Thread(target=lambda: result.update(name=invite.wait(timeout=10)), daemon=True)
+        t.start()
+        try:
+            pairing.join(self.cfg_b, code_for_joiner or code, f"127.0.0.1:{invite.port}", home=self.b)
+        finally:
+            if code_for_joiner:
+                invite.sock.close()
+        t.join(5)
+        return result
+
+    def test_pairing_gives_certificate_and_token(self):
+        self.assertEqual(self.pair()["name"], self.cfg_b["node_name"])
+        self.assertTrue(pki.ready(self.b))
+        self.assertEqual(self.cfg_b["token"], TOKEN)
+
+    def test_wrong_code_is_refused(self):
+        with self.assertRaisesRegex(pairing.PairingError, "wrong code"):
+            self.pair(code_for_joiner=pairing.new_code())
+        self.assertFalse(pki.ready(self.b))
+        self.assertNotEqual(self.cfg_b["token"], TOKEN)
+
+    def test_code_format(self):
+        code = pairing.new_code()
+        self.assertRegex(code, r"^[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}$")
+        self.assertEqual(pairing.normalize(code.lower().replace("-", " ")), code.replace("-", ""))
+        with self.assertRaises(pairing.PairingError):
+            pairing.normalize("1234")
+
+    def test_job_over_mutual_tls_and_rejections(self):
+        self.pair()
+        tmp = self.tmp
+        renderer = tmp / "fakeapp"
+        renderer.write_text(FAKE_RENDERER)
+        renderer.chmod(renderer.stat().st_mode | stat.S_IEXEC)
+        project = tmp / "Ad.ecproj"
+        project.mkdir()
+        (project / "project.json").write_text("{}")
+        tools = {"fakeapp": {"path": str(renderer)}}
+        nodes = [Node(tmp, "pro", tools, tls=True), Node(tmp, "air", tools, tls=True)]
+        try:
+            ctx = pki.context(False, self.a)
+            job = jobspec.validate(plan_range(
+                "fakeapp", str(project), 0, 199,
+                ["render", "{in:project}", "--start", "{start}", "--end", "{end}", "--output", "{out:result}"],
+                chunk=50, workdir=str(tmp / "out")))
+            result = Scheduler(job, [n.client(tls=ctx) for n in nodes], log=lambda m: None).run()
+            self.assertTrue(all(v["tasks"] > 0 for v in result["nodes"].values()), result)
+            self.assertEqual(len(os.listdir(tmp / "out/chunks")), 4)
+
+            with self.assertRaises(NodeError):  # plain HTTP to a TLS worker
+                nodes[0].client(tls=None)
+            rogue = tmp / "rogue"
+            make_ca_mac(rogue, "bbbb")
+            with self.assertRaises(NodeError):  # a certificate from another mesh's CA
+                nodes[0].client(tls=pki.context(False, rogue))
+            air_fp = pki.own_fingerprint(self.b)
+            nodes[0].worker.cfg["revoked"] = [air_fp]
+            with self.assertRaises(NodeError):  # the worker refuses a revoked Mac
+                nodes[0].client(tls=pki.context(False, self.b))
+            with self.assertRaises(NodeError):  # and a coordinator refuses a revoked worker
+                nodes[1].client(tls=ctx, revoked=[air_fp])
+        finally:
+            for n in nodes:
+                n.stop()
+
+
+@unittest.skipUnless(sandbox.available(), "sandbox-exec not available")
+class SandboxTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        tools = {"sh": {"path": "/bin/sh"}, "curl": {"path": "/usr/bin/curl"}}
+        self.node = Node(self.tmp, "air", tools)
+
+    def tearDown(self):
+        self.node.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_task(self, argv, inputs=None):
+        job = jobspec.validate({"workdir": str(self.tmp / "out"), "tasks": [
+            {"id": "t", "argv": argv, "inputs": inputs or {}, "outputs": {"result": "r.txt"}}]})
+        Scheduler(job, [self.node.client()], log=lambda m: None, max_attempts=1).run()
+        return (self.tmp / "out/r.txt").read_text()
+
+    def test_task_works_inside_its_folder(self):
+        f = self.tmp / "in.txt"
+        f.write_text("frames")
+        self.assertEqual(self.run_task(["sh", "-c", "cat {in:f} > {out:result}"], {"f": str(f)}), "frames")
+
+    def test_task_cannot_read_owner_files(self):
+        secret = Path.home() / "Library/Preferences/.GlobalPreferences.plist"
+        self.assertTrue(secret.exists())
+        with self.assertRaisesRegex(JobFailed, "Operation not permitted"):
+            self.run_task(["sh", "-c", f"cat '{secret}' > {{out:result}}"])
+
+    def test_task_cannot_write_outside_or_use_network(self):
+        escape = Path("/tmp") / f"macmesh-escape-{os.getpid()}"
+        with self.assertRaisesRegex(JobFailed, "Operation not permitted"):
+            self.run_task(["sh", "-c", f"echo x > {escape}; echo x > {{out:result}}; test -f {escape}"])
+        self.assertFalse(escape.exists())
+        with self.assertRaises(JobFailed):
+            self.run_task(["sh", "-c", f"curl -sf -m 3 http://{self.node.address}/ > {{out:result}}"])
 
 
 if __name__ == "__main__":

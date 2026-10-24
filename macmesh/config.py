@@ -61,8 +61,19 @@ def defaults() -> dict:
         "token": secrets.token_urlsafe(24),
         "slots": 1,                 # concurrent tasks this node runs
         "nice": 0,                  # raise to keep the Mac responsive while rendering
+        "priority": "utility",      # macOS QoS clamp for tasks: normal | utility | background
         "min_battery": 30,          # refuse new work on battery below this %
         "accept_on_battery": True,
+        "min_free_gb": 5,           # refuse new work when the disk is this full
+        # Owner first: pause tasks while this Mac's owner needs it, give them back if it lasts.
+        # mode "shared" yields to heavy use, "idle" runs only while nobody touches the Mac,
+        # "off" never yields. cpu/gpu are the owner's share of the Mac that counts as heavy use.
+        "owner": {"mode": "shared", "cpu": 0.5, "gpu": 0.6, "idle_seconds": 120,
+                  "calm_seconds": 10, "yield_after": 30},
+        "blob_ttl": 1800,           # seconds an unused uploaded file is kept
+        "sandbox": True,            # run tasks under sandbox-exec (no network, writes only to the task)
+        "tls": True,                # mutual TLS with certificates from the mesh's CA (see `macmesh invite`)
+        "revoked": [],              # SHA-256 fingerprints of certificates this Mac refuses
         "peers": [],                # static "host:port" entries (skip Bonjour)
         "allowed_programs": list(DEFAULT_ALLOWED),
         "tools": json.loads(json.dumps(DEFAULT_TOOLS)),
@@ -77,7 +88,9 @@ def load() -> dict:
     if not p.exists():
         raise SystemExit(f"No config at {p}. Run `macmesh init` first.")
     cfg = defaults()
-    cfg.update(json.loads(p.read_text()))
+    saved = json.loads(p.read_text())
+    cfg["owner"].update(saved.pop("owner", {}))
+    cfg.update(saved)
     return cfg
 
 

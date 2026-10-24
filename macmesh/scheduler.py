@@ -4,6 +4,11 @@ No fixed 40/60 split. A fanless Air that throttles simply comes back for work
 less often, and a Mac that disappears (lid closed, Wi-Fi dropped) costs one
 chunk, which is re-queued elsewhere. At the tail of the job, idle Macs make
 duplicate copies of straggling chunks (first result wins).
+
+A Mac counts as gone after HEARTBEAT_MISSES status polls in a row go
+unanswered (a couple of seconds), and a task it hands back because its owner
+needs it ("yielded") goes straight back in the queue. Tasks only go to Macs
+whose build of the program matches the coordinator's (see toolinfo).
 """
 
 from __future__ import annotations
@@ -18,12 +23,13 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import wire
+from . import toolinfo, wire
 from .client import NodeClient, NodeError, TaskRejected
 
 POLL = 0.5
+HEARTBEAT_MISSES = 2  # status polls in a row a Mac may miss before its task moves elsewhere
 NODE_COOLDOWN = 10.0
-BATTERY_COOLDOWN = 60.0
+BUSY_COOLDOWN = 30.0  # a Mac that refused work (owner busy, battery, disk) is asked again after this
 MAX_NODE_ERRORS = 6  # per task: give up if Macs keep vanishing
 
 
@@ -58,6 +64,7 @@ class NodeState:
     speeds: list = field(default_factory=list)  # cost units per second, measured
     completed: int = 0
     busy_seconds: float = 0.0
+    mismatched: set = field(default_factory=set)  # programs whose build differs from the coordinator's
 
     @property
     def capacity(self) -> int:
@@ -69,12 +76,14 @@ class NodeState:
         return float(self.client.info.get("hardware", {}).get("score", 1.0))
 
     def can_run(self, spec: dict) -> bool:
-        return spec["argv"][0] in self.client.info.get("programs", [])
+        prog = spec["argv"][0]
+        return prog in self.client.info.get("programs", []) and prog not in self.mismatched
 
 
 class Scheduler:
     def __init__(self, job: dict, clients: list[NodeClient], log=print,
-                 max_attempts: int = 3, speculate: bool = True):
+                 max_attempts: int = 3, speculate: bool = True, reference: dict | None = None,
+                 match: str = "version", keep_blobs: bool = False):
         self.job = job
         self.job_id = uuid.uuid4().hex[:8]
         self.workdir = Path(job["workdir"]).expanduser().resolve()
@@ -90,14 +99,23 @@ class Scheduler:
         self.staging = Path(tempfile.mkdtemp(prefix="macmesh-"))
         self.fatal: str = ""
         self.aborted = False
+        # The coordinator's own builds; None = don't compare (e.g. this Mac lacks the tools).
+        self.reference = reference
+        self.match = match
+        self.keep_blobs = keep_blobs
 
     # ---- public -------------------------------------------------------
     def run(self) -> dict:
         if not self.nodes:
             raise JobFailed("no worker nodes available")
+        self._check_builds()
         for t in self.tasks:
             if not any(n.can_run(t.spec) for n in self.nodes):
-                raise JobFailed(f"{t.id}: no node has '{t.spec['argv'][0]}' installed/allowed")
+                prog = t.spec["argv"][0]
+                if any(prog in n.mismatched for n in self.nodes):
+                    raise JobFailed(f"{t.id}: every Mac with '{prog}' has a different build from this one "
+                                    "(install the same version, or use --match none)")
+                raise JobFailed(f"{t.id}: no node has '{prog}' installed/allowed")
         self.workdir.mkdir(parents=True, exist_ok=True)
         started = time.time()
         self.log(f"job {self.job['name']} ({self.job_id}): {len(self.tasks)} tasks on "
@@ -111,6 +129,8 @@ class Scheduler:
                     self.cond.wait(timeout=1.0)
         finally:
             self._cancel_all()
+            if not self.keep_blobs:
+                self._forget_blobs()
             shutil.rmtree(self.staging, ignore_errors=True)
         wall = time.time() - started
         return {
@@ -119,6 +139,30 @@ class Scheduler:
             "nodes": {n.client.name: {"tasks": n.completed, "busy_seconds": n.busy_seconds}
                       for n in self.nodes},
         }
+
+    def _check_builds(self) -> None:
+        if self.reference is None or self.match == "none":
+            return
+        programs = {t.spec["argv"][0] for t in self.tasks}
+        for prog in sorted(programs):
+            ours = self.reference.get(prog)
+            if ours is None:
+                self.log(f"  ? {prog} isn't on this Mac: can't check the other Macs' builds of it")
+                continue
+            for n in self.nodes:
+                theirs = n.client.info.get("fingerprints", {}).get(prog)
+                if prog in n.client.info.get("programs", []) and not toolinfo.same_build(ours, theirs, self.match):
+                    n.mismatched.add(prog)
+                    seen = toolinfo.describe(theirs) if theirs else "unknown build"
+                    self.log(f"  ✗ {n.client.name}: {prog} is {seen}, this Mac has {toolinfo.describe(ours)}; "
+                             "not using it for these tasks")
+
+    def _forget_blobs(self) -> None:
+        """Ask every Mac to delete what this job uploaded: media shouldn't linger on lent Macs."""
+        shas = {sha for sha, _, _ in self.blob_cache.values()}
+        for node in self.nodes:
+            for sha in shas:
+                node.client.delete_blob(sha)
 
     # ---- scheduling (called with self.cond held) -----------------------
     def _finished(self) -> bool:
@@ -247,30 +291,44 @@ class Scheduler:
             })
             submitted = True
             self.log(f"  → {task.id} on {c.name}" + (f" (upload {upload_s:.1f}s)" if upload_s > 0.5 else ""))
+            misses = 0
             while True:
                 if self.aborted or self._done_elsewhere(task, c.address):
                     outcome = "superseded"
                     return
-                st = c.status(remote_id)
+                try:
+                    st = c.status(remote_id)
+                    misses = 0
+                except NodeError:
+                    misses += 1  # one slow answer on busy Wi-Fi isn't a dead Mac; two in a row is
+                    if misses >= HEARTBEAT_MISSES:
+                        raise
+                    continue
                 if st["state"] == "done":
                     elapsed = st["elapsed"]
                     break
+                if st["state"] == "yielded":
+                    outcome, detail = "yielded", st["error"]
+                    return
                 if st["state"] in ("failed", "cancelled"):
                     outcome, detail = "failed", f"{st['error']}\n{st['log_tail'][-1500:]}"
                     return
-                time.sleep(POLL)
+                time.sleep(POLL)  # queued, running or paused (paused for long enough looks like a straggler)
             if self._done_elsewhere(task, c.address):
                 outcome = "superseded"
                 return
             self._fetch_outputs(task, c, remote_id, st["outputs"])
             outcome = "done"
         except TaskRejected as e:
-            outcome = "battery" if e.code == 503 else ("excluded" if e.code == 403 else "error")
+            outcome = "busy" if e.code == 503 else ("excluded" if e.code == 403 else "error")
             detail = str(e)
         except (NodeError, OSError, ValueError, KeyError) as e:
             outcome, detail = "error", str(e)
         finally:
-            if submitted:
+            if submitted and outcome == "error":
+                # The Mac may be gone: don't hold up re-queuing on a cleanup call that will time out.
+                threading.Thread(target=c.delete, args=(remote_id,), daemon=True).start()
+            elif submitted:
                 c.delete(remote_id)
             self._record(task, node, outcome, detail, elapsed)
 
@@ -360,10 +418,14 @@ class Scheduler:
                 task.state = "pending"
                 if all(n.client.address in task.excluded or not n.can_run(task.spec) for n in self.nodes):
                     self.fatal = f"task {task.id}: no node will run it ({detail})"
-            else:  # node trouble: unreachable, battery policy, lost task
+            elif outcome == "yielded":  # the Mac's owner needs it, or it's shutting down
+                task.state = "pending"
+                node.cooldown_until = time.time() + BUSY_COOLDOWN
+                self.log(f"  ↩ {name} handed back {task.id} ({detail.removeprefix('yielded: ')}); re-queued")
+            else:  # node trouble: unreachable, refusing work, lost task
                 task.state = "pending"
                 task.node_errors += outcome == "error"
-                wait = BATTERY_COOLDOWN if outcome == "battery" else NODE_COOLDOWN
+                wait = BUSY_COOLDOWN if outcome == "busy" else NODE_COOLDOWN
                 node.cooldown_until = time.time() + wait
                 self.log(f"  ! {name}: {detail.splitlines()[0] if detail else outcome}; "
                          f"re-queued {task.id}, pausing node {wait:.0f}s")

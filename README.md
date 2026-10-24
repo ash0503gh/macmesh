@@ -25,7 +25,8 @@ across the Macs around you, over Wi-Fi, with zero configuration.
 
 | Piece | What it does |
 |---|---|
-| `macmesh serve` | Worker daemon, run on every Mac. Advertises itself over Bonjour (`_macmesh._tcp`), accepts signed tasks, keeps the Mac awake with `caffeinate` while working. |
+| `macmesh serve` | Worker daemon, run on every Mac. Advertises itself over Bonjour (`_macmesh._tcp`), accepts signed tasks over mutual TLS, runs them sandboxed at low priority, steps aside when the Mac's owner needs it, keeps the Mac awake with `caffeinate` while working. |
+| `macmesh init` / `invite` / `join` | Start a mesh (this Mac holds its certificate authority), then add Macs with a one-time code, like pairing a Bluetooth device. |
 | Discovery | Zero-config over mDNS, the same mechanism AirDrop and AirPlay use for discovery. Static `--peer host:port` works too. |
 | Scheduler | **Pull-based**: each Mac takes the next chunk when it has room, so faster Macs naturally do more. Re-queues work when a Mac disappears, retries failures on a *different* Mac, and duplicates straggling chunks at the end of a job (first finisher wins). |
 | `macmesh video` | Splits a video at keyframes (lossless), encodes chunks across Macs, stitches with `-c copy`, then adds the original audio back in one pass. Frame-exact: tested to match the source's frame count with no seam errors. |
@@ -46,16 +47,18 @@ python3 -m pip install --user -e .
 On the **first** Mac:
 
 ```sh
-macmesh init --slots 2        # prints a join command with a shared token
-macmesh serve
+macmesh init --slots 2        # starts a mesh; this Mac holds its certificate authority
+macmesh invite                # shows a one-time code such as 7K2Q-M9XD-4TRA and waits
 ```
 
-On the **second** Mac, paste the join command, then serve:
+On the **second** Mac:
 
 ```sh
-macmesh init --token <token-from-first-mac>
+macmesh join 7K2Q-M9XD-4TRA   # finds the inviting Mac over Bonjour (or add --host <address>)
 macmesh serve
 ```
+
+Then run `macmesh serve` on the first Mac too. Repeat `invite` / `join` for each extra Mac.
 
 From either Mac (in another terminal):
 
@@ -155,14 +158,34 @@ On the first run, use `--dry-run --save-job plan.json` to review a plan and
   chunks, and weaker ones take the smallest.
 - **Upload overlap:** each Mac is sent one extra chunk, so its next
   upload happens while it computes the current one.
-- **Lid closed / Wi-Fi dropped:** the Mac's chunks are re-queued to the
-  others within about 10 s. It rejoins automatically when it comes back.
+- **Lid closed / Wi-Fi dropped:** status calls time out after 2 s, and a Mac
+  that misses two in a row has its chunk re-queued (about 4 s). A transfer
+  that stalls for 10 s counts as dead too. The Mac rejoins automatically when
+  it comes back.
+- **Shutdown / logout:** the worker catches SIGTERM and hands its chunks back
+  at once, so nothing waits for a timeout.
+- **The owner needs their Mac (owner first):** each worker watches CPU use by
+  everything except macmesh's own tasks, total GPU use while someone is at the
+  keyboard, and keyboard/mouse idle time. When the owner is busy (by default:
+  over 50% CPU or 60% GPU) it stops taking work and **pauses** running tasks
+  (SIGSTOP). If the owner is calm again for 10 s, the tasks resume. If not,
+  after 30 s the tasks are **handed back** and run on another Mac. With
+  `macmesh config owner '{"mode": "idle"}'` a Mac only works while nobody has
+  touched it for 2 minutes. Tasks also run under a macOS QoS clamp
+  (`priority`, default `utility`), so macOS favours the owner's apps anyway.
+- **Different software on the other Mac:** a chunk only goes to Macs that have
+  the program *and* the same build of it as the Mac you typed on: the same
+  version string when the tool reports one (`version_args` in its `tools`
+  entry; ffmpeg's is built in), otherwise the same binary (SHA-256).
+  `--match hash` always compares binaries; `--match none` turns the check off.
+  A Mac without the program is skipped, and the job stops with a clear message
+  if no Mac can run a task.
 - **Stragglers:** once the queue is empty, an idle Mac starts a duplicate
   of any chunk that is badly overdue. The first copy to finish wins and
   the other is cancelled.
-- **Battery:** a Mac on battery below `min_battery` (default 30%) stops
-  accepting new chunks (`macmesh config accept_on_battery false` to refuse
-  all battery work).
+- **Battery and disk:** a Mac on battery below `min_battery` (default 30%), or
+  with less than `min_free_gb` (default 5) of free disk, stops accepting new
+  chunks (`macmesh config accept_on_battery false` to refuse all battery work).
 - **Staying awake:** tasks run under `caffeinate -i`, so an *open* Mac
   won't idle-sleep. Closing a MacBook's lid still sleeps it unless it's on power
   with an external display (clamshell mode). macmesh treats that as a dropped
@@ -170,18 +193,40 @@ On the first run, use `--dry-run --save-job plan.json` to review a plan and
 
 ## Security model
 
-- Every request is HMAC-signed with the mesh token, with a timestamp and
-  body hash. The token itself never goes over the network.
-- Workers run only allowlisted programs, as argument lists with no shell, in a
-  scratch folder. Task outputs can't escape the coordinator's `workdir`, and
-  archives are extracted with path-traversal checks.
-- Uploads are content-addressed and re-hashed on arrival. Downloads are
-  verified against the worker's SHA-256.
-- **Not yet:** encryption. Traffic is plain HTTP on your LAN, so someone on the
-  same Wi-Fi could *see* your media while it's transferred. Don't use it on
-  untrusted networks until TLS is added (roadmap below). Anyone with the token can
-  run allowlisted programs on your Macs, so treat it like a password, and don't
-  add `sh`/`python3` to `allowed_programs` unless you mean it.
+- **Encryption and identity:** all traffic is mutual TLS (1.2+, P-256 keys).
+  Each Mac has its own key, which never leaves it, and a certificate signed by
+  the mesh's CA on the first Mac. Workers and coordinators accept only
+  certificates from that CA. `macmesh revoke <fingerprint>` (fingerprints are
+  listed by `macmesh nodes`) cuts one Mac off; run it on every Mac.
+- **Pairing:** `join` sends its signing request over TLS. Both directions
+  carry an HMAC keyed by the one-time code over the inviter's certificate
+  fingerprint, so a machine in the middle can't pair or impersonate without
+  the code. The code is 60 random bits, single-use, expires in 10 minutes and
+  allows 3 wrong tries.
+- Every request is also HMAC-signed with the mesh token, with a timestamp and
+  body hash.
+- **Protecting the Mac that lends its power:** workers run only allowlisted
+  programs, as argument lists with no shell, inside a macOS sandbox
+  (`sandbox-exec`). A sandboxed task:
+  - has no IP networking;
+  - can write only to its own task folder;
+  - can't read or even list the owner's home folder, apart from its task
+    folder, the tool itself, `~/Library/Fonts` and paths the tool's config
+    allows (`"sandbox": {"read": [...], "write": [...]}`, or `false` for a tool
+    that can't work inside it).
+- **Protecting the Mac that sends work:** task outputs can't escape the
+  coordinator's `workdir`, archives are extracted with path-traversal checks,
+  and downloads are verified against the worker's SHA-256.
+- **Your media on other Macs:** uploads are content-addressed and re-hashed on
+  arrival. After each job, the coordinator deletes what it uploaded
+  (`--keep-blobs` to keep it for the next job), and workers delete anything
+  unused for `blob_ttl` (default 30 minutes). Task folders are deleted as soon
+  as results are fetched.
+- **Still on you:** keep FileVault on, because cached media is not separately
+  encrypted on disk. Tasks run as your user, not a separate low-privilege
+  account. There are no memory limits per task. Don't add `sh`/`python3` to
+  `allowed_programs` unless you mean it: the sandbox limits a shell, but an
+  allowlisted interpreter can still run anything inside it.
 
 ## Testing
 
@@ -189,10 +234,13 @@ On the first run, use `--dry-run --save-job plan.json` to review a plan and
 python3 -m unittest discover -s tests -v
 ```
 
-The suite starts two in-process workers to stand in for two Macs. It covers
-the frame-exact video stitch, frame-range renders with a fake app, batch jobs,
-a node dying mid-job, permanent failure after retries, signature tampering,
-the program allowlist, and tar traversal.
+The suite starts in-process workers to stand in for Macs. It covers:
+- the frame-exact video stitch, frame-range renders with a fake app, and batch jobs;
+- a node dying mid-job, a node going silent (detected within seconds), shutdown handing work back, and a busy owner getting their Mac back (pause, resume, yield);
+- build matching, and blob cleanup and expiry;
+- pairing (and a wrong code), mutual TLS jobs, and refusal of plain HTTP, foreign CAs and revoked certificates;
+- the sandbox (no home reads, no writes outside, no network);
+- permanent failure after retries, signature tampering, the program allowlist, and tar traversal.
 
 ## Known limitations / roadmap
 
@@ -204,11 +252,12 @@ the program allowlist, and tar traversal.
 2. **Media-engine encoders** (`h264-hw`, `hevc-hw`) are already very fast on
    Apple Silicon. Splitting pays off most for software encoders (x264/x265),
    heavy filters, motion-graphics renders and AI passes.
-3. **TLS + pairing UI:** a menu bar app in Swift (`Network.framework` with
-   `includePeerToPeer = true`) would give encrypted transport and AirDrop-style
-   peer-to-peer Wi-Fi (AWDL) without a shared router, plus drag-and-drop and
-   per-Mac progress bars. This Python core would become its engine (or be
-   ported).
+3. **Menu bar app:** a Swift app (`Network.framework` with
+   `includePeerToPeer = true`) would give AirDrop-style peer-to-peer Wi-Fi
+   (AWDL) without a shared router, plus drag-and-drop and per-Mac progress
+   bars. It could also catch sleep notifications, so a Mac about to sleep
+   hands work back the way shutdown already does; today sleep is noticed by
+   the 4 s heartbeat. This Python core would become its engine (or be ported).
 4. **Real thermal state:** read `ProcessInfo.thermalState` (via the Swift
    app or PyObjC) so a throttling Air gets smaller chunks proactively instead
    of reactively.

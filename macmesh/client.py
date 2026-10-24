@@ -1,4 +1,4 @@
-"""Signed HTTP client for talking to one worker."""
+"""Signed HTTP(S) client for talking to one worker."""
 
 from __future__ import annotations
 
@@ -6,9 +6,16 @@ import http.client
 import json
 import os
 import shutil
+import ssl
 from pathlib import Path
 
-from . import wire
+from . import pki, wire
+
+# Control calls (info, status, submit) must answer fast: a Mac that sleeps or
+# drops off Wi-Fi is noticed within a couple of seconds instead of hanging.
+CONTROL_TIMEOUT = 2.0
+# Uploads and downloads may take long, but a socket silent this long is dead.
+TRANSFER_TIMEOUT = 10.0
 
 
 class NodeError(Exception):
@@ -22,20 +29,34 @@ class TaskRejected(Exception):
 
 
 class NodeClient:
-    def __init__(self, address: str, token: str, timeout: float = 30):
+    def __init__(self, address: str, token: str, timeout: float = CONTROL_TIMEOUT,
+                 tls: ssl.SSLContext | None = None, revoked: list[str] | tuple = ()):
         host, _, port = address.rpartition(":")
         self.address, self.host, self.port = address, host, int(port)
         self.token, self.timeout = token, timeout
+        self.tls, self.revoked = tls, set(revoked)
         self.info: dict = {}
+        self.fingerprint = ""  # the worker's certificate, once connected over TLS
 
     @property
     def name(self) -> str:
         return self.info.get("node_name", self.address)
 
     def _conn(self, timeout: float | None = None) -> http.client.HTTPConnection:
-        return http.client.HTTPConnection(self.host, self.port, timeout=timeout or self.timeout)
+        t = timeout or self.timeout
+        if self.tls is None:
+            return http.client.HTTPConnection(self.host, self.port, timeout=t)
+        conn = http.client.HTTPSConnection(self.host, self.port, timeout=t, context=self.tls)
+        conn.connect()
+        fp = pki.fingerprint_der(conn.sock.getpeercert(binary_form=True))
+        if fp in self.revoked:
+            conn.close()
+            raise ssl.SSLError(f"{self.address} presented a revoked certificate")
+        self.fingerprint = fp
+        return conn
 
     def _request(self, method: str, path: str, body: bytes = b"") -> tuple[int, bytes]:
+        conn = None
         try:
             conn = self._conn()
             headers = wire.auth_headers(self.token, method, path, body)
@@ -43,9 +64,11 @@ class NodeClient:
             conn.request(method, path, body=body or None, headers=headers)
             resp = conn.getresponse()
             data = resp.read()
-            conn.close()
         except (OSError, http.client.HTTPException) as e:
             raise NodeError(f"{self.address}: {e}") from e
+        finally:
+            if conn:
+                conn.close()
         if resp.status == 401:
             raise NodeError(f"{self.address}: authentication failed (token mismatch or clock skew)")
         return resp.status, data
@@ -71,8 +94,9 @@ class NodeClient:
     def put_blob(self, sha: str, path: Path) -> None:
         size = path.stat().st_size
         req_path = f"/blobs/{sha}"
+        conn = None
         try:
-            conn = self._conn(timeout=max(self.timeout, 600))
+            conn = self._conn(timeout=TRANSFER_TIMEOUT)
             conn.putrequest("PUT", req_path)
             for k, v in wire.auth_headers(self.token, "PUT", req_path, None).items():
                 conn.putheader(k, v)
@@ -83,11 +107,21 @@ class NodeClient:
                     conn.send(block)
             resp = conn.getresponse()
             data = resp.read()
-            conn.close()
         except (OSError, http.client.HTTPException) as e:
             raise NodeError(f"{self.address}: upload failed: {e}") from e
+        finally:
+            if conn:
+                conn.close()
         if resp.status != 201:
             raise NodeError(f"{self.address}: upload rejected ({resp.status}): {data[:200]!r}")
+
+    def delete_blob(self, sha: str) -> bool:
+        """Ask the worker to forget an uploaded file. False if it's still in use there."""
+        try:
+            code, _ = self._request("DELETE", f"/blobs/{sha}")
+        except NodeError:
+            return False
+        return code in (200, 404)
 
     def submit(self, spec: dict) -> dict:
         code, body = self._json("POST", "/tasks", spec)
@@ -104,19 +138,21 @@ class NodeClient:
     def download(self, task_id: str, name: str, dest: Path) -> None:
         path = f"/tasks/{task_id}/out/{name}"
         tmp = dest.with_name(dest.name + ".part")
+        conn = None
         try:
-            conn = self._conn(timeout=max(self.timeout, 600))
+            conn = self._conn(timeout=TRANSFER_TIMEOUT)
             conn.request("GET", path, headers=wire.auth_headers(self.token, "GET", path, b""))
             resp = conn.getresponse()
             if resp.status != 200:
                 raise NodeError(f"{self.address}: download {name} returned {resp.status}")
             with open(tmp, "wb") as f:
                 shutil.copyfileobj(resp, f, wire.CHUNK)
-            conn.close()
             os.replace(tmp, dest)
         except (OSError, http.client.HTTPException) as e:
             raise NodeError(f"{self.address}: download failed: {e}") from e
         finally:
+            if conn:
+                conn.close()
             if tmp.exists():
                 tmp.unlink()
 

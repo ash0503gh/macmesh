@@ -35,15 +35,15 @@ class Advertisement:
         self.zc.close()
 
 
-def advertise(cfg: dict) -> Advertisement | None:
+def advertise(cfg: dict, service_type: str = SERVICE_TYPE, port: int | None = None) -> Advertisement | None:
     try:
         from zeroconf import ServiceInfo, Zeroconf
     except ImportError:
         print("zeroconf not installed: not advertising (peers must be added by address)")
         return None
-    name = f"{cfg['node_name']}-{cfg['node_id'][:6]}.{SERVICE_TYPE}"
+    name = f"{cfg['node_name']}-{cfg['node_id'][:6]}.{service_type}"
     info = ServiceInfo(
-        SERVICE_TYPE, name, addresses=_local_ips(), port=int(cfg["port"]),
+        service_type, name, addresses=_local_ips(), port=int(port or cfg["port"]),
         properties={"node_id": cfg["node_id"], "name": cfg["node_name"], "v": __version__},
         server=f"{cfg['node_name']}.local.",
     )
@@ -52,8 +52,8 @@ def advertise(cfg: dict) -> Advertisement | None:
     return Advertisement(zc, info)
 
 
-def browse(seconds: float = 2.0) -> list[str]:
-    """Return "host:port" for every macmesh worker visible on the network."""
+def browse(seconds: float = 2.0, service_type: str = SERVICE_TYPE) -> list[str]:
+    """Return "host:port" for every macmesh worker (or open invite) visible on the network."""
     try:
         from zeroconf import ServiceBrowser, Zeroconf
     except ImportError:
@@ -72,7 +72,7 @@ def browse(seconds: float = 2.0) -> list[str]:
         def remove_service(self, *_):
             pass
 
-    ServiceBrowser(zc, SERVICE_TYPE, Listener())
+    ServiceBrowser(zc, service_type, Listener())
     time.sleep(seconds)
     zc.close()
     return sorted(set(found.values()))
