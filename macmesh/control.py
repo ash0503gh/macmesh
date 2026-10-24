@@ -315,7 +315,7 @@ class Control:
                 if not fname:
                     fname = t.spec.get("task_id", "")
                 task_name = f"Lending: {Path(fname).stem}"
-                elapsed = round(t.elapsed(), 1)
+                elapsed = round((t.finished or time.time()) - t.started, 1) if t.started else 0.0
                 is_done = t.state == "done"
                 is_running = t.state == "running"
                 jobs.append({

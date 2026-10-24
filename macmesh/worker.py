@@ -59,6 +59,9 @@ class Task:
         self.outputs: dict = {}
         self.started = self.finished = 0.0
 
+    def elapsed(self) -> float:
+        return (self.finished or time.time()) - self.started if self.started else 0.0
+
     def status(self) -> dict:
         log = self.dir / "task.log"
         tail = ""
