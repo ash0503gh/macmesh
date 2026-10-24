@@ -166,6 +166,12 @@ class Scheduler:
             for sha in shas:
                 node.client.delete_blob(sha)
 
+    def cancel(self) -> None:
+        """Stop the job: run() raises JobFailed("cancelled") and the remote tasks are cancelled."""
+        with self.cond:
+            self.fatal = "cancelled"
+            self.cond.notify_all()
+
     # ---- scheduling (called with self.cond held) -----------------------
     def _finished(self) -> bool:
         return all(t.state == "done" for t in self.tasks)

@@ -2,3 +2,5 @@ __pycache__/
 *.egg-info/
 macmesh-out/
 .venv/
+app/.build/
+app/build/

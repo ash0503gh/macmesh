@@ -131,6 +131,8 @@ class Worker:
         """Why this Mac won't take new work right now, or "" if it will."""
         if self.draining:
             return self.draining
+        if not self.cfg.get("lend", True):
+            return "not lending"
         if self.owner_busy:
             return self.owner_busy
         free_gb = shutil.disk_usage(self.root).free / 2**30
@@ -322,7 +324,7 @@ class Worker:
                 argv = sandbox.wrap(argv, task.dir, table.get(step[0], {}), name=f"step{i + 1}.sb")
             if priority in QOS and sysinfo.IS_MAC:
                 # A QoS clamp makes macOS favour the owner's apps over this task.
-                argv = ["taskpolicy", "-c", priority, *argv]
+                argv = ["/usr/sbin/taskpolicy", "-c", priority, *argv]
             steps.append(argv)
         (task.dir / "steps.json").write_text(json.dumps(steps, indent=1))
         return steps
@@ -349,7 +351,7 @@ class Worker:
                 awake = None
                 if sysinfo.IS_MAC:
                     # Keep the Mac from idle-sleeping while this task runs.
-                    awake = subprocess.Popen(["caffeinate", "-i", "-w", str(task.proc.pid)])
+                    awake = subprocess.Popen(["/usr/bin/caffeinate", "-i", "-w", str(task.proc.pid)])
                 try:
                     rc = task.proc.wait(timeout=max(deadline - time.time(), 0.1) if deadline else None)
                 except subprocess.TimeoutExpired:
@@ -636,6 +638,9 @@ def make_server(worker: Worker, host: str, port: int, tls: ssl.SSLContext | None
 
 
 def serve(cfg: dict, host: str = "0.0.0.0", advertise: bool = True) -> None:
+    # Apps and login items start with a bare PATH; the system tools macmesh reads live here.
+    path = os.environ.get("PATH", "").split(":")
+    os.environ["PATH"] = ":".join(path + [d for d in ("/usr/bin", "/bin", "/usr/sbin", "/sbin") if d not in path])
     worker = Worker(cfg)
     tls = pki.context(server=True) if cfg.get("tls", True) else None
     server = make_server(worker, host, int(cfg["port"]), tls)
@@ -643,6 +648,14 @@ def serve(cfg: dict, host: str = "0.0.0.0", advertise: bool = True) -> None:
     if advertise:
         from . import discovery
         ad = discovery.advertise(cfg)
+
+    from . import control
+    ctl = control.Control(cfg, worker)
+    try:
+        ctl_server = control.serve(ctl)
+    except (control.ControlError, OSError) as e:
+        ctl_server = None
+        print(f"warning: no control socket for the app and agents: {e}")
 
     def on_term(signum, frame):
         # Logout, shutdown or launchctl stop: hand work back at once, then let pollers see it.
@@ -664,6 +677,10 @@ def serve(cfg: dict, host: str = "0.0.0.0", advertise: bool = True) -> None:
         worker.drain("worker stopped")
     finally:
         worker.stopped.set()
+        ctl.stopped.set()
+        if ctl_server:
+            ctl_server.shutdown()
+            control.socket_path().unlink(missing_ok=True)
         if ad:
             ad.close()
         server.server_close()

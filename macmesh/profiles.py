@@ -15,7 +15,9 @@ app means adding a file, in macmesh/apps/ (examples shipped with macmesh) or
   "sandbox": {"read": ["~/Library/Application Support/MyApp"], "write": ["~/Library/Caches/MyApp"]},
   "media": "scan",                                  # ship files the project refers to (see mediarefs)
   "vars": {"comp": "-"},                            # defaults for {name} placeholders (--var name=value)
+  "extensions": [".myproj"],                        # project files this app opens (for drag and drop)
   "fps_probe": {"args": ["info", "{project}"], "pattern": "\"fps\":\\s*([0-9.]+)"},
+  "frames_probe": {"args": ["info", "{project}"], "json": "timeline.frames"},  # or "json_seconds"
   "range": {
     "steps": [["relink", "{in:project}", "{indir}"],
               ["render", "{in:project}", "--from", "{start}", "--to", "{end_excl}", "-o", "{out:result}"]],
@@ -89,6 +91,14 @@ def validate(p: dict) -> dict:
             raise ProfileError("fps_probe needs \"args\" and a \"pattern\" with one group")
         _strings(probe.get("args"), "fps_probe.args")
         re.compile(probe["pattern"])
+    probe = p.get("frames_probe")
+    if probe is not None:
+        if not isinstance(probe, dict) or not (isinstance(probe.get("json"), str) ^ isinstance(probe.get("json_seconds"), str)):
+            raise ProfileError("frames_probe needs \"args\" and one of \"json\" (frames) or \"json_seconds\"")
+        _strings(probe.get("args"), "frames_probe.args")
+    for ext in _strings(p.get("extensions", []), "extensions"):
+        if not ext.startswith("."):
+            raise ProfileError(f"extension {ext!r} must start with '.'")
     return p
 
 

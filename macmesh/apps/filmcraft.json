@@ -8,6 +8,19 @@
       "--version"
     ]
   },
+  "extensions": [
+    ".fcproj"
+  ],
+  "frames_probe": {
+    "args": [
+      "--compact",
+      "--project",
+      "{project}",
+      "inspect",
+      "sequence"
+    ],
+    "json": "durationFrames"
+  },
   "media": "scan",
   "range": {
     "steps": [

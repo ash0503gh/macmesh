@@ -49,6 +49,8 @@ def defaults() -> dict:
         "node_name": socket.gethostname().split(".")[0],
         "port": DEFAULT_PORT,
         "token": secrets.token_urlsafe(24),
+        "lend": True,               # let other Macs on the mesh use this one
+        "output_dir": "~/Movies/macmesh",  # where jobs started from the app land
         "slots": 1,                 # concurrent tasks this node runs
         "nice": 0,                  # raise to keep the Mac responsive while rendering
         "priority": "utility",      # macOS QoS clamp for tasks: normal | utility | background

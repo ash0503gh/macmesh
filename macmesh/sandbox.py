@@ -17,7 +17,6 @@ to a program it starts.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from functools import lru_cache
 from pathlib import Path
@@ -25,8 +24,11 @@ from pathlib import Path
 from .sysinfo import IS_MAC
 
 
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"  # by full path: apps and login items start with a bare PATH
+
+
 def available() -> bool:
-    return IS_MAC and shutil.which("sandbox-exec") is not None
+    return IS_MAC and Path(SANDBOX_EXEC).exists()
 
 
 def _q(path: str | Path) -> str:
@@ -94,4 +96,4 @@ def wrap(argv: list[str], task_dir: Path, tool_cfg: dict, name: str = "sandbox.s
     prof = task_dir / name
     prof.write_text(profile(task_dir, argv[0], rules.get("read", []), rules.get("write", [])))
     # Run the real path: the sandbox checks a symlinked one (e.g. .build/release) against ~ too.
-    return ["sandbox-exec", "-f", str(prof), str(_real(argv[0])), *argv[1:]]
+    return [SANDBOX_EXEC, "-f", str(prof), str(_real(argv[0])), *argv[1:]]

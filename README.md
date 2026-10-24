@@ -21,6 +21,68 @@ across the Macs around you, over Wi-Fi, with zero configuration.
                   results back → lossless stitch → final.mp4
 ```
 
+## Install
+
+On each Mac (Apple silicon, macOS 14 or later), in Terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ash0503gh/macmesh/main/install.sh | sh
+```
+
+It downloads the latest release, checks it against its SHA-256, installs `macmesh.app` in
+Applications and opens it. Then:
+
+1. **On the first Mac:** choose *Start a mesh*. To add another Mac, go to *Macs*, then *Add a Mac*,
+   and a one-time code appears.
+2. **On every other Mac:** choose *Join a mesh* and enter that code.
+
+To download by hand instead, get `macmesh-macos-arm64.zip` from
+[Releases](https://github.com/ash0503gh/macmesh/releases/latest) and unzip it into Applications.
+The app isn't notarized by Apple, so the first time you open it, Control-click it, choose
+*Open*, then confirm *Open*. (Or allow it in System Settings, then Privacy & Security.)
+
+What each Mac needs for the work it shares:
+
+- **ffmpeg** for video jobs: `brew install ffmpeg`.
+- **The apps' command-line tools** for app jobs, at the same version on every Mac. The FilmCraft and
+  EffectCraft profiles expect `filmcraft-cli` and `effectcraft-cli` in `~/.local/bin`. The Grade profile
+  expects Grade with `grade-cli` in `~/Applications/Grade.app` (Grade's `make install`). Each Mac's
+  *Apps* page shows what it has.
+
+## The app
+
+`app/` is a native macOS app (SwiftUI) on top of the engine:
+
+- **Dashboard window:** the sidebar has five pages.
+  - **Jobs:** the running job, with progress, time left, how much faster it is than one Mac, and a map of which Mac did which chunk. Below it, the job history with *Show in Finder*.
+  - **Macs:** every Mac on the mesh, with chip, cores, memory, power and what it's doing. *Add a Mac* shows a pairing code.
+  - **Apps:** the app profiles, and whether this Mac has each app.
+  - **Lending:** lend this Mac or not, *step aside when I need it* or *only while I'm away*, and open at login.
+  - **Security:** encryption, this Mac's certificate, and removing a Mac.
+- **New job:** a sheet that opens from the toolbar, or when you drop a file on the window or open one with macmesh. macmesh recognises the project, its app and its length, asks for anything missing (an EffectCraft composition, say), lets you pick the Macs, and starts the job. Results land in `~/Movies/macmesh`.
+- **Menu bar icon:** what's running, *Lend this Mac*, and *Open macmesh*. It keeps lending going with the window closed.
+- **First run:** *Start a mesh* or *Join a mesh* with a code.
+
+The app carries its own Python and engine, so a Mac only needs the app. Build it with:
+
+```sh
+app/scripts/build-app.sh      # → app/build/macmesh.app (fetches a pinned, checksummed Python the first time)
+app/scripts/package.sh        # → app/build/macmesh-macos-arm64.zip and .sha256, for a GitHub release
+```
+
+`Macmesh --snapshot DIR [--dark]` renders every screen with sample data to PNGs, and
+`Macmesh --check` reads a running engine the way the app does.
+
+Under the hood, `macmesh serve` listens on `~/.macmesh/control.sock` (only your user can open it). Jobs started there run inside the daemon, so the app, agents and the CLI all see the same jobs (`macmesh/control.py`).
+
+## For AI agents (MCP)
+
+`macmesh mcp` is an MCP server (stdio) with these tools: `get_status`, `list_apps`, `inspect_file`, `start_job`, `get_job`, `list_jobs`, `cancel_job`, `set_lending` and `create_invite`. It talks to the running engine, so jobs an agent starts show up in the app. For Claude Code:
+
+```sh
+claude mcp add macmesh -- /Applications/macmesh.app/Contents/Resources/engine/bin/macmesh mcp
+```
+
 ## What's in this prototype
 
 | Piece | What it does |
@@ -68,7 +130,8 @@ macmesh nodes                                   # both Macs should appear
 macmesh video clip.mov -o clip-hevc.mp4 --preset hevc
 ```
 
-To start the worker automatically at login, see `examples/com.macmesh.worker.plist`.
+To start the worker automatically at login, use the app's *Open macmesh at login*, or see
+`examples/com.macmesh.worker.plist` for a command-line-only setup.
 
 ## Any app: profiles
 
@@ -278,12 +341,11 @@ The suite starts in-process workers to stand in for Macs. It covers:
 2. **Media-engine encoders** (`h264-hw`, `hevc-hw`) are already very fast on
    Apple Silicon. Splitting pays off most for software encoders (x264/x265),
    heavy filters, motion-graphics renders and AI passes.
-3. **Menu bar app:** a Swift app (`Network.framework` with
-   `includePeerToPeer = true`) would give AirDrop-style peer-to-peer Wi-Fi
-   (AWDL) without a shared router, plus drag-and-drop and per-Mac progress
-   bars. It could also catch sleep notifications, so a Mac about to sleep
-   hands work back the way shutdown already does; today sleep is noticed by
-   the 4 s heartbeat. This Python core would become its engine (or be ported).
+3. **Peer-to-peer Wi-Fi and sleep notices in the app:** `Network.framework`
+   with `includePeerToPeer = true` would give AirDrop-style Wi-Fi (AWDL)
+   without a shared router. The app could also catch sleep notifications, so
+   a Mac about to sleep hands work back the way shutdown already does; today
+   sleep is noticed by the 4 s heartbeat.
 4. **Real thermal state:** read `ProcessInfo.thermalState` (via the Swift
    app or PyObjC) so a throttling Air gets smaller chunks proactively instead
    of reactively.

@@ -8,6 +8,18 @@
       "--version"
     ]
   },
+  "extensions": [
+    ".ecproj"
+  ],
+  "frames_probe": {
+    "args": [
+      "--project",
+      "{project}",
+      "info",
+      "--json"
+    ],
+    "json_seconds": "activeComp.duration"
+  },
   "media": "scan",
   "fps_probe": {
     "args": [

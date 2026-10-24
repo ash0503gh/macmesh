@@ -5,6 +5,16 @@
   "program": {
     "path": "~/Applications/Grade.app/Contents/MacOS/grade-cli"
   },
+  "extensions": [
+    ".gradeproject"
+  ],
+  "frames_probe": {
+    "args": [
+      "info",
+      "{project}"
+    ],
+    "json": "frames"
+  },
   "media": "scan",
   "range": {
     "steps": [

@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import PAIR_SERVICE_TYPE, __version__, config, discovery, jobspec, media, pairing, pki, profiles, toolinfo
+from . import PAIR_SERVICE_TYPE, __version__, config, discovery, jobspec, media, mesh, pairing, pki, profiles, toolinfo
 from .client import NodeClient, NodeError
 from .planners import ENCODE_PRESETS, PLANNERS, PRIVATE_PARAMS
 from .scheduler import JobFailed, Scheduler
@@ -27,25 +27,9 @@ def log(msg: str) -> None:
 
 # ---- node discovery ----------------------------------------------------
 def gather_nodes(cfg: dict, args) -> list[NodeClient]:
-    addrs = list(cfg.get("peers", [])) + list(getattr(args, "peer", None) or [])
-    if not getattr(args, "no_discovery", False):
-        addrs += discovery.browse(getattr(args, "discover_seconds", 2.0))
-    if not addrs:
-        addrs = [f"127.0.0.1:{cfg['port']}"]  # at least this Mac, if its daemon runs
-    tls = pki.context(server=False) if cfg.get("tls", True) else None
-    clients, seen = [], set()
-    for addr in dict.fromkeys(addrs):
-        c = NodeClient(addr, cfg["token"], tls=tls, revoked=cfg.get("revoked", []))
-        try:
-            info = c.fetch_info()
-        except NodeError as e:
-            log(f"skip {addr}: {e}")
-            continue
-        if info["node_id"] in seen:  # same Mac reached via another address
-            continue
-        seen.add(info["node_id"])
-        clients.append(c)
-    return clients
+    return mesh.find_nodes(cfg, peers=getattr(args, "peer", None) or [],
+                           discover=not getattr(args, "no_discovery", False),
+                           seconds=getattr(args, "discover_seconds", 2.0), log=log)
 
 
 def print_nodes(clients: list[NodeClient]) -> None:
@@ -246,6 +230,11 @@ def cmd_serve(args) -> int:
     from .worker import serve
     serve(config.load(), host=args.host, advertise=not args.no_advertise)
     return 0
+
+
+def cmd_mcp(args) -> int:
+    from .mcp import main as mcp_main
+    return mcp_main()
 
 
 def cmd_nodes(args) -> int:
@@ -483,6 +472,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input", action="append", help="extra asset name=path, use as {in:name}")
     mesh_opts(p)
     p.set_defaults(fn=cmd_range)
+
+    p = sub.add_parser("mcp", help="MCP server for AI agents (stdio), talking to this Mac's running daemon")
+    p.set_defaults(fn=cmd_mcp)
 
     p = sub.add_parser("apps", help="list app profiles and whether this Mac has each app")
     p.add_argument("-v", "--verbose", action="store_true")

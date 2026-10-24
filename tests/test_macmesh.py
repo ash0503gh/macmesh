@@ -16,7 +16,8 @@ import time
 import unittest
 from pathlib import Path
 
-from macmesh import config, jobspec, media, mediarefs, owner, pairing, pki, profiles, sandbox, toolinfo, wire
+from macmesh import config, control, jobspec, media, mediarefs, owner, pairing, pki, profiles, sandbox, toolinfo, wire
+from macmesh import mcp as mcp_module
 from macmesh import worker as worker_module
 from macmesh.client import NodeClient, NodeError
 from macmesh.planners import plan_app, plan_batch, plan_range, plan_video
@@ -571,6 +572,7 @@ class TLSTests(unittest.TestCase):
 FAKE_APP = """#!/bin/sh
 # fake app with a project that refers to media: relink <project> <dir> | render <project> <start> <end_excl> <out>
 case "$1" in
+  info) cat "$2" ;;
   relink) test -f "$3/clip.dat" || { echo "no media in $3"; exit 4; }; echo relinked > "$2.linked" ;;
   render) test -f "$2.linked" || { echo '{"offline": ["clip.dat"]}'; exit 0; }
           mkdir -p "$5"; i=$3; while [ $i -lt $4 ]; do echo "$i" > "$5/frame_$(printf %05d $i).txt"; i=$((i+1)); done ;;
@@ -732,6 +734,110 @@ class ProfileTests(MeshCase):
             "mine": {"path": "/usr/local/bin/mine"}})
         (home / "config.json").write_text(json.dumps(old))
         self.assertEqual(set(config.load()["tools"]), {"mine"})
+
+
+class ControlTests(MeshCase):
+    """The daemon's control socket and the MCP server on top of it, with in-process Macs."""
+
+    write_profile = ProfileTests.write_profile
+    fake_profile = ProfileTests.fake_profile
+
+    def setUp(self):
+        super().setUp()
+        app = self.tmp / "fakeapp2"
+        app.write_text(FAKE_APP)
+        app.chmod(app.stat().st_mode | stat.S_IEXEC)
+        prof = self.fake_profile(app)
+        prof["extensions"] = [".show"]
+        prof["frames_probe"] = {"args": ["info", "{project}"], "json": "frames"}
+        self.home = self.tmp / "coordinator"
+        for home in [self.home, *(n.home for n in self.nodes)]:
+            self.write_profile(home, prof)
+        for n in self.nodes:
+            n.worker.fingerprints = toolinfo.fingerprints(n.worker.cfg, n.home)
+        os.environ["MACMESH_HOME"] = str(self.home)
+        (self.tmp / "footage").mkdir()
+        (self.tmp / "footage/clip.dat").write_bytes(b"pixels")
+        self.project = self.tmp / "ad.show"
+        self.project.write_text(json.dumps({"frames": 120, "clips": [{"path": str(self.tmp / "footage/clip.dat")}]}))
+        cfg = dict(config.defaults(), token=TOKEN, tls=False, tools={}, output_dir=str(self.tmp / "Movies"),
+                   peers=[n.address for n in self.nodes])
+        config.save(cfg)
+        self.ctl = control.Control(cfg, worker=self.nodes[0].worker, home=self.home)
+        self.server = control.serve(self.ctl)
+        self.client = control.ControlClient(control.socket_path(self.home))
+
+    def tearDown(self):
+        self.ctl.stopped.set()
+        self.server.shutdown()
+        self.server.server_close()
+        super().tearDown()
+
+    def wait_job(self, call, jid, timeout=60):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            job = call(jid)
+            if job["state"] in ("done", "failed", "cancelled"):
+                return job
+            time.sleep(0.2)
+        self.fail("job didn't finish")
+
+    def test_status_inspect_and_a_whole_project_job(self):
+        self.ctl.refresh()
+        st = self.client.call("status")
+        self.assertEqual(len(st["macs"]), 2)
+        info = self.client.call("inspect", path=str(self.project))
+        self.assertEqual((info["kind"], info["app"], info["frames"]), ("app", "fakeapp2", 120))
+        with self.assertRaisesRegex(control.ControlError, "doesn't know how to split"):
+            self.client.call("inspect", path=str(self.tmp / "footage/clip.dat"))
+        job = self.client.call("start", kind="app", path=str(self.project))
+        job = self.wait_job(lambda j: self.client.call("job", id=j), job["id"])
+        self.assertEqual(job["state"], "done", job)
+        self.assertEqual(job["done"], job["tasks"])
+        self.assertTrue(all(m["done"] > 0 for m in job["macs"]), job["macs"])
+        self.assertEqual(len(job["chunks"]), job["tasks"])
+        self.assertTrue(all(c["state"] == "done" and c["mac"] in {"pro", "air"} for c in job["chunks"]), job["chunks"])
+        self.assertEqual(Path(job["output"]).name, "ad (macmesh)")
+        self.assertEqual(len(os.listdir(job["output"])), 120)
+        self.assertEqual(self.client.call("jobs")[0]["id"], job["id"])
+
+    def test_cancel_and_lending(self):
+        os.environ["FAKE_DELAY"] = "1"
+        try:
+            job = self.client.call("start", kind="app", path=str(self.project), chunk=5)
+            self.client.call("cancel", id=job["id"])
+            job = self.wait_job(lambda j: self.client.call("job", id=j), job["id"])
+        finally:
+            os.environ.pop("FAKE_DELAY")
+        self.assertEqual(job["state"], "cancelled")
+        st = self.client.call("lend", on=False)
+        self.assertEqual((st["lend"], st["accepting"], st["reason"]), (False, False, "not lending"))
+        self.assertFalse(config.load()["lend"])
+        self.assertTrue(self.client.call("lend", on=True)["accepting"])
+        self.assertEqual(oct(control.socket_path(self.home).stat().st_mode & 0o777), "0o600")
+
+    def test_mcp_tools(self):
+        server = mcp_module.Server(self.client)
+        init = server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        self.assertEqual(init["result"]["serverInfo"]["name"], "macmesh")
+        names = {t["name"] for t in server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]}
+        self.assertTrue({"get_status", "inspect_file", "start_job", "get_job", "cancel_job"} <= names)
+
+        def call(name, **args):
+            r = server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": name, "arguments": args}})
+            return r["result"]
+
+        started = call("start_job", path=str(self.project), end=49)
+        self.assertFalse(started["isError"], started)
+        jid = json.loads(started["content"][0]["text"])["id"]
+        job = self.wait_job(lambda j: json.loads(call("get_job", id=j)["content"][0]["text"]), jid)
+        self.assertEqual((job["state"], len(os.listdir(job["output"]))), ("done", 50))
+        bad = call("inspect_file", path="/nope/x.show")
+        self.assertTrue(bad["isError"])
+        self.assertIn("no file", bad["content"][0]["text"])
+        self.assertIn("error", server.handle({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                                              "params": {"name": "rm_rf"}}))
+        self.assertIsNone(server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
 
 
 @unittest.skipUnless(sandbox.available(), "sandbox-exec not available")
