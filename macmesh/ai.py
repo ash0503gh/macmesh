@@ -140,7 +140,8 @@ def _run(prompt: str, cfg: dict, agent: str | None = None) -> str:
 
 
 SIGN_IN = {"claude": "Open Terminal, run `claude` and sign in again.",
-           "antigravity": "Open Terminal, run `agy` and sign in again."}
+           "antigravity": "The agy command-line tool signs in separately from the Antigravity app (and can lose "
+                          "it when it updates itself): open Terminal, run `agy` and sign in."}
 
 
 def _failure(name: str, proc: subprocess.CompletedProcess) -> str:
