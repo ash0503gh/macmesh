@@ -83,7 +83,7 @@ struct DropSheetView: View {
                     Text("Looking at the file…").foregroundStyle(.secondary)
                 } else {
                     Text("Drop a project or video").font(.headline)
-                    Text("FilmCraft, EffectCraft, Grade, or any app with a profile").font(.callout).foregroundStyle(.secondary)
+                    Text("Any app with a profile (see Apps), a video, or songs").font(.callout).foregroundStyle(.secondary)
                 }
             }
             Spacer()

@@ -96,7 +96,7 @@ def run_help(program: str, args: list[str]) -> str:
 
 
 def _examples() -> str:
-    shipped = profiles.load(Path("/nonexistent"))
+    shipped = {**profiles.examples(), **profiles.load(Path("/nonexistent"))}
     return json.dumps([{k: v for k, v in p.items() if k != "source"} for p in shipped.values()], indent=1)
 
 

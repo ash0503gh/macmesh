@@ -58,10 +58,9 @@ What each Mac needs for the work it shares:
   when a job needs one that a Mac lacks, that Mac shows *"Ashwin's MacBook Pro needs demucs-stem
   on this Mac"* with *Allow*. After Allow, it installs into `~/.macmesh/tools` (no administrator
   password) and joins the job while it's still running.
-- **The apps' command-line tools** for app jobs, at the same version on every Mac. The FilmCraft and
-  EffectCraft profiles expect `filmcraft-cli` and `effectcraft-cli` in `~/.local/bin`. The Grade profile
-  expects Grade with `grade-cli` in `~/Applications/Grade.app` (Grade's `make install`). Each Mac's
-  *Apps* page shows what it has.
+- **The apps' command-line tools** for app jobs, at the same version on every Mac, with a profile
+  for each app in `~/.macmesh/apps/` (see [Any app: profiles](#any-app-profiles)). Each Mac's *Apps*
+  page shows what it has.
 
 ## The app
 
@@ -158,10 +157,15 @@ To start the worker automatically at login, use the app's *Open macmesh at login
 
 macmesh's core knows nothing about particular apps. It runs commands on files
 and returns files. What it knows about an app lives in an **app profile**: one
-JSON file that says how to drive the app's command-line tool. Shipped
-examples are in `macmesh/apps/` (FilmCraft, EffectCraft, Grade). Yours go in
-`~/.macmesh/apps/`, and a file there replaces a shipped one with the same
-name. The format is documented at the top of `macmesh/profiles.py`.
+JSON file that says how to drive the app's command-line tool. Yours go in
+`~/.macmesh/apps/` (or let the AI write one: *Teach an app*). macmesh ships
+only general-purpose tools that anyone can install (`macmesh/apps/`, for now
+`demucs-stem`). `macmesh/apps/examples/` has profiles for FilmCraft,
+EffectCraft and Grade: they aren't loaded, so copy one to `~/.macmesh/apps/`
+if you have that app (FilmCraft and EffectCraft expect `filmcraft-cli` and
+`effectcraft-cli` in `~/.local/bin`; Grade expects `grade-cli` in
+`~/Applications/Grade.app`). The format is documented at the top of
+`macmesh/profiles.py`.
 
 ```sh
 macmesh apps                     # profiles, and whether this Mac has each app (and which build)

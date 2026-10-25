@@ -913,7 +913,8 @@ class ProfileTests(MeshCase):
 
     def test_shipped_profiles_are_valid(self):
         shipped = {p["name"] for p in profiles.load(self.tmp / "nobody").values()}
-        self.assertTrue({"filmcraft", "effectcraft", "grade"} <= shipped, shipped)
+        self.assertEqual(shipped, {"demucs-stem"})  # only tools anyone can install
+        self.assertEqual(set(profiles.examples()), {"filmcraft", "effectcraft", "grade"})  # examples, not loaded
 
     def test_bad_profile_is_rejected(self):
         with self.assertRaises(profiles.ProfileError):

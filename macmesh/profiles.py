@@ -4,8 +4,11 @@ macmesh's core knows nothing about any app. A profile is one JSON file that
 says how to drive an app's command-line tool: where it lives, how to ask its
 version, how to render a range of frames (as one or more steps), what it may
 touch inside the sandbox, and which output text means it failed. Adding an
-app means adding a file, in macmesh/apps/ (examples shipped with macmesh) or
-~/.macmesh/apps/ (yours; a file there replaces a shipped one of the same name).
+app means adding a file to ~/.macmesh/apps/ (a file there replaces a shipped
+one of the same name). macmesh/apps/ holds general-purpose tools everyone can
+use; macmesh/apps/examples/ holds profiles for particular apps (FilmCraft,
+EffectCraft, Grade): not loaded, but copied to ~/.macmesh/apps/ by people who
+have those apps, and shown to the AI as examples when it writes a profile.
 
 {
   "name": "myapp",                                  # the program name tasks use
@@ -58,6 +61,7 @@ from pathlib import Path
 from . import config
 
 PACKAGED = Path(__file__).parent / "apps"
+EXAMPLES = PACKAGED / "examples"
 NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -146,6 +150,15 @@ def load(home: Path | None = None) -> dict[str, dict]:
                 print(f"macmesh: skipping app profile {f}: {e}", file=sys.stderr)
                 continue
             found[p["name"]] = dict(p, source=str(f))
+    return found
+
+
+def examples() -> dict[str, dict]:
+    """Profiles for particular apps, shipped as examples only (see the module notes)."""
+    found = {}
+    for f in sorted(EXAMPLES.glob("*.json")):
+        p = validate(json.loads(f.read_text()))
+        found[p["name"]] = dict(p, source=str(f))
     return found
 
 
