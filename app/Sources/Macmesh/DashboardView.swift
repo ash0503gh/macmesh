@@ -150,6 +150,7 @@ struct JobsPage: View {
     @Binding var newJob: Bool
     @State private var confirmCancel: Job?
     @State private var explaining: Job?
+    @State private var chatting: String?
 
     var body: some View {
         ScrollView {
@@ -176,6 +177,13 @@ struct JobsPage: View {
             Text("Every Mac stops its part. Finished chunks are thrown away.")
         }
         .sheet(item: $explaining) { job in ExplainSheet(job: job).environment(engine) }
+        .sheet(isPresented: Binding(get: { chatting != nil }, set: { if !$0 { chatting = nil } })) {
+            VStack(alignment: .trailing) {
+                ChatPlanView(chatId: chatting).environment(engine)
+                Button("Done") { chatting = nil }.keyboardShortcut(.cancelAction)
+            }
+            .padding(22).frame(width: 600, height: 700)
+        }
     }
 
     /// Work this Mac is doing for your other Macs.
@@ -236,7 +244,10 @@ struct JobsPage: View {
                             Text(job.state == "done" ? Format.duration(job.elapsed) + (job.speedup.map { ", \($0.formatted())×" } ?? "") : "–")
                                 .monospacedDigit().foregroundStyle(.secondary)
                             Text(job.macs.isEmpty ? "–" : "\(job.macs.count)").foregroundStyle(.secondary)
-                            if job.state == "done", !job.output.isEmpty {
+                            if let chat = job.chat {
+                                Button("Chat") { chatting = chat }.controlSize(.small)
+                                    .help("Reopen the conversation that planned this job, to change it and run it again")
+                            } else if job.state == "done", !job.output.isEmpty {
                                 Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([URL(filePath: job.output)]) }
                                     .controlSize(.small)
                             } else if job.state == "failed" {

@@ -243,6 +243,44 @@ final class Engine {
         try await client.call("plan", ["request": request, "paths": paths, "macs": macs])
     }
 
+    // ---- planning by conversation --------------------------------------------
+    func chatStart(_ message: String, paths: [String], macs: [String]) async throws -> ChatInfo {
+        try await client.call("chat_start", ["message": message, "paths": paths, "macs": macs])
+    }
+
+    func chatSend(_ id: String, message: String? = nil, folder: String? = nil, macs: [String]) async throws -> ChatInfo {
+        var params: [String: Any] = ["id": id, "macs": macs]
+        if let message { params["message"] = message }
+        if let folder { params["folder"] = folder }
+        return try await client.call("chat_send", params)
+    }
+
+    func chat(_ id: String) async throws -> ChatInfo {
+        try await client.call("chat", ["id": id])
+    }
+
+    func chats() async -> [ChatListItem] {
+        (try? await client.call("chats")) ?? []
+    }
+
+    func chatRun(_ id: String, macs: [String], output: String, slots: Int?) async throws -> Job {
+        var params: [String: Any] = ["id": id, "macs": macs, "output": output]
+        if let slots { params["slots"] = slots }
+        let job: Job = try await client.call("chat_run", params)
+        await tick()
+        return job
+    }
+
+    /// Polls a conversation while the AI is answering.
+    func follow(chat: ChatInfo, update: @escaping (ChatInfo) -> Void) async {
+        var current = chat
+        update(current)
+        while current.state == "thinking", !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(1))
+            if let next = try? await self.chat(current.id) { current = next; update(current) }
+        }
+    }
+
     func teach(program: String, name: String, sample: String) async throws -> AiTask {
         try await client.call("teach", ["program": program, "name": name, "sample": sample])
     }

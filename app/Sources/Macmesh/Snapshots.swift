@@ -55,6 +55,17 @@ enum Snapshots {
                                  .init(at: 1_792_878_955, text: "  ✓ That Bass.mp3 on Leo\u{2019}s MacBook Air in 64.3s  [6/10]"),
                                  .init(at: 1_792_878_957, text: "  → We Own It.mp3 on Leo\u{2019}s MacBook Air (upload 4.3s)"),
                              ])
+    static let sampleChat = ChatInfo(
+        id: "c1", title: "Split the 600 songs into stems", created: 0, messages: [
+            .init(role: "user", text: "Split the 600+ songs into stems, in a new folder. Use both Macs, several at once.", at: 0),
+            .init(role: "ai", text: "Which folder has the songs?", at: 0),
+            .init(role: "user", text: "(picked the folder /Users/me/Music/Party set: 612 files)", at: 0),
+            .init(role: "ai", text: "612 MP3s. I\u{2019}ll split each into vocals, drums, bass and other with demucs-stem, 4 at a time here and 1 on the Air.", at: 0),
+        ], folders: ["/Users/me/Music/Party set"], state: "waiting", error: "", askFolder: nil,
+        card: .init(explanation: "One task per song; Macs take the next song as they free up.", planner: "batch", tasks: 612,
+                    programs: ["demucs-stem"], example: ["demucs-stem 01 Intro.mp3 01 Intro.zip"], name: "Party set stems",
+                    reasons: [], needsInstall: [:]),
+        suggest: .init(slots: ["This Mac": 4], macs: nil, outputFolder: "Party set stems"), jobIds: [])
     static let finished = [
         Job(id: "b1", name: "Launch ad (motion)", state: "done", error: "", output: "/tmp/x.mov", tasks: 8, done: 8, progress: 1,
             elapsed: 74, eta: nil, macs: [.init(nodeId: "a", name: "This Mac", done: 5, running: 0)], chunks: [],
@@ -139,9 +150,8 @@ enum Snapshots {
             ("newjob-project", AnyView(DropSheetView(file: project).environment(engine(working)))),
             ("newjob-comp", AnyView(DropSheetView(file: comp).environment(engine(working)))),
             ("dashboard-ai", dash(.ai, engine(working))),
-            ("newjob-describe", AnyView(DescribeJobView(files: [URL(filePath: "/Users/me/Movies/Interview.fcproj")],
-                                                        request: "Export Interview at 4K in HEVC, then make a 720p preview too",
-                                                        task: planTask).padding(22).frame(width: 520).environment(engine(working)))),
+            ("newjob-describe", AnyView(ChatPlanView(chat: sampleChat).padding(22).frame(width: 600, height: 760)
+                                            .environment(engine(working)))),
             ("teach-done", AnyView(TeachSheet(program: URL(filePath: "/Applications/Blender.app/Contents/MacOS/Blender"), name: "blender",
                                               sample: URL(filePath: "/Users/me/Scenes/Robot.blend"), task: teachTask)
                                    .environment(engine(working)))),

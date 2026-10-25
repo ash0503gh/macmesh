@@ -93,7 +93,7 @@ class Worker:
         self.work.mkdir(parents=True)
         self.tasks: dict[str, Task] = {}
         self.lock = threading.Lock()
-        self.slots = threading.Semaphore(int(cfg["slots"]))
+        self.slots = SlotGate(lambda: int(self.cfg["slots"]))
         self.extract_lock = threading.Lock()
         self.fingerprints = toolinfo.fingerprints(cfg, self.root)
         self.sandboxed = bool(cfg.get("sandbox")) and sandbox.available()
@@ -551,6 +551,26 @@ class Worker:
     def drain(self, reason: str) -> int:
         self.draining = reason
         return self.yield_all(f"yielded: {reason}")
+
+
+class SlotGate:
+    """Lets at most `limit()` tasks run at once, reading the limit live (it changes from the app)."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.used = 0
+        self.cond = threading.Condition()
+
+    def __enter__(self):
+        with self.cond:
+            while self.used >= max(1, self.limit()):
+                self.cond.wait(0.5)
+            self.used += 1
+
+    def __exit__(self, *exc):
+        with self.cond:
+            self.used -= 1
+            self.cond.notify_all()
 
 
 def _touch(path: Path) -> None:

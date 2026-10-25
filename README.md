@@ -236,10 +236,18 @@ the next section). The AI works on the parts that have no rule yet:
 
 | | In the app | On the command line |
 |---|---|---|
-| **Plan a free-form request** ("export at 4K, then a 720p preview") | New job > *Describe it* | `macmesh plan "…" files…` |
+| **Plan a job by talking it through** ("split the 600 songs into stems, in a new folder") | New job > *Describe it* | control methods `chat_start`, `chat_send`, `chat_run` |
+| **Plan a free-form request in one go** | | `macmesh plan "…" files…` |
 | **Teach macmesh a new app** from its `--help` | Apps > *Teach an app* | control method `teach` |
 | **Explain a failed job** in plain words | Jobs > History > *Explain* | control method `explain` |
 
+- **Talking it through:** *Describe it* is a conversation. The AI asks for what it needs, one
+  question at a time. When it needs files, a *Choose folder…* button appears, and it then sees the
+  names, sizes and types in that folder, never the files' contents. When you agree, it proposes the
+  job as a card: what runs, on which Macs, how many at once on this Mac, and where the results go.
+  You can change any of these, and nothing starts until you click *Run*. A plan may only use files
+  in folders you picked. Conversations are kept in `~/.macmesh/chats/`; a job planned this way has
+  *Chat* in its history row to reopen, change and run it again.
 - **Which AI:** `agent` is `auto` (Claude Code if it's installed, else Antigravity), `claude` or
   `antigravity` (the app's *AI* page, or `macmesh config agent …`). It runs each one's command-line
   tool with your existing subscription, and finds it where its installer put it (Antigravity's

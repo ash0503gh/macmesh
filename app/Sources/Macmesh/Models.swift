@@ -11,6 +11,7 @@ struct MeshStatus: Decodable, Equatable {
     var running: Int
     var paused: Int
     var ownerMode: String?
+    var slots: Int?      // how many tasks this Mac runs at once
     var limit: Double?   // the most of this Mac (CPU and GPU, owner + macmesh) to use, 0.5-0.95
     var duty: Double?    // how much of the time macmesh's tasks run right now, to stay under it
     var tls: Bool
@@ -107,6 +108,7 @@ struct Job: Decodable, Equatable, Identifiable {
     var created: Double
     var kind: String?
     var events: [Event]?
+    var chat: String?
 
     struct JobMac: Decodable, Equatable {
         var nodeId: String?
@@ -280,6 +282,54 @@ struct AiInfo: Decodable, Equatable {
 }
 
 /// Something the AI is working on: a plan, a new app's profile, or an explanation.
+/// A job being planned by talking it through with the AI (control methods chat_*).
+struct ChatInfo: Decodable, Equatable, Identifiable {
+    var id: String
+    var title: String
+    var created: Double
+    var messages: [Message]
+    var folders: [String]
+    var state: String          // thinking | waiting | failed
+    var error: String
+    var askFolder: String?
+    var card: PlanCard?
+    var suggest: Suggest?
+    var jobIds: [String]
+
+    struct Message: Decodable, Equatable {
+        var role: String       // user | ai | note
+        var text: String
+        var at: Double
+    }
+
+    /// What the agreed plan would do.
+    struct PlanCard: Decodable, Equatable {
+        var explanation: String
+        var planner: String
+        var tasks: Int
+        var programs: [String]
+        var example: [String]
+        var name: String
+        var reasons: [String]
+        var needsInstall: [String: [String]]
+    }
+
+    /// The AI's optional suggestions; the plan card starts from them.
+    struct Suggest: Decodable, Equatable {
+        var slots: [String: Int]?
+        var macs: [String]?
+        var outputFolder: String?
+    }
+}
+
+struct ChatListItem: Decodable, Equatable, Identifiable {
+    var id: String
+    var title: String
+    var created: Double?
+    var jobIds: [String]
+    var hasPlan: Bool
+}
+
 struct AiTask: Decodable, Equatable, Identifiable {
     var id: String
     var kind: String            // plan | teach | explain

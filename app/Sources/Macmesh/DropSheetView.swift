@@ -37,13 +37,13 @@ struct DropSheetView: View {
             .labelsHidden()
             .frame(maxWidth: 260)
             if mode == .describe {
-                DescribeJobView(files: file.map { [URL(filePath: $0.path)] } ?? [])
+                ChatPlanView(files: file.map { [URL(filePath: $0.path)] } ?? [])
             } else {
                 fileMode
             }
         }
         .padding(22)
-        .frame(width: 520)
+        .frame(width: mode == .describe ? 600 : 520)
         .task { if let initialURL, file == nil { await open(initialURL) } }
     }
 

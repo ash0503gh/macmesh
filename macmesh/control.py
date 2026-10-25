@@ -43,7 +43,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import __version__, ai, config, firewall, jobspec, media, mesh, pairing, pki, profiles, teach, toolinfo
+from . import __version__, ai, chat, config, firewall, jobspec, media, mesh, pairing, pki, profiles, teach, toolinfo
 from .planners import plan_app, plan_batch, plan_video
 from .planners.ai import MEDIA_EXT, plan_to_job, plan_with_agent, unsafe_reasons
 from .planners.app import probe_fps, probe_frames
@@ -147,6 +147,7 @@ class Job:
                 "eta": round(eta) if eta is not None else None, "macs": nodes, "chunks": chunks, "created": self.created, "kind": self.spec.get("kind"),
                 # Chunk time added up over wall time: how many Macs' worth of work ran at once.
                 "speedup": round(compute / elapsed, 1) if elapsed > 1 and compute else None,
+                "chat": self.spec.get("chat"),
                 "log": self.log[-20:],
                 "events": [{"at": round(at, 1), "text": _named(text, tasks)} for at, text in self.events[-80:]]}
 
@@ -196,6 +197,7 @@ class Control:
         self.cfg, self.worker, self.home = cfg, worker, home or config.home()
         self.jobs: dict[str, Job] = {}
         self.ai_tasks: dict[str, AiTask] = {}
+        self.chats: dict[str, chat.Chat] = {}
         self.lock = threading.Lock()
         self.nodes: list = []
         self.nodes_at = 0.0
@@ -485,7 +487,7 @@ class Control:
                 "accepting": me.get("accepting"), "reason": me.get("refusal", ""),
                 "running": me.get("running", 0), "paused": me.get("paused", 0),
                 "owner_mode": self.cfg["owner"].get("mode"), "tls": bool(self.cfg.get("tls", True)),
-                "limit": float(self.cfg["owner"].get("limit", 0.9)),
+                "limit": float(self.cfg["owner"].get("limit", 0.9)), "slots": int(self.cfg.get("slots", 1)),
                 "duty": round(self.worker.governor.duty, 2) if self.worker else 1.0,
                 "holds_ca": pki.paths(self.home)["ca_key"].exists(), "invite": self._invite_state(),
                 "fingerprint": pki.own_fingerprint(self.home) if pki.ready(self.home) else "",
@@ -649,6 +651,123 @@ class Control:
 
         return self._ai("plan", work)
 
+    # ---- planning by conversation (chat.py) -------------------------------
+    def _chat(self, id: str) -> chat.Chat:
+        with self.lock:
+            if id not in self.chats:
+                try:
+                    self.chats[id] = chat.Chat.load(self.home, id)
+                except (KeyError, OSError, ValueError):
+                    raise ControlError("that conversation has gone") from None
+            return self.chats[id]
+
+    def _chat_turn(self, c: chat.Chat, macs: list | None = None) -> None:
+        """Ask the agent for its next reply, in the background; the app polls `chat`."""
+        c.state, c.error = "thinking", ""
+
+        def run():
+            try:
+                nodes = [n.info for n in self.refresh() if not macs or n.info["node_id"] in macs]
+                if not nodes:
+                    raise ControlError("no Macs are available")
+                out_root = Path(self.cfg.get("output_dir", "~/Movies/macmesh")).expanduser()
+                with c.lock:
+                    chat.turn(c, nodes, self.cfg, self.home, workdir=str(out_root / ".work" / f"chat-{c.id}"))
+                c.state = "waiting"
+            except (ai.AgentError, ControlError, OSError, ValueError) as e:
+                c.state, c.error = "failed", str(e)
+            except Exception as e:  # reported, never raised into a dead thread
+                c.state, c.error = "failed", f"{type(e).__name__}: {e}"
+            c.save()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def m_chat_start(self, message: str, paths: list | None = None, macs: list | None = None) -> dict:
+        """Start planning a job by talking it through with the AI."""
+        if not message.strip():
+            raise ControlError("say what you'd like done")
+        c = chat.Chat(self.home)
+        c.paths = [str(Path(p).expanduser()) for p in (paths or [])]
+        c.add("user", message)
+        with self.lock:
+            self.chats[c.id] = c
+        c.save()
+        self._chat_turn(c, macs)
+        return c.summary()
+
+    def m_chat_send(self, id: str, message: str | None = None, folder: str | None = None,
+                    macs: list | None = None) -> dict:
+        """Answer the AI: a message, a folder it asked for, or both."""
+        c = self._chat(id)
+        if c.state == "thinking":
+            raise ControlError("the AI is still answering")
+        if folder:
+            f = Path(folder).expanduser().resolve()
+            if not f.is_dir():
+                raise ControlError(f"there's no folder at {f}")
+            if str(f) not in c.folders:
+                c.folders.append(str(f))
+            summary = chat.folder_summary(str(f))
+            c.add("user", f"(picked the folder {f}: {summary['files']} files)")
+            c.ask_folder = None
+        if message and message.strip():
+            c.add("user", message)
+        if not (folder or (message and message.strip())):
+            raise ControlError("say something, or pick a folder")
+        c.save()
+        self._chat_turn(c, macs)
+        return c.summary()
+
+    def m_chat(self, id: str) -> dict:
+        return self._chat(id).summary()
+
+    def m_chats(self) -> list:
+        """Recent conversations, newest first."""
+        found = []
+        for p in sorted((self.home / "chats").glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
+            try:
+                d = json.loads(p.read_text())
+                found.append({"id": d["id"], "title": d.get("title", ""), "created": d.get("created"),
+                              "job_ids": d.get("job_ids", []), "has_plan": bool(d.get("card"))})
+            except (OSError, ValueError, KeyError):
+                continue
+        return found
+
+    def m_chat_run(self, id: str, macs: list | None = None, output: str | None = None,
+                   slots: int | None = None) -> dict:
+        """Run the plan the conversation agreed on. `slots` sets how many tasks this Mac runs at once."""
+        c = self._chat(id)
+        if not c.plan:
+            raise ControlError("there's no plan to run yet")
+        out_root = Path(self.cfg.get("output_dir", "~/Movies/macmesh")).expanduser()
+        name = re.sub(r"[^A-Za-z0-9 _.-]+", "", (c.card or {}).get("name") or c.title)[:40].strip() or "job"
+        if slots:
+            self.m_slots(int(slots))
+        workdir = out_root / ".work" / f"{name}-{uuid.uuid4().hex[:6]}"
+        try:
+            job = jobspec.validate(plan_to_job(c.plan, c.folders + c.paths, self.cfg, workdir=str(workdir), home=self.home))
+        except (ValueError, KeyError) as e:
+            raise ControlError(f"the plan can't run: {e}") from None
+        final = str(Path(output).expanduser()) if output else str(out_root / f"{name} (macmesh)")
+        record = self._start(job, {"kind": "plan", "title": name, "macs": macs, "chat": c.id}, final)
+        c.job_ids.append(record.id)
+        c.add("note", f"Started \u201c{name}\u201d: {len(job['tasks'])} tasks. Follow it on the Jobs page.")
+        c.save()
+        return record.summary()
+
+    def m_slots(self, n: int) -> dict:
+        """How many tasks this Mac runs at once (remembered)."""
+        n = int(n)
+        if not 1 <= n <= max(1, (os.cpu_count() or 1)):
+            raise ControlError(f"slots is between 1 and {os.cpu_count()}")
+        self.cfg["slots"] = n
+        if self.worker:
+            self.worker.cfg["slots"] = n  # its slot gate reads this live
+        saved = config.load()
+        saved["slots"] = n
+        config.save(saved)
+        return self.m_status()
+
     def m_run_plan(self, id: str) -> dict:
         task = self._ai_task(id)
         if not task.pending:
@@ -686,7 +805,7 @@ class Control:
 
     # ---- dispatch --------------------------------------------------------
     METHODS = {"status", "macs", "apps", "inspect", "start", "submit", "jobs", "job", "cancel", "lend", "owner", "invite", "approve",
-               "install", "revoke", "stop",
+               "install", "revoke", "stop", "chat_start", "chat_send", "chat", "chats", "chat_run", "slots",
                "ai", "set_ai", "plan", "run_plan", "teach", "explain", "ai_task"}
 
     def call(self, method: str, params: dict):

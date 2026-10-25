@@ -1151,7 +1151,10 @@ d = os.environ["FAKE_AGENT_DIR"]
 prompt = sys.argv[sys.argv.index("-p") + 1]
 n = len([f for f in os.listdir(d) if f.startswith("prompt-")]) + 1
 open(os.path.join(d, f"prompt-{n}.txt"), "w").write(prompt)
-if "planner for macmesh" in prompt:
+if "You are talking with the person" in prompt:  # a chat turn: chat-1.json, chat-2.json...
+    turn = len([f for f in os.listdir(d) if f.startswith("prompt-") and "talking with the person" in open(os.path.join(d, f)).read()])
+    reply = open(os.path.join(d, f"chat-{turn}.json")).read()
+elif "planner for macmesh" in prompt:
     reply = open(os.path.join(d, "plan.json")).read()
 elif "job failed" in prompt:
     reply = open(os.path.join(d, "explain.json")).read()
@@ -1232,6 +1235,61 @@ class AITests(ControlTests):
                 return t
             time.sleep(0.2)
         self.fail("AI task didn't finish")
+
+    def wait_chat(self, cid, timeout=60):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            c = self.client.call("chat", id=cid)
+            if c["state"] != "thinking":
+                return c
+            time.sleep(0.2)
+        self.fail("the chat didn't answer")
+
+    def test_a_job_planned_by_talking_it_through(self):
+        songs = self.tmp / "songs"
+        songs.mkdir()
+        for name in ("a.mp3", "b.mp3", "notes.txt"):
+            (songs / name).write_text(name)
+        copier = {"name": "copier", "description": "copies a file", "program": {"path": "/bin/cp"}}
+        for home in [self.home, *(n.home for n in self.nodes)]:
+            self.write_profile(home, copier)
+        self.reply("chat-1.json", {"reply": "Which folder has the songs?", "ask_folder": "Which folder has the songs?"})
+        self.reply("chat-2.json", {"reply": "Two songs. Here's the plan.", "plan": {
+            "explanation": "One task per song.", "planner": "batch",
+            "params": {"files": [{"folder": str(songs), "extensions": [".mp3"]}],
+                       "template": ["copier", "{in:file}", "{out:result}"], "out_ext": ".mp3", "name": "songs"}},
+            "suggest": {"slots": {"pro": 2}, "output_folder": "Songs done"}})
+        c = self.wait_chat(self.client.call("chat_start", message="Split all my songs, in a new folder")["id"])
+        self.assertEqual((c["state"], c["ask_folder"], c["card"]), ("waiting", "Which folder has the songs?", None))
+        c = self.wait_chat(self.client.call("chat_send", id=c["id"], folder=str(songs))["id"])
+        self.assertEqual(c["state"], "waiting", c)
+        self.assertEqual((c["card"]["tasks"], c["card"]["programs"]), (2, ["copier"]))  # .mp3 only
+        self.assertEqual(c["card"]["example"], ["copier a.mp3 a.mp3"])  # the first task, with its real file
+        self.assertEqual(c["suggest"]["slots"], {"pro": 2})
+        prompt = (self.agent_dir / "prompt-2.txt").read_text()
+        self.assertIn('"a.mp3"', prompt)          # it saw the folder's file names...
+        self.assertNotIn("notes.txt\n", prompt.split("FOLDERS")[0])
+        self.assertIn("THEM: Split all my songs", prompt)  # ...and the conversation so far
+        out = self.tmp / "Songs done"
+        job = self.client.call("chat_run", id=c["id"], output=str(out), slots=2)
+        self.assertEqual(self.ctl.cfg["slots"], 2)
+        job = self.wait_job(lambda j: self.client.call("job", id=j), job["id"])
+        self.assertEqual(job["state"], "done", job)
+        self.assertEqual(job["chat"], c["id"])
+        self.assertEqual(sorted(os.listdir(out)), ["a.mp3", "b.mp3"])
+        chats = self.client.call("chats")
+        self.assertEqual((chats[0]["id"], chats[0]["job_ids"]), (c["id"], [job["id"]]))
+        self.assertTrue((self.home / "chats" / f"{c['id']}.json").exists())  # kept with the job
+
+    def test_a_chat_plan_may_only_use_folders_they_picked(self):
+        self.reply("chat-1.json", {"reply": "Done.", "plan": {"explanation": "x", "planner": "batch",
+                   "params": {"files": [{"folder": "/etc", "extensions": [".conf"]}], "template": ["ffmpeg", "-i", "{in:file}", "{out:result}"],
+                              "out_ext": ".txt", "name": "sneaky"}}})
+        self.reply("chat-2.json", {"reply": "Sorry, which folder?", "ask_folder": "Which folder?"})
+        c = self.wait_chat(self.client.call("chat_start", message="do it")["id"])
+        self.assertIsNone(c["card"])
+        self.assertIn("isn't a folder they picked", (self.agent_dir / "prompt-2.txt").read_text())  # told why, retried
+        self.assertEqual(c["ask_folder"], "Which folder?")
 
     test_status_inspect_and_a_whole_project_job = None  # covered by ControlTests
     test_cancel_and_lending = None
