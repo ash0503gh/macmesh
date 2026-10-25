@@ -13,10 +13,10 @@ enum Snapshots {
     }
 
     static let macs = [
-        mac("Ashwin's MacBook Pro", "MacBook Pro", "Apple M5", state: "working", this: true),
+        mac("Maya's MacBook Pro", "MacBook Pro", "Apple M5", state: "working", this: true),
         mac("MacBook Air", "MacBook Air", "Apple M3", state: "working", fanless: true),
         mac("Mac Studio", "Mac Studio", "Apple M4 Max", state: "working"),
-        mac("Riya's MacBook", "MacBook Pro", "Apple M2 Pro", state: "paused", reason: "owner using 72% CPU"),
+        mac("Noor's MacBook", "MacBook Pro", "Apple M2 Pro", state: "paused", reason: "owner using 72% CPU"),
         mac("Old iMac", "iMac", "Apple M1", state: "unavailable", reason: "not lending"),
     ]
 
@@ -35,12 +35,12 @@ enum Snapshots {
                                           doing: [.init(label: "Firestone.mp3", phase: "running", since: 52, bytes: 0, total: 0),
                                                   .init(label: "Wiggle.mp3", phase: "queued", since: 40, bytes: 0, total: 0)],
                                           sent: 0, received: 61_000_000, upRate: 0, downRate: 0, load: load(31, 64)),
-                                    .init(nodeId: "b", name: "Sonakshi\u{2019}s MacBook Air", done: 4, running: 2,
+                                    .init(nodeId: "b", name: "Leo\u{2019}s MacBook Air", done: 4, running: 2,
                                           doing: [.init(label: "That Bass.mp3", phase: "running", since: 21, bytes: 0, total: 0),
                                                   .init(label: "We Own It.mp3", phase: "uploading", since: 2, bytes: 5_400_000, total: 9_100_000)],
                                           sent: 46_200_000, received: 132_000_000, upRate: 2_700_000, downRate: 0, load: load(24, 78, duty: 0.72))],
                              chunks: songs.enumerated().map { i, song in
-                                 let mac = [1, 0, 1, 1, 0, 1, 1, 1, 0, 0][i] == 0 ? "This Mac" : "Sonakshi\u{2019}s MacBook Air"
+                                 let mac = [1, 0, 1, 1, 0, 1, 1, 1, 0, 0][i] == 0 ? "This Mac" : "Leo\u{2019}s MacBook Air"
                                  return i < 6 ? Job.Chunk(state: "done", mac: mac, label: song, phase: "done", seconds: [79, 109, 72, 53, 105, 64][i], attempts: 1)
                                      : i == 6 ? Job.Chunk(state: "running", mac: mac, label: song, phase: "uploading", seconds: 2, attempts: 0)
                                      : i < 9 ? Job.Chunk(state: "running", mac: mac, label: song, phase: i == 7 ? "running" : "running", seconds: i == 7 ? 21 : 52, attempts: 0)
@@ -48,12 +48,12 @@ enum Snapshots {
                              },
                              speedup: 1.9, created: 0, kind: "batch",
                              events: [
-                                 .init(at: 1_792_878_701, text: "job Hip hop stems (2ecf6214): 10 tasks on This Mac[7.1], Sonakshi\u{2019}s MacBook Air[4.8]"),
-                                 .init(at: 1_792_878_714, text: "  → Love You No More.mp3 on Sonakshi\u{2019}s MacBook Air (upload 12.3s)"),
-                                 .init(at: 1_792_878_793, text: "  ✓ Love You No More.mp3 on Sonakshi\u{2019}s MacBook Air in 79.2s  [1/10]"),
+                                 .init(at: 1_792_878_701, text: "job Hip hop stems (2ecf6214): 10 tasks on This Mac[7.1], Leo\u{2019}s MacBook Air[4.8]"),
+                                 .init(at: 1_792_878_714, text: "  → Love You No More.mp3 on Leo\u{2019}s MacBook Air (upload 12.3s)"),
+                                 .init(at: 1_792_878_793, text: "  ✓ Love You No More.mp3 on Leo\u{2019}s MacBook Air in 79.2s  [1/10]"),
                                  .init(at: 1_792_878_811, text: "  ✓ It's My Birthday.mp3 on This Mac in 109.3s  [2/10]"),
-                                 .init(at: 1_792_878_955, text: "  ✓ That Bass.mp3 on Sonakshi\u{2019}s MacBook Air in 64.3s  [6/10]"),
-                                 .init(at: 1_792_878_957, text: "  → We Own It.mp3 on Sonakshi\u{2019}s MacBook Air (upload 4.3s)"),
+                                 .init(at: 1_792_878_955, text: "  ✓ That Bass.mp3 on Leo\u{2019}s MacBook Air in 64.3s  [6/10]"),
+                                 .init(at: 1_792_878_957, text: "  → We Own It.mp3 on Leo\u{2019}s MacBook Air (upload 4.3s)"),
                              ])
     static let finished = [
         Job(id: "b1", name: "Launch ad (motion)", state: "done", error: "", output: "/tmp/x.mov", tasks: 8, done: 8, progress: 1,
@@ -87,13 +87,13 @@ enum Snapshots {
     static func status(jobs: [Job], macs: [Mac]? = nil, paused: Int = 0, requests: Bool = false,
                        blockedFirewall: Bool = false) -> MeshStatus {
         let macs = macs ?? Self.macs
-        return MeshStatus(nodeId: "ashwinsmacbookpro", name: "Ashwin's MacBook Pro", lend: true, accepting: true, reason: "",
+        return MeshStatus(nodeId: "mayasmacbookpro", name: "Maya's MacBook Pro", lend: true, accepting: true, reason: "",
                    running: 2, paused: paused, ownerMode: "shared", tls: true, holdsCa: true,
                    fingerprint: "0b4109f4ba1c7033bf0ac00db1c03e381d2d4f9a1864c0d393d8efde5d1aeeaa",
                    outputDir: "/Users/me/Movies/macmesh", mesh: "0b4109f4ba1c",
                    firewall: .init(on: true, blockAll: false, blocked: blockedFirewall, program: "/Applications/macmesh.app/Contents/Resources/engine/python/bin/python3.13"),
                    invite: .init(code: "7K2Q-M9XD-4TRA", state: "waiting", expires: nil, joined: nil, error: nil,
-                                 requests: requests ? [.init(id: "r1", name: "Riya's MacBook", number: "736 487", age: 4)] : []),
+                                 requests: requests ? [.init(id: "r1", name: "Noor's MacBook", number: "736 487", age: 4)] : []),
                    macs: macs, jobs: jobs)
     }
 
@@ -147,10 +147,10 @@ enum Snapshots {
                                    .environment(engine(working)))),
             ("explain", AnyView(ExplainSheet(job: finished[1], task: explainTask).environment(engine(working)))),
             ("menubar-working", AnyView(PopoverView().environment(engine(working)))),
-            ("setup-nearby", AnyView(OnboardingView(nearby: [NearbyMesh(name: "Ashwin's MacBook Pro", addresses: ["192.168.0.103:7478"], mesh: "0b41")],
+            ("setup-nearby", AnyView(OnboardingView(nearby: [NearbyMesh(name: "Maya's MacBook Pro", addresses: ["192.168.1.20:7478"], mesh: "0b41")],
                                                     searching: false).environment(engine(nil, phase: .needsSetup)))),
             ("setup-number", AnyView(OnboardingView(nearby: [], searching: false,
-                                                    joining: NearbyMesh(name: "Ashwin's MacBook Pro", addresses: [], mesh: "0b41"),
+                                                    joining: NearbyMesh(name: "Maya's MacBook Pro", addresses: [], mesh: "0b41"),
                                                     number: "736 487").environment(engine(nil, phase: .needsSetup)))),
             ("mesh-sheet", AnyView(MeshSheet().environment(engine(status(jobs: [], requests: true))))),
             ("dashboard-request", dash(.jobs, engine(status(jobs: finished, requests: true, blockedFirewall: true)))),
@@ -168,7 +168,7 @@ enum Snapshots {
                 ForEach(["asking", "installing", "done", "failed"], id: \.self) { state in
                     InstallRequestBanner(request: .init(program: "demucs-stem",
                         summary: "Demucs stem separation: Python packages and the htdemucs model, about 1 GB",
-                        by: "Ashwin\u{2019}s MacBook Pro", state: state, detail: "Step 2 of 3: pip install demucs==4.1.0",
+                        by: "Maya\u{2019}s MacBook Pro", state: state, detail: "Step 2 of 3: pip install demucs==4.1.0",
                         error: "step 2 failed (exit 1): No space left on device"))
                 }
             }.padding(20).frame(width: 560).environment(engine(idle)))),

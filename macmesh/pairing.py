@@ -5,7 +5,7 @@ on the worker port + 1 and advertises itself over Bonjour (_macmesh-pair._tcp). 
 joins one of two ways:
 
 1. Ask to join (the app's way): the new Mac lists the meshes it finds nearby; you click Join.
-   The first Mac shows "Riya's MacBook wants to join" with a 6-digit number, and the new Mac
+   The first Mac shows "Noor's MacBook wants to join" with a 6-digit number, and the new Mac
    shows a number too. You check they match and click Allow. The number is worked out from
    random values both Macs committed to before seeing each other's (commit, then reveal), from
    the first Mac's certificate as the new Mac saw it, and from the new Mac's signing request.

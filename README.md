@@ -55,7 +55,7 @@ What each Mac needs for the work it shares:
 
 - **ffmpeg** for video jobs: `brew install ffmpeg`.
 - **Tools with an install recipe** (such as `demucs-stem` for stem separation) set themselves up:
-  when a job needs one that a Mac lacks, that Mac shows *"Ashwin's MacBook Pro needs demucs-stem
+  when a job needs one that a Mac lacks, that Mac shows *"Maya's MacBook Pro needs demucs-stem
   on this Mac"* with *Allow*. After Allow, it installs into `~/.macmesh/tools` (no administrator
   password) and joins the job while it's still running.
 - **The apps' command-line tools** for app jobs, at the same version on every Mac, with a profile
