@@ -30,11 +30,15 @@ DEFAULT_AGENTS = {
     # The planner only needs text in, JSON out: all agent tools are disabled.
     "claude": ["claude", "-p", "{prompt}", "--output-format", "json",
                "--tools", "", "--no-session-persistence"],
-    # Antigravity CLI: it can't turn its tools off, so it runs read-only (plan mode, sandboxed).
-    # Some versions hang without a TTY; see README.
-    # (--disable-slash-commands would switch plan mode off; macmesh's prompts never start with "/".)
-    "antigravity": ["agy", "-p", "{prompt}", "--output-format", "json", "--mode", "plan", "--sandbox"],
+    # Antigravity CLI: it can't turn its tools off, so it runs with its terminal sandboxed and slash
+    # commands off. Not --mode plan: that starts agy's /plan workflow, which waits for someone to
+    # review the plan and never ends a non-interactive turn. Low effort answers in ~15 s instead of
+    # minutes, and agy's own time limit ends a stuck turn before macmesh's (agent_timeout).
+    "antigravity": ["agy", "-p", "{prompt}", "--output-format", "json", "--sandbox", "--disable-slash-commands",
+                    "--effort", "low", "--print-timeout", "280s"],
 }
+# Earlier default commands, replaced on load (a user's own edits are kept).
+OLD_AGENTS = {"antigravity": [["agy", "-p", "{prompt}", "--output-format", "json", "--mode", "plan", "--sandbox"]]}
 
 
 def home() -> Path:
@@ -89,6 +93,9 @@ def load() -> dict:
     cfg.update(saved)
     cfg["tools"] = {name: t for name, t in cfg["tools"].items()
                     if not (t.get("path") in OLD_DEFAULT_PATHS and set(t) <= {"path", "description", "usage"})}
+    for name, old in OLD_AGENTS.items():
+        if cfg["agents"].get(name) in old:
+            cfg["agents"][name] = list(DEFAULT_AGENTS[name])
     return cfg
 
 

@@ -19,7 +19,7 @@ from pathlib import Path
 from macmesh import ai, config, control, jobspec, media, mediarefs, owner, pairing, pki, profiles, sandbox, sysinfo, toolinfo, wire
 from macmesh import mcp as mcp_module
 from macmesh import worker as worker_module
-from macmesh.client import NodeClient, NodeError
+from macmesh.client import NodeClient, NodeError, TaskRejected
 from macmesh.planners import plan_app, plan_batch, plan_range, plan_video
 from macmesh.planners.range import exact_fps
 from macmesh.planners.ai import extract_plan
@@ -328,6 +328,33 @@ class Relay:
         self.sock.close()
         for s in self.open:
             s.close()
+
+
+class OwnWorkTests(MeshCase):
+    def test_a_mac_not_lending_still_runs_its_own_jobs(self):
+        air = self.nodes[1]
+        air.worker.cfg["lend"] = False
+        mine = {"task_id": "own-1", "argv": ["fakeapp"], "origin": {"node_id": air.worker.cfg["node_id"]}}
+        theirs = {"task_id": "their-1", "argv": ["fakeapp"], "origin": {"node_id": "someone-else"}}
+        c = air.client()
+        self.assertIn(c.submit(mine)["state"], ("queued", "running"))  # accepted
+        with self.assertRaises(TaskRejected) as refused:
+            c.submit(theirs)
+        self.assertEqual(refused.exception.code, 503)
+        self.assertIn("not lending", str(refused.exception))
+
+    def test_a_job_no_mac_will_take_says_why(self):
+        air = self.nodes[1]
+        air.worker.cfg["lend"] = False
+        lines = []
+        sched = Scheduler(self.range_job(frames=50), [air.client()], log=lines.append)
+        threading.Thread(target=lambda: self.assertRaises(JobFailed, sched.run), daemon=True).start()
+        for _ in range(100):
+            if any("waiting: no Mac will take work" in m for m in lines):
+                break
+            time.sleep(0.05)
+        sched.cancel()
+        self.assertTrue(any("waiting: no Mac will take work right now (air: not lending)" in m for m in lines), lines)
 
 
 class InstallTests(MeshCase):
@@ -1033,6 +1060,37 @@ class ControlTests(MeshCase):
         self.assertTrue(any("on pro in" in e["text"] for e in job["events"]), job["events"])
         self.assertTrue(all(e["at"] > job["created"] - 1 for e in job["events"]))
 
+    def test_command_line_jobs_run_in_the_engine(self):
+        from contextlib import redirect_stdout
+        from macmesh import cli
+        self.project = self.tmp / "Ad.ecproj"  # the fake renderer's project folder (MeshCase's)
+        jobspec.save(self.range_job(frames=100, out="cli-out"), self.tmp / "job.json")
+        printed = io.StringIO()
+        with redirect_stdout(printed):
+            rc = cli.main(["run", str(self.tmp / "job.json"), "--yes"])
+        self.assertEqual(rc, 0, printed.getvalue())
+        self.assertEqual(len(os.listdir(self.tmp / "cli-out/frames")), 100)
+        job = self.client.call("jobs")[0]  # the app sees it like any other job
+        self.assertEqual((job["state"], job["kind"], job["done"]), ("done", "job", 2))
+        self.assertIn("running in macmesh's engine", printed.getvalue())
+        self.assertIn("Frames 0\u201349", printed.getvalue())  # its activity, as the app shows it
+
+    def test_command_line_says_to_open_macmesh_when_it_isnt_running(self):
+        from contextlib import redirect_stdout
+        from macmesh import cli
+        self.project = self.tmp / "Ad.ecproj"
+        jobspec.save(self.range_job(frames=10, out="cli-out"), self.tmp / "job.json")
+        self.server.shutdown()
+        self.server.server_close()
+        control.socket_path(self.home).unlink(missing_ok=True)
+        printed = io.StringIO()
+        with redirect_stdout(printed):
+            rc = cli.main(["run", str(self.tmp / "job.json"), "--yes"])
+        self.server = control.serve(self.ctl)  # for tearDown
+        self.assertEqual(rc, 1)
+        self.assertIn("Open the macmesh app", printed.getvalue())
+        self.assertFalse((self.tmp / "cli-out/frames").exists())  # no hidden job ran
+
     def test_cancel_and_lending(self):
         os.environ["FAKE_DELAY"] = "1"
         try:
@@ -1104,6 +1162,26 @@ print(json.dumps({"type": "result", "result": "Here you go:\\n" + reply}))
 
 
 class AgentLookupTests(unittest.TestCase):
+    def test_old_antigravity_command_is_replaced_on_load(self):
+        home = Path(tempfile.mkdtemp())
+        old_home = os.environ.get("MACMESH_HOME")
+        os.environ["MACMESH_HOME"] = str(home)
+        try:
+            cfg = config.defaults()
+            cfg["agents"]["antigravity"] = config.OLD_AGENTS["antigravity"][0]
+            cfg["agents"]["claude"] = ["claude", "-p", "{prompt}", "--my-own-flag"]  # the user's own: kept
+            config.save(cfg)
+            loaded = config.load()
+            self.assertEqual(loaded["agents"]["antigravity"], config.DEFAULT_AGENTS["antigravity"])
+            self.assertNotIn("plan", loaded["agents"]["antigravity"])
+            self.assertEqual(loaded["agents"]["claude"][-1], "--my-own-flag")
+        finally:
+            if old_home is None:
+                os.environ.pop("MACMESH_HOME", None)
+            else:
+                os.environ["MACMESH_HOME"] = old_home
+            shutil.rmtree(home, ignore_errors=True)
+
     def test_finds_antigravity_where_its_installer_puts_it(self):
         home = Path(tempfile.mkdtemp())
         agy = home / ".gemini/bin/agy"

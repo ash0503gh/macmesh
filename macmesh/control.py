@@ -332,14 +332,28 @@ class Control:
         planned = self.plan_job(spec)
         return self._start(planned["job"], spec, planned["final"]).summary()
 
-    def _start(self, job: dict, spec: dict, final: str) -> Job:
+    def m_submit(self, job: dict, final: str | None = None, kind: str | None = None, title: str | None = None,
+                 options: dict | None = None) -> dict:
+        """A job already planned elsewhere (the command line): run it here like any other, so the app
+        shows it live. `final` is the exact output path, or None to leave results in the job's workdir.
+        options: max_attempts, speculate, match, keep_blobs (the Scheduler's)."""
+        try:
+            job = jobspec.validate(job)
+        except (ValueError, KeyError) as e:
+            raise ControlError(f"not a valid job: {e}") from None
+        spec = {"kind": kind or "job", "title": title or job["name"], "exact_final": True,
+                "options": {k: v for k, v in (options or {}).items()
+                            if k in ("max_attempts", "speculate", "match", "keep_blobs") and v is not None}}
+        return self._start(job, spec, final).summary()
+
+    def _start(self, job: dict, spec: dict, final: str | None) -> Job:
         record = Job(job, spec)
         with self.lock:
             self.jobs[record.id] = record
         threading.Thread(target=self._run, args=(record, final), daemon=True).start()
         return record
 
-    def _run(self, record: Job, final: str) -> None:
+    def _run(self, record: Job, final: str | None) -> None:
         try:
             clients = [c for c in mesh.find_nodes(self.cfg, seconds=2.0)
                        if not record.spec.get("macs") or c.info["node_id"] in record.spec["macs"]]
@@ -348,7 +362,8 @@ class Control:
             record.scheduler = Scheduler(record.job, clients, log=record.note,
                                          reference=toolinfo.fingerprints(self.cfg, self.home),
                                          origin={"node_id": self.cfg["node_id"], "name": self.cfg["node_name"]},
-                                         installer=lambda client, prog: client.request_install(prog, self.cfg["node_name"]))
+                                         installer=lambda client, prog: client.request_install(prog, self.cfg["node_name"]),
+                                         **record.spec.get("options", {}))
             if record.cancel_requested:  # cancelled while the Macs were being found
                 raise JobFailed("cancelled")
             record.state, record.started = "running", time.time()
@@ -361,12 +376,21 @@ class Control:
                              for s in record.job["merge"] if s.get("output") or s.get("into")), None)
             if not (produced and produced.exists()):
                 produced = workdir / "results" if (workdir / "results").is_dir() else workdir  # batch jobs
-            dest = _free_name(Path(final + (produced.suffix if produced.is_file() else "")))
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(produced), dest)
-            record.output = str(dest)
-            if produced != workdir:
-                shutil.rmtree(workdir, ignore_errors=True)
+            if final is None:  # the command line's "outputs in <workdir>"
+                record.output = str(produced)
+            else:
+                if record.spec.get("exact_final"):  # the command line names the file, as `-o` always has
+                    dest = Path(final).expanduser()
+                    if dest.is_file() and dest.resolve() != produced.resolve():
+                        dest.unlink()
+                else:
+                    dest = _free_name(Path(final + (produced.suffix if produced.is_file() else "")))
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if dest.resolve() != produced.resolve():
+                    shutil.move(str(produced), dest)
+                record.output = str(dest)
+                if produced != workdir:
+                    shutil.rmtree(workdir, ignore_errors=True)
             record.state = "done"
         except JobFailed as e:
             record.state = "cancelled" if str(e) == "cancelled" else "failed"
@@ -661,7 +685,7 @@ class Control:
         return self._ai_task(id).summary()
 
     # ---- dispatch --------------------------------------------------------
-    METHODS = {"status", "macs", "apps", "inspect", "start", "jobs", "job", "cancel", "lend", "owner", "invite", "approve",
+    METHODS = {"status", "macs", "apps", "inspect", "start", "submit", "jobs", "job", "cancel", "lend", "owner", "invite", "approve",
                "install", "revoke", "stop",
                "ai", "set_ai", "plan", "run_plan", "teach", "explain", "ai_task"}
 

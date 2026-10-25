@@ -124,7 +124,8 @@ struct LoadChart: View {
             }
         }
         .chartLegend(.hidden)
-        .frame(maxWidth: .infinity, minHeight: 56, maxHeight: 56)
+        .aspectRatio(4, contentMode: .fit)  // a quarter of the card's width: fills a large window, never jumps
+        .frame(minHeight: 56, maxHeight: 180)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.03)))
         .overlay {
             if shown.count < 2 {

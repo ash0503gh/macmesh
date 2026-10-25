@@ -90,7 +90,7 @@ app/scripts/package.sh        # → app/build/macmesh-macos-arm64.zip and .sha25
 the jobs as the app's live view sees them, and `Macmesh --join-nearby [name]` joins a nearby mesh
 the way the first-run screen does.
 
-Under the hood, `macmesh serve` listens on `~/.macmesh/control.sock` (only your user can open it). Jobs started there run inside the daemon, so the app, agents and the CLI all see the same jobs (`macmesh/control.py`).
+Under the hood, `macmesh serve` listens on `~/.macmesh/control.sock` (only your user can open it). Every job runs inside it, however it was started: from the app, by an agent through MCP, or from Terminal (`macmesh video`, `range`, `batch`, `run`, `plan` hand the planned job to it and print its activity as it goes; Ctrl-C cancels it). So the app always shows every job live, and there's one way jobs run (`macmesh/control.py`). With the engine not running, those commands say to open macmesh rather than run a job the app can't see.
 
 ## For AI agents (MCP)
 
@@ -241,7 +241,8 @@ the next section). The AI works on the parts that have no rule yet:
   tool with your existing subscription, and finds it where its installer put it (Antigravity's
   `~/.gemini/bin`, `~/.local/bin`, npm and Homebrew folders, and your login shell's PATH), even
   though the app's engine starts with macOS's bare PATH. Claude Code runs with its tools turned off
-  (`claude -p … --tools ""`). Antigravity runs read-only (`agy -p … --mode plan --sandbox`). Both run
+  (`claude -p … --tools ""`). Antigravity runs with its terminal sandboxed and slash commands off, at low effort
+  (`agy -p … --sandbox --disable-slash-commands --effort low`); it answers in about 15 s. Both run
   from an empty folder and are told to answer from the prompt alone. The AI only answers; macmesh
   checks the answer before anything runs.
 - **What it sees:** your request, the names, sizes and formats of the files you add, your Macs'
@@ -265,8 +266,9 @@ the next section). The AI works on the parts that have no rule yet:
   the AI, which answers with what went wrong, what to do, and where to look.
 
 > **Signing in:** the AI tools use their own logins. If one says it isn't signed in, run `claude`
-> (or `agy`) in Terminal once and sign in. If Antigravity hangs with no terminal, set
-> `MACMESH_AGENT_TTY=1`.
+> (or `agy`) in Terminal once and sign in. The `agy` command-line tool signs in separately from the
+> Antigravity app, and can lose its sign-in when it updates itself. If Antigravity hangs with no
+> terminal, set `MACMESH_AGENT_TTY=1`.
 
 ## How the scheduling handles real Macs
 

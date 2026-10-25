@@ -11,10 +11,9 @@ import threading
 import time
 from pathlib import Path
 
-from . import PAIR_SERVICE_TYPE, __version__, config, discovery, jobspec, media, mesh, pairing, pki, profiles, toolinfo
+from . import PAIR_SERVICE_TYPE, __version__, config, discovery, jobspec, mesh, pairing, pki, profiles, toolinfo
 from .client import NodeClient, NodeError
 from .planners import ENCODE_PRESETS, PLANNERS
-from .scheduler import JobFailed, Scheduler
 
 
 _log_lock = threading.Lock()
@@ -77,7 +76,10 @@ def confirm(args) -> bool:
     return input("Run it? [Y/n] ").strip().lower() in ("", "y", "yes")
 
 
-def execute(job: dict, cfg: dict, args) -> int:
+def execute(job: dict, cfg: dict, args, kind: str = "job") -> int:
+    """Run a planned job in this Mac's macmesh engine, so the app shows it live (activity, graphs,
+    history) like a job started there or by an agent. Follows it here until it's done."""
+    from .control import ControlClient, ControlError
     final = job.pop("final", None)
     job = jobspec.validate(job)
     if getattr(args, "save_job", None):
@@ -86,44 +88,48 @@ def execute(job: dict, cfg: dict, args) -> int:
     describe(job)
     if getattr(args, "dry_run", False):
         return 0
-    clients = gather_nodes(cfg, args)
-    if not clients:
-        print("No worker nodes reachable.")
+    try:
+        client = ControlClient()
+        status = client.call("status")
+    except ControlError as e:
+        print(f"{e}\nJobs run in macmesh's engine so the app can show them. Open the macmesh app, or run "
+              "`macmesh serve` in another Terminal, then try again.")
         return 1
+    if getattr(args, "peer", None) or getattr(args, "no_discovery", False):
+        print("note: --peer and --no-discovery are ignored; the engine finds the Macs (static peers go in the config).")
     print()
-    print_nodes(clients)
+    for m in status["macs"]:
+        print(f"  {m['name']:<28} {m.get('chip') or '':<16} {m['state']:<12} {', '.join(m.get('programs', []))}")
     print()
     if not confirm(args):
         return 1
-    sched = Scheduler(job, clients, log=log, max_attempts=args.retries, speculate=not args.no_speculate,
-                      reference=toolinfo.fingerprints(cfg), match=args.match, keep_blobs=args.keep_blobs)
+    options = {"max_attempts": getattr(args, "retries", None), "keep_blobs": getattr(args, "keep_blobs", None),
+               "match": getattr(args, "match", None),
+               "speculate": None if getattr(args, "no_speculate", None) is None else not args.no_speculate}
+    record = client.call("submit", job=job, final=final, kind=kind, options=options)
+    log(f"job {record['id']} is running in macmesh's engine (open the app to watch it)")
+    seen: set = set()
     try:
-        result = sched.run()
-    except JobFailed as e:
-        log(f"JOB FAILED: {e}")
-        return 1
+        while True:
+            j = client.call("job", id=record["id"])
+            for e in j.get("events", []):
+                if (e["at"], e["text"]) not in seen:
+                    seen.add((e["at"], e["text"]))
+                    log("  " + e["text"])
+            if j["state"] in ("done", "failed", "cancelled"):
+                break
+            time.sleep(1)
     except KeyboardInterrupt:
-        log("interrupted; remote tasks cancelled")
+        client.call("cancel", id=record["id"])
+        log("interrupted; the job was cancelled on every Mac")
         return 130
-    workdir = Path(job["workdir"]).expanduser().resolve()
-    try:
-        media.run_merge(workdir, job["merge"], log=log)
-    except (RuntimeError, OSError) as e:
-        log(f"MERGE FAILED: {e}")
+    if j["state"] != "done":
+        log(f"JOB FAILED: {j['error'] or j['state']}")
         return 1
-    if final:
-        produced = workdir / Path(final).name
-        Path(final).parent.mkdir(parents=True, exist_ok=True)
-        if produced.resolve() != Path(final).resolve():
-            shutil.move(str(produced), final)
-        log(f"output: {final}")
-    else:
-        log(f"outputs in {workdir}")
-    wall, compute = result["wall_seconds"], result["compute_seconds"]
-    log(f"done in {wall:.1f}s wall · {compute:.1f}s of compute · "
-        f"avg {compute / wall if wall else 0:.1f} tasks running at once")
-    for name, n in result["nodes"].items():
-        log(f"  {name}: {n['tasks']} task(s), {n['busy_seconds']:.1f}s busy")
+    log(f"output: {j['output']}")
+    log(f"done in {j['elapsed']:.1f}s" + (f" · {j['speedup']}× as many tasks at once as one Mac runs" if j.get("speedup") else ""))
+    for m in j["macs"]:
+        log(f"  {m['name']}: {m['done']} task(s)")
     return 0
 
 
@@ -316,7 +322,7 @@ def cmd_run(args) -> int:
 def cmd_video(args) -> int:
     job = PLANNERS["video"](args.src, args.output, preset=args.preset, vargs=args.vargs or "",
                             vf=args.vf or "", chunk_seconds=args.chunk, workdir=args.workdir or "")
-    return execute(job, config.load(), args)
+    return execute(job, config.load(), args, kind="video")
 
 
 def _kv(pairs, flag: str = "--input") -> dict:
@@ -345,7 +351,7 @@ def cmd_range(args) -> int:
                                 chunk=args.chunk, out_ext=args.out_ext, merge=args.merge,
                                 output=args.output or "", extra_inputs=_kv(args.input),
                                 workdir=args.workdir or "", fps=args.fps, vars=_kv(args.var, "--var"))
-    return execute(job, cfg, args)
+    return execute(job, cfg, args, kind="app")
 
 
 def cmd_apps(args) -> int:
@@ -370,7 +376,7 @@ def cmd_apps(args) -> int:
 def cmd_batch(args) -> int:
     job = PLANNERS["batch"](args.files, _template(args.template), args.out_ext, name=args.name,
                             workdir=args.workdir or "", extra_inputs=_kv(args.input))
-    return execute(job, config.load(), args)
+    return execute(job, config.load(), args, kind="batch")
 
 
 def _template(t: list[str]) -> list[str]:

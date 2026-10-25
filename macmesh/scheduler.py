@@ -71,6 +71,7 @@ class NodeState:
     free_at: float = 0.0  # when a chunk last left this Mac, so the next queued one started then
     mismatched: set = field(default_factory=set)  # programs whose build differs from the coordinator's
     installing: set = field(default_factory=set)  # programs this Mac was asked to set up and may still
+    refused: str = ""    # why it last turned work away ("not lending", "owner using 85% CPU"...)
     sent: int = 0        # bytes uploaded to this Mac for the job
     received: int = 0    # bytes of results fetched back
     transfers: list = field(default_factory=list)  # (time, bytes up, bytes down), recent, for speeds
@@ -131,6 +132,7 @@ class Scheduler:
         # installer(client, program) -> {"state"}: asks a Mac that lacks a program to set it up.
         self.installer = installer
         self._install_checked = 0.0
+        self._waiting_said = 0.0
 
     # ---- public -------------------------------------------------------
     def run(self) -> dict:
@@ -152,6 +154,7 @@ class Scheduler:
                         raise JobFailed(self.fatal)
                     self._recheck_installs()
                     self._dispatch()
+                    self._say_if_stuck()
                     self.cond.wait(timeout=1.0)
         finally:
             self._cancel_all()
@@ -183,6 +186,17 @@ class Scheduler:
                     seen = toolinfo.describe(theirs) if theirs else "unknown build"
                     self.log(f"  ✗ {n.client.name}: {prog} is {seen}, this Mac has {toolinfo.describe(ours)}; "
                              "not using it for these tasks")
+
+    def _say_if_stuck(self) -> None:
+        """Once a minute while nothing runs because every Mac is turning work away, say why."""
+        now = time.time()
+        if any(t.copies for t in self.tasks) or not all(n.cooldown_until > now for n in self.nodes):
+            self._waiting_said = 0.0
+            return
+        if now - self._waiting_said >= 60:
+            self._waiting_said = now
+            why = "; ".join(f"{n.client.name}: {n.refused or 'busy'}" for n in self.nodes)
+            self.log(f"  … waiting: no Mac will take work right now ({why})")
 
     def _unrunnable(self) -> str:
         """Why some task can't run on any Mac (and none is setting up what it needs), or ""."""
@@ -606,6 +620,7 @@ class Scheduler:
                 task.node_errors += outcome == "error"
                 wait = BUSY_COOLDOWN if outcome == "busy" else NODE_COOLDOWN
                 node.cooldown_until = time.time() + wait
+                node.refused = detail.split("(", 1)[-1].rstrip(")") if outcome == "busy" else "not answering"
                 self.log(f"  ! {name}: {detail.splitlines()[0] if detail else outcome}; "
                          f"re-queued {task.id}, pausing node {wait:.0f}s")
                 if task.node_errors >= MAX_NODE_ERRORS:

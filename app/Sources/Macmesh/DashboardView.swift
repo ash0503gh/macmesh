@@ -74,7 +74,29 @@ struct DashboardView: View {
             case .security: SecurityPage()
             }
         case .needsSetup:
-            OnboardingView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            if page == .jobs {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        OnboardingView()
+                            .frame(maxWidth: .infinity)
+                            .background(RoundedRectangle(cornerRadius: 14).fill(Color.primary.opacity(0.035)))
+                        Label("Once this Mac is in a mesh, drop a project, video or songs here to split the work across your Macs.",
+                              systemImage: "square.and.arrow.down.on.square")
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(24)
+                    .frame(maxWidth: 760)
+                    .frame(maxWidth: .infinity)
+                }
+            } else {
+                ContentUnavailableView {
+                    Label("Join or start a mesh first", systemImage: "point.3.connected.trianglepath.dotted")
+                } description: {
+                    Text("macmesh shares work between the Macs in a mesh.")
+                } actions: {
+                    Button("Go to Jobs") { page = .jobs }.buttonStyle(.borderedProminent)
+                }
+            }
         case .missing:
             ContentUnavailableView("The engine is missing", systemImage: "exclamationmark.triangle",
                                    description: Text("This copy of macmesh can't find its engine. Reinstall the app."))
@@ -132,6 +154,7 @@ struct JobsPage: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                MeshStrip()
                 if engine.activeJobs.isEmpty {
                     emptyState
                 } else {
@@ -261,8 +284,9 @@ struct LiveJob: View {
             }
             JobProgressBar(job: job)
             HStack(spacing: 12) {
-                metric("Done", job.progress == 0 && job.done == 0 ? "–" : "\(Int((job.progress * 100).rounded()))%")
-                metric("Time left", job.eta.map { Format.duration($0) } ?? "–")
+                metric("Done", job.tasks == 0 ? "\u{2013}" : "\(job.done * 100 / job.tasks)%")
+                metric("Time", job.eta.map { "\(Format.duration(job.elapsed)) of ~\(Format.duration(job.elapsed + $0))" }
+                                ?? (job.elapsed > 0 ? Format.duration(job.elapsed) : "\u{2013}"))
                 metric("Faster by", job.speedup.map { "\($0.formatted())×" } ?? "–")
                 metric("Chunks", "\(job.done) of \(job.tasks)")
             }
@@ -341,15 +365,13 @@ struct MacsPage: View {
             }
             .tableStyle(.inset)
         }
-        .toolbar {
-            ToolbarItem {
-                Button {
-                    inviting = true
-                } label: {
-                    Label("Add or Join Macs", systemImage: "plus.circle")
-                }
-                .help("Add Macs, Join a mesh, Start a new mesh, or Revoke / Leave mesh")
+        .safeAreaInset(edge: .bottom) {
+            HStack {
+                Spacer()
+                Button("Manage mesh\u{2026}") { inviting = true }
+                    .help("Add a Mac, answer join requests, remove a Mac, or leave this mesh")
             }
+            .padding(12)
         }
         .sheet(isPresented: $inviting) { MeshSheet().environment(engine) }
     }
@@ -481,5 +503,40 @@ struct SecurityPage: View {
         } message: { _ in
             Text("This Mac will refuse it from now on. Do the same on your other Macs, and restart macmesh here.")
         }
+    }
+}
+
+/// The top of Jobs once this Mac is in a mesh: which Macs are in it, and where to manage it.
+struct MeshStrip: View {
+    @Environment(Engine.self) private var engine
+    @State private var managing = false
+
+    var body: some View {
+        let macs = engine.status?.macs ?? []
+        HStack(spacing: 10) {
+            Image(systemName: "point.3.connected.trianglepath.dotted").foregroundStyle(.secondary)
+            Text("Your mesh").fontWeight(.medium)
+            if macs.count <= 1 {
+                Text("Only this Mac so far. On another Mac, open macmesh and click Join.")
+                    .foregroundStyle(.secondary).lineLimit(1)
+            } else {
+                ForEach(macs) { mac in
+                    HStack(spacing: 5) {
+                        Circle().fill(mac.state == "unavailable" ? Color.secondary.opacity(0.4) : mac.state == "paused" ? .orange : .green)
+                            .frame(width: 7, height: 7)
+                        Text(mac.thisMac ? "This Mac" : mac.name).lineLimit(1)
+                    }
+                    .help(Format.macState(mac))
+                }
+            }
+            Spacer(minLength: 8)
+            Button("Manage\u{2026}") { managing = true }
+                .help("Add a Mac, answer join requests, remove a Mac, or leave this mesh")
+        }
+        .font(.callout)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.035)))
+        .sheet(isPresented: $managing) { MeshSheet().environment(engine) }
     }
 }

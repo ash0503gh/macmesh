@@ -60,6 +60,7 @@ class Task:
         self.proc: subprocess.Popen | None = None
         self.outputs: dict = {}
         self.started = self.finished = 0.0
+        self.own = False  # from a job this Mac started: never paused, slowed or handed back for its owner
 
     def elapsed(self) -> float:
         return (self.finished or time.time()) - self.started if self.started else 0.0
@@ -147,10 +148,15 @@ class Worker:
             pass
         return self.fingerprints
 
-    def refusal(self, pw: dict) -> str:
-        """Why this Mac won't take new work right now, or "" if it will."""
+    def refusal(self, pw: dict, own: bool = False) -> str:
+        """Why this Mac won't take new work right now, or "" if it will. Work from this Mac's own jobs
+        is only refused while shutting down or with the disk nearly full: lending, the owner being busy
+        and battery limits are about other Macs' work."""
         if self.draining:
             return self.draining
+        if own:
+            free_gb = shutil.disk_usage(self.root).free / 2**30
+            return f"disk nearly full ({free_gb:.1f} GB free)" if free_gb < float(self.cfg.get("min_free_gb", 0)) else ""
         if not self.cfg.get("lend", True):
             return "not lending"
         if self.owner_busy:
@@ -165,6 +171,9 @@ class Worker:
         if pw["battery_pct"] is not None and pw["battery_pct"] < self.cfg["min_battery"]:
             return f"battery at {pw['battery_pct']}%"
         return ""
+
+    def is_own(self, spec: dict) -> bool:
+        return (spec.get("origin") or {}).get("node_id") == self.cfg["node_id"]
 
     def accepting(self, pw: dict) -> bool:
         return not self.refusal(pw)
@@ -300,13 +309,14 @@ class Worker:
             if tid in self.tasks:
                 raise FileExistsError("duplicate task_id")
             task = Task(spec, self.work)
+            task.own = self.is_own(spec)
             self.tasks[tid] = task
         threading.Thread(target=self._run, args=(task, [programs[a[0]] for a in steps]), daemon=True).start()
         return task
 
     def _run(self, task: Task, exes: list[str]) -> None:
         with self.slots:
-            while self.owner_busy and task.state == "queued":
+            while self.owner_busy and not task.own and task.state == "queued":
                 time.sleep(0.5)  # don't start new work while the owner needs the Mac
             with self.lock:
                 if task.state != "queued":
@@ -445,8 +455,9 @@ class Worker:
                 pass
 
     def pause_all(self) -> None:
+        """Pause other Macs' work (this Mac's own jobs keep running)."""
         with self.lock:
-            running = [t for t in self.tasks.values() if t.state == "running" and t.proc]
+            running = [t for t in self.tasks.values() if t.state == "running" and t.proc and not t.own]
             for t in running:
                 t.state = "paused"
         for t in running:
@@ -460,10 +471,11 @@ class Worker:
         for t in paused:
             self._signal(t, signal.SIGCONT)
 
-    def yield_all(self, reason: str) -> int:
-        """Give every unfinished task back to its coordinator, which runs it elsewhere."""
+    def yield_all(self, reason: str, others_only: bool = False) -> int:
+        """Give unfinished tasks back to their coordinator, which runs them elsewhere: all of them when
+        shutting down, only other Macs' when the owner needs this Mac."""
         with self.lock:
-            active = [t for t in self.tasks.values() if t.state in ACTIVE]
+            active = [t for t in self.tasks.values() if t.state in ACTIVE and not (others_only and t.own)]
             for t in active:
                 t.state, t.error = "yielded", reason
         for t in active:
@@ -477,7 +489,7 @@ class Worker:
         now = time.time() if now is None else now
         p = self.cfg["owner"]
         with self.lock:
-            live = [t for t in self.tasks.values() if t.state in ("running", "paused") and t.proc]
+            live = [t for t in self.tasks.values() if t.state in ("running", "paused") and t.proc and not t.own]
         reason = self.watch.busy({t.proc.pid for t in live}, any(t.state == "paused" for t in live))
         if not reason and live and self.governor.duty <= self.governor.FLOOR:
             reason = f"owner needs more than {1 - self.governor.limit + self.governor.FLOOR:.0%} of this Mac"
@@ -488,7 +500,7 @@ class Worker:
             self.owner_busy = reason
             self.pause_all()
             if now - self._busy_since >= float(p["yield_after"]):
-                self.yield_all(f"yielded: {reason}")
+                self.yield_all(f"yielded: {reason}", others_only=True)
         elif self.owner_busy:
             self._calm_since = self._calm_since or now
             if now - self._calm_since >= float(p["calm_seconds"]):
@@ -500,7 +512,7 @@ class Worker:
         """Every second while tasks run, measure the Mac and set how much of the time they may run."""
         while not self.stopped.wait(GOVERN_EVERY):
             with self.lock:
-                active = any(t.state in ("running", "paused") for t in self.tasks.values())
+                active = any(t.state in ("running", "paused") and not t.own for t in self.tasks.values())
             try:
                 self.governor.step() if active else self.governor.reset()
             except Exception:  # measuring must never take the worker down
@@ -526,7 +538,7 @@ class Worker:
     def _govern_signal(self, sig: int) -> None:
         with self.lock:
             for t in self.tasks.values():
-                if t.state == "running":
+                if t.state == "running" and not t.own:  # only other Macs' work makes room for the owner
                     self._signal(t, sig)
 
     def _owner_loop(self) -> None:
@@ -667,11 +679,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._reply(400, {"error": "say which program to install"})
         if self._parts() != ["tasks"]:
             return self._reply(404, {"error": "not found"})
-        refusal = self.worker.refusal(sysinfo.power())
+        try:
+            spec = json.loads(body)
+        except ValueError:
+            return self._reply(400, {"error": "not JSON"})
+        refusal = self.worker.refusal(sysinfo.power(), own=isinstance(spec, dict) and self.worker.is_own(spec))
         if refusal:
             return self._reply(503, {"error": f"not accepting work ({refusal})"})
         try:
-            task = self.worker.submit(json.loads(body))
+            task = self.worker.submit(spec)
         except PermissionError as e:
             return self._reply(403, {"error": str(e)})
         except FileExistsError as e:
