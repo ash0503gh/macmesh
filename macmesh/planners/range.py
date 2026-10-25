@@ -13,6 +13,7 @@ list per step, with placeholders:
 
 from __future__ import annotations
 
+import math
 import re
 from fractions import Fraction
 from pathlib import Path
@@ -41,7 +42,8 @@ def plan_range(tool: str, project: str, start: int, end: int, template: list[str
                chunk: int = 100, out_ext: str = "", merge: str = "auto",
                output: str = "", extra_inputs: dict | None = None, name: str = "",
                workdir: str = "", steps: list[list[str]] | None = None, fps: float | None = None,
-               vars: dict | None = None, fail_if: list[str] | None = None, media: list[str] | None = None) -> dict:
+               vars: dict | None = None, fail_if: list[str] | None = None, media: list[str] | None = None,
+               chunks: list[int] | None = None) -> dict:
     """out_ext like ".mov" means each chunk is a movie; empty means a frames directory.
 
     merge: "concat" (join movie chunks), "dirs" (pool frames into one folder),
@@ -76,8 +78,13 @@ def plan_range(tool: str, project: str, start: int, end: int, template: list[str
         merge = "concat" if out_ext else "dirs"
 
     tasks, outs = [], []
-    for index, s in enumerate(range(start, end + 1, chunk)):
-        e = min(s + chunk - 1, end)
+    starts, at = [], start
+    for size in (chunks or [chunk] * math.ceil((end - start + 1) / chunk)):
+        if at > end:
+            break
+        starts.append((at, min(at + int(size) - 1, end)))
+        at += int(size)
+    for index, (s, e) in enumerate(starts):
         tid = f"f{s:06d}-{e:06d}"
         dest = f"chunks/{tid}{out_ext}"
         outs.append(dest)
@@ -87,7 +94,7 @@ def plan_range(tool: str, project: str, start: int, end: int, template: list[str
             fill.update(start_s=_seconds(s, rate), end_s=_seconds(e + 1, rate), fps=repr(float(rate)))
         filled = [[tool] + [_fill(a, fill) for a in step] for step in steps]
         task = {"id": tid, "steps": filled, "inputs": dict(inputs), "outputs": {"result": dest},
-                "cost": float(e - s + 1)}
+                "cost": float(e - s + 1), "unit": "frames"}
         if fail_if:
             task["fail_if"] = list(fail_if)
         tasks.append(task)

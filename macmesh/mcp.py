@@ -49,7 +49,6 @@ JOB_ARGS = {
     "end": {"type": "integer", "description": "Last frame, inclusive (default the last)"},
     "vars": {"type": "object", "description": "Values the app needs, e.g. {\"comp\": \"Main\"}", "additionalProperties": S},
     "macs": {"type": "array", "items": S, "description": "Node ids to use (default all available)"},
-    "slots": {"type": "integer", "minimum": 1, "description": "Tasks this Mac runs at once (remembered)"},
     "preset": {**S, "description": "Video presets: h264, hevc, prores, h264-hw, hevc-hw (default hevc)"},
     "title": {**S, "description": "Name to show for the job"},
 }
@@ -63,8 +62,8 @@ PROMPT = """You're helping the user run a job with macmesh, which splits heavy w
    a. What to do: re-encode a video, render an app's project, or a batch with one of the programs the Macs have (one task per file).
    b. Which files: a project, a video, or a folder. If they describe a folder loosely, ask for it; then call list_folder to see what's in it and confirm the count ("612 MP3s").
    c. Where results go: default a new folder named after the job in their macmesh folder; ask only if they mentioned a place.
-   Don't ask about Macs or how many at once unless they brought it up: default to all available Macs and current settings. If they want more in parallel, suggest a number for this Mac (2-4 helps tools that leave the GPU partly idle; never more than its cores) as slots.
-3. Call preview_job with exactly what you'd start. Show a short summary: what runs on how many files or frames, which Macs (and any that would be asked to install a program), how many at once on this Mac, where results go. Ask: "Start it?"
+   Don't ask which Macs unless they brought it up: default to all available Macs. Never ask how many tasks run at once: each Mac works that out itself by measuring (it adds tasks while that makes it faster, within its owner's limit and its memory).
+3. Call preview_job with exactly what you'd start. Show a short summary: what runs on how many files or frames, which Macs (and any that would be asked to install a program), where results go. Ask: "Start it?"
 4. Only after a clear yes, call start_job with the same arguments and confirmed: true. If they change something, preview again.
 5. Then check get_job a few times (about every 30 s) and report progress briefly: done of total, time left, what each Mac is doing. Tell them it's also live on the Jobs page of the macmesh app.
 

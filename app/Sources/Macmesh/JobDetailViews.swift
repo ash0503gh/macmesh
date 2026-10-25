@@ -39,6 +39,9 @@ struct MacActivityCard: View {
                     Text("\(Int((duty * 100).rounded()))% speed \u{00B7}")
                         .help("Slowed to keep \(mac.name) under \(Int(((last?.limit ?? 0.9) * 100).rounded()))% for its owner")
                 }
+                if let workers = mac.workers, workers > 1 {
+                    Text("\(workers) at once \u{00B7}").help("\(mac.name) found it's fastest running \(workers) at once")
+                }
                 Text("\(mac.done) done")
             }
             .font(.caption.weight(.regular)).foregroundStyle(.secondary).monospacedDigit()

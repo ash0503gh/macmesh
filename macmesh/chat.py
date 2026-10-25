@@ -36,14 +36,13 @@ Reply with ONE JSON object and nothing else:
   "reply": "what you say to them",
   "ask_folder": "why you need a folder (e.g. 'Which folder has the songs?')" or null,
   "plan": null, or a plan as described below once you both agree on what to do,
-  "suggest": null or {"slots": {"<Mac name>": tasks at once}, "macs": ["<Mac name>", ...],
-                      "output_folder": "a new folder name or path for the results"}
+  "suggest": null or {"macs": ["<Mac name>", ...], "output_folder": "a new folder name or path for the results"}
 }
 A plan replaces nothing until they press Run, so propose one as soon as the job is clear, and
 change it when they ask. In a plan you may use every file in a picked folder without listing them:
 for planner "batch", "files" may contain {"folder": "<picked folder>", "extensions": [".mp3", ...],
-"recursive": true|false}. "suggest.slots" is how many tasks a Mac runs at once: tools that leave the
-GPU or cores partly idle gain from 2-4 at once on a 16 GB Mac; never more than its performance cores.
+"recursive": true|false}. Don't ask or talk about how many tasks run at once: each Mac works that
+out itself by measuring.
 """
 
 
@@ -189,7 +188,7 @@ def turn(chat: Chat, nodes: list[dict], cfg: dict, home: Path, workdir: str, age
         ask = answer.get("ask_folder")
         chat.ask_folder = str(ask) if ask else None
         if isinstance(answer.get("suggest"), dict):
-            chat.suggest = {k: v for k, v in answer["suggest"].items() if k in ("slots", "macs", "output_folder") and v}
+            chat.suggest = {k: v for k, v in answer["suggest"].items() if k in ("macs", "output_folder") and v}
         return
 
 

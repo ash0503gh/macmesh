@@ -48,6 +48,7 @@ from .planners import plan_app, plan_batch, plan_video
 from .planners.ai import MEDIA_EXT, plan_to_job, plan_with_agent, unsafe_reasons
 from .planners.app import probe_fps, probe_frames
 from .planners.range import NEEDS_FPS
+from .planners.sizes import shrinking, shrinking_frames
 from .client import NodeError
 from .scheduler import JobFailed, Scheduler
 
@@ -131,6 +132,7 @@ class Job:
                               "done": n.completed, "running": n.in_flight, "doing": doing,
                               "sent": n.sent, "received": n.received, "up_rate": round(up), "down_rate": round(down),
                               "load": list(self.load.get(node_id or n.client.address, [])),
+                              "workers": int(n.client.info.get("slots") or 1),
                               "installing": sorted(n.installing)})
             for t in tasks:  # one entry per chunk, in order: which Mac did it, or is doing it
                 where = t.done_by if t.state == "done" else next(iter(t.copies), "")
@@ -316,15 +318,18 @@ class Control:
                     raise ControlError(info.get("note") or "give the last frame (end)")
                 end = info["frames"] - 1
             end = int(end)
-            # At least three chunks per slot, so a slow Mac never holds up the end for long.
-            chunk = int(spec.get("chunk") or max(12, math.ceil((end - start + 1) / (3 * slots))))
+            # Big chunks first, shrinking toward the end, so the Macs finish together (sizes.py);
+            # a chunk size asked for explicitly is kept.
+            chunk = int(spec.get("chunk") or 12)
+            chunks = None if spec.get("chunk") else shrinking_frames(end - start + 1, slots, 12)
             job = plan_app(app, path, start, end, chunk=chunk, fps=spec.get("fps"), vars=spec.get("vars"),
-                           workdir=str(workdir), cfg=self.cfg, home=self.home)
+                           workdir=str(workdir), cfg=self.cfg, home=self.home, chunks=chunks)
         elif kind == "video":
             duration = media.summary(path)["duration"]
-            chunk = float(spec.get("chunk") or max(5.0, duration / (3 * slots)))
+            chunk = float(spec.get("chunk") or 5.0)
+            chunks = None if spec.get("chunk") else shrinking(duration, slots, 5.0)
             job = plan_video(path, f"{stem}.mp4", preset=spec.get("preset", "hevc"),
-                             vf=spec.get("vf", ""), chunk_seconds=chunk, workdir=str(workdir))
+                             vf=spec.get("vf", ""), chunk_seconds=chunk, workdir=str(workdir), chunks=chunks)
             job.pop("final")
         else:
             raise ControlError("kind is \"app\", \"video\" or \"batch\"")
@@ -337,8 +342,6 @@ class Control:
 
     def m_start(self, **spec) -> dict:
         planned = self.plan_job(spec)
-        if spec.get("slots"):
-            self.m_slots(int(spec["slots"]))
         final = str(Path(spec["output"]).expanduser()) if spec.get("output") else planned["final"]
         return self._start(planned["job"], spec, final).summary()
 
@@ -354,10 +357,10 @@ class Control:
         return {"name": job["name"], "tasks": len(job["tasks"]), "programs": programs,
                 "first_task": [" ".join(names.get(a, a) for a in step) for step in first["steps"]],
                 "output": str(Path(spec["output"]).expanduser()) if spec.get("output") else planned["final"],
-                "macs": [{"name": m["name"], "this_mac": m["this_mac"], "state": m["state"], "slots": m["slots"],
+                "macs": [{"name": m["name"], "this_mac": m["this_mac"], "state": m["state"], "at_once_now": m["slots"],
                           "missing": [p for p in programs if p not in m["programs"]]} for m in macs],
-                "this_mac_at_once": int(spec.get("slots") or self.cfg.get("slots", 1)),
-                "note": "Macs missing a program are asked to install it when the job starts; their owner decides."}
+                "note": "Macs missing a program are asked to install it when the job starts; their owner decides. "
+                        "Each Mac sets how many tasks it runs at once by measuring, so there's nothing to choose."}
 
     def m_submit(self, job: dict, final: str | None = None, kind: str | None = None, title: str | None = None,
                  options: dict | None = None) -> dict:
@@ -390,6 +393,7 @@ class Control:
                                          reference=toolinfo.fingerprints(self.cfg, self.home),
                                          origin={"node_id": self.cfg["node_id"], "name": self.cfg["node_name"]},
                                          installer=lambda client, prog: client.request_install(prog, self.cfg["node_name"]),
+                                         memory=self.home / "speeds.json",
                                          **record.spec.get("options", {}))
             if record.cancel_requested:  # cancelled while the Macs were being found
                 raise JobFailed("cancelled")
@@ -512,7 +516,8 @@ class Control:
                 "accepting": me.get("accepting"), "reason": me.get("refusal", ""),
                 "running": me.get("running", 0), "paused": me.get("paused", 0),
                 "owner_mode": self.cfg["owner"].get("mode"), "tls": bool(self.cfg.get("tls", True)),
-                "limit": float(self.cfg["owner"].get("limit", 0.9)), "slots": int(self.cfg.get("slots", 1)),
+                "limit": float(self.cfg["owner"].get("limit", 0.9)),
+                "slots": self.worker.workers() if self.worker else 1,
                 "duty": round(self.worker.governor.duty, 2) if self.worker else 1.0,
                 "holds_ca": pki.paths(self.home)["ca_key"].exists(), "invite": self._invite_state(),
                 "fingerprint": pki.own_fingerprint(self.home) if pki.ready(self.home) else "",
@@ -789,16 +794,13 @@ class Control:
         kept.replace(self.home / "chats" / kept.name)
         return self._chat(id).summary()
 
-    def m_chat_run(self, id: str, macs: list | None = None, output: str | None = None,
-                   slots: int | None = None) -> dict:
-        """Run the plan the conversation agreed on. `slots` sets how many tasks this Mac runs at once."""
+    def m_chat_run(self, id: str, macs: list | None = None, output: str | None = None) -> dict:
+        """Run the plan the conversation agreed on."""
         c = self._chat(id)
         if not c.plan:
             raise ControlError("there's no plan to run yet")
         out_root = Path(self.cfg.get("output_dir", "~/Movies/macmesh")).expanduser()
         name = re.sub(r"[^A-Za-z0-9 _.-]+", "", (c.card or {}).get("name") or c.title)[:40].strip() or "job"
-        if slots:
-            self.m_slots(int(slots))
         workdir = out_root / ".work" / f"{name}-{uuid.uuid4().hex[:6]}"
         try:
             job = jobspec.validate(plan_to_job(c.plan, c.folders + c.paths, self.cfg, workdir=str(workdir), home=self.home))
@@ -810,19 +812,6 @@ class Control:
         c.add("note", f"Started \u201c{name}\u201d: {len(job['tasks'])} tasks. Follow it on the Jobs page.")
         c.save()
         return record.summary()
-
-    def m_slots(self, n: int) -> dict:
-        """How many tasks this Mac runs at once (remembered)."""
-        n = int(n)
-        if not 1 <= n <= max(1, (os.cpu_count() or 1)):
-            raise ControlError(f"slots is between 1 and {os.cpu_count()}")
-        self.cfg["slots"] = n
-        if self.worker:
-            self.worker.cfg["slots"] = n  # its slot gate reads this live
-        saved = config.load()
-        saved["slots"] = n
-        config.save(saved)
-        return self.m_status()
 
     def m_run_plan(self, id: str) -> dict:
         task = self._ai_task(id)
@@ -861,7 +850,7 @@ class Control:
 
     # ---- dispatch --------------------------------------------------------
     METHODS = {"status", "macs", "apps", "inspect", "start", "submit", "jobs", "job", "cancel", "lend", "owner", "invite", "approve",
-               "install", "revoke", "stop", "preview", "folder", "setup_agents", "chat_start", "chat_send", "chat", "chats", "chat_run", "chat_delete", "chat_restore", "slots",
+               "install", "revoke", "stop", "preview", "folder", "setup_agents", "chat_start", "chat_send", "chat", "chats", "chat_run", "chat_delete", "chat_restore",
                "ai", "set_ai", "plan", "run_plan", "teach", "explain", "ai_task"}
 
     def call(self, method: str, params: dict):

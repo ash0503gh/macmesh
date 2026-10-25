@@ -34,7 +34,7 @@ enum Snapshots {
                              macs: [.init(nodeId: "a", name: "This Mac", done: 2, running: 2,
                                           doing: [.init(label: "Firestone.mp3", phase: "running", since: 52, bytes: 0, total: 0),
                                                   .init(label: "Wiggle.mp3", phase: "queued", since: 40, bytes: 0, total: 0)],
-                                          sent: 0, received: 61_000_000, upRate: 0, downRate: 0, load: load(31, 64)),
+                                          sent: 0, received: 61_000_000, upRate: 0, downRate: 0, load: load(31, 64), workers: 3),
                                     .init(nodeId: "b", name: "Leo\u{2019}s MacBook Air", done: 4, running: 2,
                                           doing: [.init(label: "That Bass.mp3", phase: "running", since: 21, bytes: 0, total: 0),
                                                   .init(label: "We Own It.mp3", phase: "uploading", since: 2, bytes: 5_400_000, total: 9_100_000)],
@@ -65,7 +65,7 @@ enum Snapshots {
         card: .init(explanation: "One task per song; Macs take the next song as they free up.", planner: "batch", tasks: 612,
                     programs: ["demucs-stem"], example: ["demucs-stem 01 Intro.mp3 01 Intro.zip"], name: "Party set stems",
                     reasons: [], needsInstall: [:]),
-        suggest: .init(slots: ["This Mac": 4], macs: nil, outputFolder: "Party set stems"), jobIds: [])
+        suggest: .init(macs: nil, outputFolder: "Party set stems"), jobIds: [])
     static let sampleRecent: [ChatListItem] = [
         .init(id: "c1", title: "Split the 600 songs into stems", created: Date().timeIntervalSince1970 - 600,
               updated: Date().timeIntervalSince1970 - 300, jobIds: [], hasPlan: true),

@@ -5,6 +5,14 @@ less often, and a Mac that disappears (lid closed, Wi-Fi dropped) costs one
 chunk, which is re-queued elsewhere. At the tail of the job, idle Macs make
 duplicate copies of straggling chunks (first result wins).
 
+Order and placement: the longest chunk left goes first. Once everything left
+could start at once, a chunk only goes to a Mac where it would finish about as
+soon as anywhere else, counting its upload; a slow or far Mac waits rather
+than hold up the end. Each Mac's measured speed and upload rate per program are
+remembered between jobs (speeds.json), so this works from the first chunk.
+How many chunks each Mac runs at once is the Mac's own measurement
+(tuning.py), read from every status reply.
+
 A Mac counts as gone after HEARTBEAT_MISSES status polls in a row go
 unanswered (a couple of seconds), and a task it hands back because its owner
 needs it ("yielded") goes straight back in the queue. Tasks only go to Macs
@@ -13,6 +21,7 @@ whose build of the program matches the coordinator's (see toolinfo).
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import statistics
@@ -32,6 +41,9 @@ NODE_COOLDOWN = 10.0
 INSTALL_RECHECK = 5.0  # how often to see whether a Mac asked to install something has it now
 BUSY_COOLDOWN = 30.0  # a Mac that refused work (owner busy, battery, disk) is asked again after this
 MAX_NODE_ERRORS = 6  # per task: give up if Macs keep vanishing
+FINISH_SLACK = 1.15  # near the end, a Mac takes a chunk if it finishes within this of the best Mac
+LOCAL_BPS = 1e9      # uploading to this Mac's own worker: effectively free
+DEFAULT_BPS = 20e6   # another Mac's upload rate until measured (Wi-Fi)
 
 
 class JobFailed(Exception):
@@ -75,6 +87,9 @@ class NodeState:
     sent: int = 0        # bytes uploaded to this Mac for the job
     received: int = 0    # bytes of results fetched back
     transfers: list = field(default_factory=list)  # (time, bytes up, bytes down), recent, for speeds
+    upload_bps: list = field(default_factory=list)  # measured upload rates, bytes per second
+    sent_paths: set = field(default_factory=set)    # local inputs already uploaded to this Mac
+    local: bool = False                             # this Mac's own worker
 
     def moved(self, up: int = 0, down: int = 0) -> None:
         now = time.time()
@@ -107,7 +122,7 @@ class Scheduler:
     def __init__(self, job: dict, clients: list[NodeClient], log=print,
                  max_attempts: int = 3, speculate: bool = True, reference: dict | None = None,
                  match: str = "version", keep_blobs: bool = False, origin: dict | None = None,
-                 installer=None):
+                 installer=None, memory: Path | None = None):
         self.job = job
         self.job_id = uuid.uuid4().hex[:8]
         self.workdir = Path(job["workdir"]).expanduser().resolve()
@@ -132,6 +147,19 @@ class Scheduler:
         # installer(client, program) -> {"state"}: asks a Mac that lacks a program to set it up.
         self.installer = installer
         self._install_checked = 0.0
+        # Remembered speeds (speeds.json): per Mac, program and cost unit.
+        self.memory = memory
+        programs = sorted({step[0] for t in self.tasks for step in (t.spec.get("steps") or [t.spec.get("argv") or ["?"]])})
+        self.key = "|".join(programs) + "|" + str(job["tasks"][0].get("unit", "")) if job["tasks"] else ""
+        mine = (origin or {}).get("node_id")
+        known = self._recall()
+        for n in self.nodes:
+            n.local = bool(mine) and n.client.info.get("node_id") == mine
+            seen = known.get(f"{n.client.info.get('node_id')}|{self.key}", {})
+            if seen.get("speed"):
+                n.speeds.append(float(seen["speed"]))  # a starting point; real timings soon outweigh it
+            if seen.get("upload_bps"):
+                n.upload_bps.append(float(seen["upload_bps"]))
         self._waiting_said = 0.0
 
     # ---- public -------------------------------------------------------
@@ -157,6 +185,7 @@ class Scheduler:
                     self._say_if_stuck()
                     self.cond.wait(timeout=1.0)
         finally:
+            self._remember()
             self._cancel_all()
             if not self.keep_blobs:
                 self._forget_blobs()
@@ -350,6 +379,64 @@ class Scheduler:
                     self.log(f"  ↻ {task.id}: duplicating on {node.client.name} (straggler)")
                     self._start(task, node)
 
+    # ---- remembered speeds -----------------------------------------------
+    def _recall(self) -> dict:
+        try:
+            return json.loads(self.memory.read_text()) if self.memory else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _remember(self) -> None:
+        if not self.memory or not self.key:
+            return
+        known = self._recall()
+        for n in self.nodes:
+            if len(n.speeds) < 2 and not n.upload_bps:
+                continue  # nothing measured this time
+            entry = known.setdefault(f"{n.client.info.get('node_id')}|{self.key}", {})
+            if len(n.speeds) >= 2:
+                entry["speed"] = round(statistics.median(n.speeds[-8:]), 6)
+            if n.upload_bps:
+                entry["upload_bps"] = round(statistics.median(n.upload_bps[-8:]))
+            entry["name"], entry["at"] = n.client.name, round(time.time())
+        try:
+            self.memory.write_text(json.dumps(known, indent=1))
+        except OSError:
+            pass
+
+    # ---- where a chunk would finish -----------------------------------------
+    def _bps(self, node: NodeState) -> float:
+        if node.local:
+            return LOCAL_BPS
+        return statistics.median(node.upload_bps[-8:]) if node.upload_bps else DEFAULT_BPS
+
+    def _upload_s(self, task: TaskState, node: NodeState) -> float:
+        size = 0
+        for local in task.spec["inputs"].values():
+            if local in node.sent_paths:
+                continue
+            try:
+                size += Path(local).stat().st_size if Path(local).is_file() else 0
+            except OSError:
+                pass
+        return size / self._bps(node)
+
+    def _free_at(self, node: NodeState, now: float) -> float:
+        """When this Mac could start one more chunk: now, or when its first running chunk ends."""
+        mine = [t for t in self.tasks if node.client.address in t.copies]
+        if len(mine) < max(1, int(node.client.info.get("slots", 1))):
+            return now
+        speed = self._speed(node)
+        return min(t.copies[node.client.address] + t.spec["cost"] / speed for t in mine)
+
+    def _finish(self, task: TaskState, node: NodeState, now: float) -> float:
+        return self._free_at(node, now) + self._upload_s(task, node) + task.spec["cost"] / self._speed(node)
+
+    def _end_phase(self, pending: list) -> bool:
+        """Everything left could start now: from here, where a chunk runs decides when the job ends."""
+        room = sum(max(1, int(n.client.info.get("slots", 1))) for n in self.nodes if not n.cooldown_until)
+        return len(pending) <= room
+
     def _pick(self, node: NodeState) -> TaskState | None:
         pending = [t for t in self.tasks if t.state == "pending"
                    and node.client.address not in t.excluded and node.can_run(t.spec)]
@@ -364,11 +451,20 @@ class Scheduler:
                    or [t for t in pending if not untried_elsewhere(t)])
         if not pending:
             return None
-        # Strong Macs take the biggest chunks, weaker ones the smallest.
-        speeds = [self._speed(n) for n in self.nodes]
-        strong = self._speed(node) >= statistics.median(speeds)
-        pending.sort(key=lambda t: t.spec["cost"], reverse=strong)
-        return pending[0]
+        # The longest chunk first, so the end of the job is made of short ones.
+        pending.sort(key=lambda t: t.spec["cost"], reverse=True)
+        everything = [t for t in self.tasks if t.state == "pending"]
+        if not self._end_phase(everything):
+            return pending[0]
+        now = time.time()
+        for t in pending:
+            here = self._finish(t, node, now)
+            elsewhere = min((self._finish(t, n, now) for n in self.nodes
+                             if n is not node and not n.cooldown_until and n.can_run(t.spec)
+                             and n.client.address not in t.excluded), default=float("inf"))
+            if here <= elsewhere * FINISH_SLACK + 2:
+                return t
+        return None  # another Mac would finish what's left sooner: wait (or copy a straggler)
 
     def _speed(self, node: NodeState) -> float:
         """Measured cost/second, or a score-based estimate until measured."""
@@ -446,6 +542,7 @@ class Scheduler:
                 sha, kind, path = blobs[name]
                 inputs[name] = {"blob": sha, "kind": kind, "filename": Path(local).name}
                 self._ensure_uploaded(c, sha, path, node, step)
+                node.sent_paths.add(local)
             upload_s = time.time() - t0
             self._phase(task, c, "queued")
             c.submit({
@@ -454,6 +551,7 @@ class Scheduler:
                 "inputs": inputs,
                 "outputs": {k: Path(v).name for k, v in task.spec["outputs"].items()},
                 "timeout": task.spec.get("timeout"),
+                "cost": task.spec["cost"],
             })
             submitted = True
             self.log(f"  → {task.id} on {c.name}" + (f" (upload {upload_s:.1f}s)" if upload_s > 0.5 else ""))
@@ -465,6 +563,8 @@ class Scheduler:
                 try:
                     st = c.status(remote_id)
                     misses = 0
+                    if st.get("slots"):
+                        c.info["slots"] = int(st["slots"])  # the Mac tunes this as it goes
                 except NodeError:
                     misses += 1  # one slow answer on busy Wi-Fi isn't a dead Mac; two in a row is
                     if misses >= HEARTBEAT_MISSES:
@@ -536,7 +636,11 @@ class Scheduler:
             lock = self.upload_locks.setdefault((c.address, sha), threading.Lock())
         with lock:
             if not c.has_blob(sha):
+                t0 = time.time()
                 c.put_blob(sha, path, progress=sent)
+                size, took = path.stat().st_size, time.time() - t0
+                if node and size > 1_000_000 and took > 0.05:
+                    node.upload_bps.append(size / took)
             elif step:
                 step["bytes"] += path.stat().st_size  # already there from an earlier chunk
 

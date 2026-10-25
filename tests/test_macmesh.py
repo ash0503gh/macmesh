@@ -54,7 +54,8 @@ class Node:
         self.home = root / name
         os.environ["MACMESH_HOME"] = str(self.home)
         cfg = config.defaults()
-        cfg.update(node_name=name, token=TOKEN, slots=slots, port=0, tools=tools, **extra)
+        cfg.update(node_name=name, token=TOKEN, slots=slots, port=0, tools=tools, auto_workers=False)
+        cfg.update(extra)
         cfg["owner"].update(owner or {"mode": "off"})
         self.worker = Worker(cfg, home=self.home, owner_sample=owner_sample)
         self.server = make_server(self.worker, "127.0.0.1", 0, pki.context(True, self.home) if tls else None)
@@ -328,6 +329,121 @@ class Relay:
         self.sock.close()
         for s in self.open:
             s.close()
+
+
+class FasterRulesTests(unittest.TestCase):
+    """Workers found by measuring, longest first, finishing soonest near the end, remembered speeds,
+    and chunks that shrink toward the end."""
+
+    def test_chunks_shrink_toward_the_end(self):
+        from macmesh.planners.sizes import shrinking, shrinking_frames
+        sizes = shrinking(320.0, 5, 5.0)
+        self.assertAlmostEqual(sum(sizes), 320.0)
+        self.assertEqual(sizes, sorted(sizes, reverse=True))
+        self.assertGreater(sizes[0], 4 * sizes[-1])
+        self.assertGreaterEqual(min(sizes), 2.5)
+        frames = shrinking_frames(1000, 4, 12)
+        self.assertEqual(sum(frames), 1000)
+        self.assertGreater(frames[0], frames[-1])
+
+    def test_workers_climb_while_it_helps_and_stop_when_it_doesnt(self):
+        from macmesh import tuning
+        home = Path(tempfile.mkdtemp())
+        rate = {1: 1.0, 2: 1.9, 3: 2.6, 4: 2.65, 5: 2.5}  # gains stop after 3 at once
+        mem = {"free": 60}
+        t = tuning.AutoWorkers(home / "tuning.json", max_n=6, memory=lambda: mem["free"])
+        t.started("demucs-stem")
+        self.assertEqual(t.n, tuning.START)
+        now = 1000.0
+        for _ in range(400):  # 800 s of work, a task finishing every tick
+            now += 2
+            t.finished(rate[t.n] * 2)
+            t.step(running=t.n, waiting=1, now=now)
+        self.assertEqual(t.n, 3, t.note)
+        self.assertEqual(json.loads((home / "tuning.json").read_text())["demucs-stem"], 3)
+        mem["free"] = 10  # memory runs short: drop one at once
+        t.step(running=t.n, waiting=1, now=now + 2)
+        self.assertEqual(t.n, 2)
+        again = tuning.AutoWorkers(home / "tuning.json", max_n=6, memory=lambda: 60)
+        again.started("demucs-stem")
+        self.assertIn(again.n, (2, 3))  # the next job starts from what was learned
+        idle = tuning.AutoWorkers(None, max_n=6, memory=lambda: 60)
+        idle.started("x")
+        for _ in range(100):  # nothing queued: a quiet Mac proves nothing, so nothing changes
+            now += 2
+            idle.finished(1.0)
+            idle.step(running=1, waiting=0, now=now)
+        self.assertEqual(idle.n, tuning.START)
+        shutil.rmtree(home, ignore_errors=True)
+
+    def test_owner_limit_stops_workers_growing(self):
+        from macmesh import tuning
+        t = tuning.AutoWorkers(None, max_n=6, memory=lambda: 60, at_limit=lambda: True)
+        t.started("x")
+        now = 0.0
+        for _ in range(100):
+            now += 2
+            t.finished(4.0)
+            t.step(running=t.n, waiting=1, now=now)
+        self.assertEqual(t.n, 1)
+
+    def scheduler(self, costs, tmp):
+        class Fake:
+            def __init__(self, name, node_id):
+                self.address, self.name, self.info = f"{name}:1", name, {"node_id": node_id, "slots": 1, "programs": ["x"]}
+        files = []
+        for i, cost in enumerate(costs):
+            f = tmp / f"in{i}.bin"
+            f.write_bytes(b"x" * 4_000_000)
+            files.append(f)
+        job = {"name": "j", "workdir": str(tmp / "w"), "merge": [],
+               "tasks": [{"id": f"t{i}", "steps": [["x"]], "inputs": {"file": str(f)}, "outputs": {},
+                          "cost": float(c), "unit": "s"} for i, (c, f) in enumerate(zip(costs, files))]}
+        return Scheduler(job, [Fake("fast", "f"), Fake("slow", "s")], log=lambda m: None,
+                         origin={"node_id": "f"}, memory=tmp / "speeds.json")
+
+    def test_longest_first_and_near_the_end_only_where_it_finishes_soonest(self):
+        tmp = Path(tempfile.mkdtemp())
+        s = self.scheduler([10, 100, 50], tmp)
+        fast, slow = s.nodes
+        fast.speeds, slow.speeds = [10.0], [1.0]
+        slow.upload_bps = [1e6]  # 4 MB takes 4 s to reach it
+        self.assertTrue(fast.local and not slow.local)
+        self.assertEqual(s._pick(fast).spec["cost"], 100)  # longest first
+        # Near the end the slow Mac won't take the 100 s chunk (100 s there vs 10 s on the fast Mac)...
+        s.tasks[1].state = "running"
+        s.tasks[1].copies[fast.client.address] = time.time()
+        picked = s._pick(slow)
+        self.assertNotEqual(picked and picked.spec["cost"], 100)
+        # ...and with plenty of work left it just takes the longest, so nothing sits idle.
+        busy = self.scheduler([10] * 20 + [100], tmp)
+        busy.nodes[0].speeds, busy.nodes[1].speeds = [10.0], [1.0]
+        self.assertEqual(busy._pick(busy.nodes[1]).spec["cost"], 100)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_speeds_are_remembered_between_jobs(self):
+        tmp = Path(tempfile.mkdtemp())
+        s = self.scheduler([10, 20], tmp)
+        s.nodes[0].speeds = [9.0, 11.0]
+        s.nodes[1].speeds, s.nodes[1].upload_bps = [2.0, 2.0], [5e6]
+        s._remember()
+        again = self.scheduler([10, 20], tmp)
+        self.assertEqual(again.nodes[0].speeds, [10.0])
+        self.assertEqual((again.nodes[1].speeds, again.nodes[1].upload_bps), ([2.0], [5e6]))
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not installed")
+    def test_songs_cost_their_length_not_their_size(self):
+        tmp = Path(tempfile.mkdtemp())
+        for name, secs in (("short.mp3", 3), ("long.mp3", 12)):
+            subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"sine=duration={secs}", "-b:a", "320k" if secs < 5 else "32k",
+                            str(tmp / name)], check=True)
+        job = plan_batch([str(tmp / "short.mp3"), str(tmp / "long.mp3")], ["x", "{in:file}", "{out:result}"], ".zip",
+                         workdir=str(tmp / "w"))
+        costs = {Path(t["inputs"]["file"]).name: t["cost"] for t in job["tasks"]}
+        self.assertGreater(costs["long.mp3"], 3 * costs["short.mp3"])  # though long.mp3 is the smaller file
+        self.assertEqual({t["unit"] for t in job["tasks"]}, {"media-seconds"})
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 class OwnWorkTests(MeshCase):
@@ -1318,14 +1434,13 @@ class AITests(ControlTests):
         self.assertEqual(c["state"], "waiting", c)
         self.assertEqual((c["card"]["tasks"], c["card"]["programs"]), (2, ["copier"]))  # .mp3 only
         self.assertEqual(c["card"]["example"], ["copier a.mp3 a.mp3"])  # the first task, with its real file
-        self.assertEqual(c["suggest"]["slots"], {"pro": 2})
+        self.assertNotIn("slots", c["suggest"])  # how many at once is never the AI's (or anyone's) call
         prompt = (self.agent_dir / "prompt-2.txt").read_text()
         self.assertIn('"a.mp3"', prompt)          # it saw the folder's file names...
         self.assertNotIn("notes.txt\n", prompt.split("FOLDERS")[0])
         self.assertIn("THEM: Split all my songs", prompt)  # ...and the conversation so far
         out = self.tmp / "Songs done"
-        job = self.client.call("chat_run", id=c["id"], output=str(out), slots=2)
-        self.assertEqual(self.ctl.cfg["slots"], 2)
+        job = self.client.call("chat_run", id=c["id"], output=str(out))
         job = self.wait_job(lambda j: self.client.call("job", id=j), job["id"])
         self.assertEqual(job["state"], "done", job)
         self.assertEqual(job["chat"], c["id"])

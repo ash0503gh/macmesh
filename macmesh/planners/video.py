@@ -21,7 +21,9 @@ ENCODE_PRESETS = {
 
 
 def plan_video(src: str, output: str, preset: str = "h264", vargs: str = "", vf: str = "",
-               chunk_seconds: float = 20.0, workdir: str = "", name: str = "") -> dict:
+               chunk_seconds: float = 20.0, workdir: str = "", name: str = "",
+               chunks: list[float] | None = None) -> dict:
+    """`chunks`: segment lengths in seconds (shrinking toward the end), instead of `chunk_seconds`."""
     srcp = Path(src).expanduser().resolve()
     meta = media.summary(srcp)
     if not meta["video"]:
@@ -35,9 +37,17 @@ def plan_video(src: str, output: str, preset: str = "h264", vargs: str = "", vf:
 
     # Lossless stream-copy split; each piece starts on a keyframe so it can be
     # decoded on its own. Only these pieces travel over Wi-Fi, not the whole file.
+    if chunks:
+        cuts, at = [], 0.0
+        for length in chunks[:-1]:
+            at += length
+            cuts.append(f"{at:.3f}")
+        split = ["-segment_times", ",".join(cuts)] if cuts else ["-segment_time", str(meta["duration"] + 1)]
+    else:
+        split = ["-segment_time", str(chunk_seconds)]
     subprocess.run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(srcp),
-        "-map", "0:v:0", "-c", "copy", "-f", "segment", "-segment_time", str(chunk_seconds),
+        "-map", "0:v:0", "-c", "copy", "-f", "segment", *split,
         "-reset_timestamps", "1", str(segdir / "seg%05d.mkv"),
     ], check=True)
     segments = sorted(segdir.glob("seg*.mkv"))
@@ -57,6 +67,7 @@ def plan_video(src: str, output: str, preset: str = "h264", vargs: str = "", vf:
             "inputs": {"src": str(seg)},
             "outputs": {"video": dest},
             "cost": max(media.summary(seg)["duration"], 0.1),
+            "unit": "video-seconds",
         })
     return {
         "name": name,

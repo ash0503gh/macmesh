@@ -19,7 +19,6 @@ struct ChatPlanView: View {
     // the plan card's choices
     @State private var outputName = ""
     @State private var outputParent = ""
-    @State private var slotsHere = 1
     @State private var cardFor: String?
 
     var macs: [Mac] { engine.status?.macs ?? [] }
@@ -199,11 +198,6 @@ struct ChatPlanView: View {
                     MacChecks(macs: macs, turnedOff: $turnedOff)
                 }
                 GridRow {
-                    Text("At once").foregroundStyle(.secondary)
-                    Stepper("This Mac: \(slotsHere)", value: $slotsHere, in: 1...max(1, ProcessInfo.processInfo.activeProcessorCount))
-                        .help("How many tasks this Mac runs at the same time")
-                }
-                GridRow {
                     Text("Results").foregroundStyle(.secondary)
                     HStack(spacing: 6) {
                         TextField("Folder name", text: $outputName).textFieldStyle(.roundedBorder).frame(maxWidth: 200)
@@ -246,9 +240,6 @@ struct ChatPlanView: View {
             outputParent = root
             outputName = suggested
         }
-        let here = engine.status?.name ?? ""
-        slotsHere = chat.suggest?.slots?.first(where: { $0.key == here || $0.key == "This Mac" })?.value
-            ?? engine.status?.slots ?? 1
         if let chosen = chat.suggest?.macs, !chosen.isEmpty {
             turnedOff = Set(macs.filter { mac in !chosen.contains { $0 == mac.name || ($0 == "This Mac" && mac.thisMac) } }.map(\.nodeId))
         }
@@ -345,8 +336,7 @@ struct ChatPlanView: View {
     private func run(_ chat: ChatInfo) async {
         error = nil
         do {
-            started = try await engine.chatRun(chat.id, macs: usable.map(\.nodeId), output: output,
-                                               slots: slotsHere == engine.status?.slots ? nil : slotsHere)
+            started = try await engine.chatRun(chat.id, macs: usable.map(\.nodeId), output: output)
             self.chat = try await engine.chat(chat.id)
             await reloadList()
         } catch {

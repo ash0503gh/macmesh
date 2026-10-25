@@ -121,6 +121,7 @@ struct Job: Decodable, Equatable, Identifiable {
         var upRate: Double?
         var downRate: Double?
         var load: [LoadPoint]?
+        var workers: Int?      // tasks it runs at once right now (it tunes this itself)
         var installing: [String]?
     }
 
@@ -326,7 +327,6 @@ struct ChatInfo: Decodable, Equatable, Identifiable {
 
     /// The AI's optional suggestions; the plan card starts from them.
     struct Suggest: Decodable, Equatable {
-        var slots: [String: Int]?
         var macs: [String]?
         var outputFolder: String?
     }

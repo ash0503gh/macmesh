@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from . import __version__, config, install, owner, pki, sandbox, sysinfo, toolinfo, wire
+from . import __version__, config, install, owner, pki, sandbox, sysinfo, toolinfo, tuning, wire
 
 PLACEHOLDER = re.compile(r"\{(in|out):([A-Za-z0-9_.-]+)\}")
 SHA = re.compile(r"^[0-9a-f]{64}$")
@@ -93,7 +93,10 @@ class Worker:
         self.work.mkdir(parents=True)
         self.tasks: dict[str, Task] = {}
         self.lock = threading.Lock()
-        self.slots = SlotGate(lambda: int(self.cfg["slots"]))
+        # How many tasks run at once is measured, not set (tuning.py); "auto_workers": false pins
+        # cfg["slots"] instead (tests rely on a fixed number).
+        self.tuner = tuning.AutoWorkers(self.root / "tuning.json", at_limit=lambda: self.governor.duty < 0.9)
+        self.slots = SlotGate(self.workers)
         self.extract_lock = threading.Lock()
         self.fingerprints = toolinfo.fingerprints(cfg, self.root)
         self.sandboxed = bool(cfg.get("sandbox")) and sandbox.available()
@@ -104,6 +107,7 @@ class Worker:
         self.installer = install.Installer(self.root, have=lambda name: name in self.programs())
         self.load = {"at": 0.0, "gpu": None, "jobs": {}, "cores": os.cpu_count() or 1}
         threading.Thread(target=self._load_loop, daemon=True).start()
+        threading.Thread(target=self._tune_loop, daemon=True).start()
         self._busy_since = 0.0
         self._calm_since: float | None = None
         self.collect_garbage()
@@ -126,7 +130,8 @@ class Worker:
             "version": __version__,
             "node_id": self.cfg["node_id"],
             "node_name": self.cfg["node_name"],
-            "slots": int(self.cfg["slots"]),
+            "slots": self.workers(),
+            "workers_note": self.tuner.note if self.auto else "fixed",
             "running": sum(t.state == "running" for t in active),
             "paused": sum(t.state == "paused" for t in active),
             "queued": sum(t.state == "queued" for t in active),
@@ -171,6 +176,25 @@ class Worker:
         if pw["battery_pct"] is not None and pw["battery_pct"] < self.cfg["min_battery"]:
             return f"battery at {pw['battery_pct']}%"
         return ""
+
+    @property
+    def auto(self) -> bool:
+        return self.cfg.get("auto_workers", True)
+
+    def workers(self) -> int:
+        """Tasks this Mac runs at once right now."""
+        return self.tuner.n if self.auto else int(self.cfg["slots"])
+
+    def _tune_loop(self) -> None:
+        """Every 2 s: let the tuner see how full this Mac is, and change how many run at once."""
+        while not self.stopped.wait(2.0):
+            with self.lock:
+                running = sum(t.state == "running" for t in self.tasks.values())
+                waiting = sum(t.state == "queued" for t in self.tasks.values())
+            try:
+                self.tuner.step(running, waiting)
+            except Exception:  # measuring must never take the worker down
+                pass
 
     def is_own(self, spec: dict) -> bool:
         return (spec.get("origin") or {}).get("node_id") == self.cfg["node_id"]
@@ -311,6 +335,7 @@ class Worker:
             task = Task(spec, self.work)
             task.own = self.is_own(spec)
             self.tasks[tid] = task
+        self.tuner.started(steps[0][0])
         threading.Thread(target=self._run, args=(task, [programs[a[0]] for a in steps]), daemon=True).start()
         return task
 
@@ -334,6 +359,7 @@ class Worker:
                 else:
                     self._collect(task)
                     task.state = "done"
+                    self.tuner.finished(float(task.spec.get("cost") or 1.0))
             except Exception as e:  # report anything to the coordinator
                 if task.state not in ("cancelled", "yielded"):
                     task.state, task.error = "failed", f"{type(e).__name__}: {e}"
@@ -658,7 +684,7 @@ class Handler(BaseHTTPRequestHandler):
             if not task:
                 return self._reply(404, {"error": "no such task"})
             if len(p) == 2:
-                return self._reply(200, task.status())
+                return self._reply(200, {**task.status(), "slots": self.worker.workers()})
             if len(p) == 4 and p[2] == "out" and p[3] in task.outputs:
                 return self._send_file(Path(task.outputs[p[3]]["served"]))
         self._reply(404, {"error": "not found"})

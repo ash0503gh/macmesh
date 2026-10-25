@@ -61,7 +61,7 @@ def probe_frames(profile: dict, project: str, vars: dict, cfg: dict, fps: float 
 
 def plan_app(app: str, project: str, start: int, end: int, chunk: int = 100, fps: float | None = None,
              vars: dict | None = None, output: str = "", workdir: str = "", name: str = "",
-             cfg: dict | None = None, home: Path | None = None) -> dict:
+             cfg: dict | None = None, home: Path | None = None, chunks: list[int] | None = None) -> dict:
     cfg = cfg or config.load()
     known = profiles.load(home)
     if app not in known:
@@ -76,4 +76,4 @@ def plan_app(app: str, project: str, start: int, end: int, chunk: int = 100, fps
     media = mediarefs.scan(project) if prof.get("media") == "scan" else []
     return plan_range(app, project, start, end, steps=rng["steps"], chunk=chunk, out_ext=rng.get("out_ext", ""),
                       merge=rng.get("merge", "auto"), output=output, name=name, workdir=workdir, fps=fps,
-                      vars=vars, fail_if=prof.get("fail_if"), media=media)
+                      vars=vars, fail_if=prof.get("fail_if"), media=media, chunks=chunks)

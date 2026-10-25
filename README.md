@@ -112,10 +112,10 @@ the MCP server's `macmesh` prompt, for clients that offer MCP prompts.
 - **Look:** `get_status`, `list_apps`, `inspect_file`, and `list_folder` (counts by type, size and
   names, never contents).
 - **Run:**
-  - `preview_job` shows what would run, on which Macs, how many at once here and where results go,
+  - `preview_job` shows what would run, on which Macs and where results go,
     without starting anything.
   - `start_job` takes the same arguments: one project or video, or `files` or a `folder` (with
-    `extensions`) for a batch, plus `output` and `slots`. It refuses to start unless called with
+    `extensions`) for a batch, plus `output`. It refuses to start unless called with
     `confirmed: true`, which its description says to set only after the user's yes.
 - **Follow:** `get_job` (what each Mac is doing, CPU and GPU load, events), `list_jobs`, `cancel_job`.
 - **Settings:** `set_lending` (on or off, lending mode, how much of the Mac may be used),
@@ -269,7 +269,7 @@ the next section). The AI works on the parts that have no rule yet:
 - **Talking it through:** *Describe it* is a conversation. The AI asks for what it needs, one
   question at a time. When it needs files, a *Choose folder…* button appears, and it then sees the
   names, sizes and types in that folder, never the files' contents. When you agree, it proposes the
-  job as a card: what runs, on which Macs, how many at once on this Mac, and where the results go.
+  job as a card: what runs, on which Macs, and where the results go.
   You can change any of these, and nothing starts until you click *Run*. A plan may only use files
   in folders you picked. Conversations are kept in `~/.macmesh/chats/`; a job planned this way has
   *Chat* in its history row to reopen, change and run it again.
@@ -310,11 +310,28 @@ the next section). The AI works on the parts that have no rule yet:
 ## How the scheduling handles real Macs
 
 - **Fanless MacBook Air:** no fixed 40/60 split. The Air pulls chunks
-  when free, so a throttling Air simply returns less often. Measured speed
-  (cost units per second) replaces the initial hardware estimate after the
-  first chunk.
-- **Big vs small chunks:** the strongest Macs take the largest remaining
-  chunks, and weaker ones take the smallest.
+  when free, so a throttling Air simply returns less often.
+- **How many at once, per Mac: measured, never set.** Each Mac runs n tasks
+  at once and measures the work it finishes per second. It tries n + 1 while
+  that is at least 5% faster, and steps back when it isn't. It never adds a
+  task while memory is short or the Mac is at its owner's limit, and drops
+  one at once when memory runs low. The best n per program is remembered
+  (`tuning.json`), so the next job starts there. A setting is only judged
+  after a full round of tasks with the Mac kept busy.
+- **What a chunk costs:** its length for audio and video (seconds, read with
+  ffprobe), frames for renders, and size only for other files.
+- **Longest first:** every Mac takes the longest chunk left, so the end of
+  the job is made of short ones.
+- **Near the end, where it finishes soonest:** once everything left could
+  start at once, a chunk only goes to a Mac where it would finish about as
+  soon as anywhere else, counting the time to upload it there. A slow or far
+  Mac waits (or copies a straggler) rather than hold up the end.
+- **Remembered speeds:** each Mac's measured speed and upload rate per
+  program are kept between jobs (`speeds.json`), so placement and time left
+  are right from the first chunk.
+- **Smaller chunks near the end:** videos and frame ranges are cut big first
+  and shrinking toward the end (each about what's left divided by twice the
+  workers), so the Macs finish close together.
 - **Upload overlap:** each Mac is sent one extra chunk, so its next
   upload happens while it computes the current one.
 - **Lid closed / Wi-Fi dropped:** status calls time out after 2 s, and a Mac

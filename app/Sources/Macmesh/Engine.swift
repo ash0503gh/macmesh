@@ -279,10 +279,8 @@ final class Engine {
         try await client.call("chat_restore", ["id": id])
     }
 
-    func chatRun(_ id: String, macs: [String], output: String, slots: Int?) async throws -> Job {
-        var params: [String: Any] = ["id": id, "macs": macs, "output": output]
-        if let slots { params["slots"] = slots }
-        let job: Job = try await client.call("chat_run", params)
+    func chatRun(_ id: String, macs: [String], output: String) async throws -> Job {
+        let job: Job = try await client.call("chat_run", ["id": id, "macs": macs, "output": output])
         await tick()
         return job
     }
