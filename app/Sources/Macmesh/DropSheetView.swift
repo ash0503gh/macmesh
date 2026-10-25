@@ -30,12 +30,14 @@ struct DropSheetView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Picker("", selection: $mode) {
-                ForEach(Mode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+            SheetTitleBar(title: "New job") {
+                Picker("", selection: $mode) {
+                    ForEach(Mode.allCases, id: \.self) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 240)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 260)
             if mode == .describe {
                 ChatPlanView(files: file.map { [URL(filePath: $0.path)] } ?? [])
             } else {
@@ -43,7 +45,7 @@ struct DropSheetView: View {
             }
         }
         .padding(22)
-        .frame(width: mode == .describe ? 600 : 520)
+        .frame(width: mode == .describe ? 880 : 560)
         .task { if let initialURL, file == nil { await open(initialURL) } }
     }
 
@@ -61,9 +63,6 @@ struct DropSheetView: View {
                     .font(.callout)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
-            }
-            if file == nil {
-                HStack { Spacer(); Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction) }
             }
         }
     }
@@ -209,7 +208,7 @@ struct DropSheetView: View {
                 Text("Saved to your macmesh folder in Movies").font(.caption).foregroundStyle(.tertiary)
             }
             Spacer()
-            Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+            Button("Cancel") { dismiss() }
             Button(starting ? "Starting…" : "Start on \(usable.count) \(usable.count == 1 ? "Mac" : "Macs")") {
                 Task { await start(file) }
             }

@@ -722,16 +722,35 @@ class Control:
         return self._chat(id).summary()
 
     def m_chats(self) -> list:
-        """Recent conversations, newest first."""
+        """Recent conversations, most recently changed first."""
         found = []
-        for p in sorted((self.home / "chats").glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:20]:
+        for p in sorted((self.home / "chats").glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:50]:
             try:
                 d = json.loads(p.read_text())
                 found.append({"id": d["id"], "title": d.get("title", ""), "created": d.get("created"),
-                              "job_ids": d.get("job_ids", []), "has_plan": bool(d.get("card"))})
+                              "updated": p.stat().st_mtime, "job_ids": d.get("job_ids", []), "has_plan": bool(d.get("card"))})
             except (OSError, ValueError, KeyError):
                 continue
         return found
+
+    def m_chat_delete(self, id: str) -> dict:
+        """Put a conversation aside (chats/deleted/), so it can still be brought back with chat_restore."""
+        c = self._chat(id)
+        if c.state == "thinking":
+            raise ControlError("the AI is still answering")
+        gone = self.home / "chats" / "deleted"
+        gone.mkdir(parents=True, exist_ok=True)
+        c.path().replace(gone / c.path().name)
+        with self.lock:
+            self.chats.pop(id, None)
+        return {"deleted": id}
+
+    def m_chat_restore(self, id: str) -> dict:
+        kept = self.home / "chats" / "deleted" / f"{id}.json"
+        if not re.fullmatch(r"[0-9a-f]{8}", id) or not kept.exists():
+            raise ControlError("that conversation can't be brought back")
+        kept.replace(self.home / "chats" / kept.name)
+        return self._chat(id).summary()
 
     def m_chat_run(self, id: str, macs: list | None = None, output: str | None = None,
                    slots: int | None = None) -> dict:
@@ -805,7 +824,7 @@ class Control:
 
     # ---- dispatch --------------------------------------------------------
     METHODS = {"status", "macs", "apps", "inspect", "start", "submit", "jobs", "job", "cancel", "lend", "owner", "invite", "approve",
-               "install", "revoke", "stop", "chat_start", "chat_send", "chat", "chats", "chat_run", "slots",
+               "install", "revoke", "stop", "chat_start", "chat_send", "chat", "chats", "chat_run", "chat_delete", "chat_restore", "slots",
                "ai", "set_ai", "plan", "run_plan", "teach", "explain", "ai_task"}
 
     def call(self, method: str, params: dict):

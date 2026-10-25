@@ -1280,6 +1280,10 @@ class AITests(ControlTests):
         chats = self.client.call("chats")
         self.assertEqual((chats[0]["id"], chats[0]["job_ids"]), (c["id"], [job["id"]]))
         self.assertTrue((self.home / "chats" / f"{c['id']}.json").exists())  # kept with the job
+        self.client.call("chat_delete", id=c["id"])
+        self.assertEqual(self.client.call("chats"), [])
+        self.assertEqual(self.client.call("chat_restore", id=c["id"])["id"], c["id"])  # Undo
+        self.assertEqual(self.client.call("chats")[0]["id"], c["id"])
 
     def test_a_chat_plan_may_only_use_folders_they_picked(self):
         self.reply("chat-1.json", {"reply": "Done.", "plan": {"explanation": "x", "planner": "batch",

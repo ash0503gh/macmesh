@@ -1,21 +1,24 @@
 import SwiftUI
 
 /// "Describe it": plan a job by talking it through with the AI. It asks what it needs (a folder,
-/// a choice), then proposes a plan as a card; nothing runs until Run. Conversations are kept.
+/// a choice), then proposes a plan as a card; nothing runs until Run. Past conversations are in a
+/// list beside it, like Messages.
 struct ChatPlanView: View {
     @Environment(Engine.self) private var engine
-    @Environment(\.dismiss) private var dismiss
 
     @State var files: [URL] = []
     @State var chat: ChatInfo?
     var chatId: String?  // reopen this conversation (from a job's history row)
     @State private var draft = ""
-    @State private var recent: [ChatListItem] = []
+    @State var recent: [ChatListItem] = []
     @State private var turnedOff: Set<String> = []
     @State private var error: String?
     @State private var started: Job?
+    @State private var deleted: ChatListItem?  // just deleted: Undo brings it back
+    @State private var hovered: String?
     // the plan card's choices
-    @State private var output = ""
+    @State private var outputName = ""
+    @State private var outputParent = ""
     @State private var slotsHere = 1
     @State private var cardFor: String?
 
@@ -23,24 +26,83 @@ struct ChatPlanView: View {
     var usable: [Mac] { macs.filter { $0.available && !turnedOff.contains($0.nodeId) } }
     var agent: String { engine.ai?.using.map(AiInfo.label) ?? "The AI" }
     var thinking: Bool { chat?.state == "thinking" }
+    var output: String { (outputParent as NSString).appendingPathComponent(outputName) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let ai = engine.ai, ai.using == nil {
-                Label(ai.problem.isEmpty ? "No AI agent is available." : ai.problem, systemImage: "exclamationmark.triangle.fill")
-                    .font(.callout).foregroundStyle(.orange)
+        HStack(alignment: .top, spacing: 0) {
+            sidebar.frame(width: 220)
+            Divider()
+            VStack(alignment: .leading, spacing: 12) {
+                if let ai = engine.ai, ai.using == nil {
+                    Label(ai.problem.isEmpty ? "No AI agent is available." : ai.problem, systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout).foregroundStyle(.orange)
+                }
+                if let chat { conversation(chat) } else { start }
+                if let error {
+                    Label(error, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange)
+                }
+                composer
             }
-            if let chat { conversation(chat) } else { start }
-            if let error {
-                Label(error, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange)
-            }
-            composer
+            .padding(.leading, 16)
         }
-        .frame(minHeight: 460)
+        .frame(minHeight: 520)
         .task {
             if let chatId, chat == nil { await open(chatId) }
-            recent = await engine.chats()
+            await reloadList()
         }
+    }
+
+    // ---- past conversations ------------------------------------------------------------
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button { newChat() } label: { Label("New conversation", systemImage: "square.and.pencil") }
+                .buttonStyle(.borderless)
+                .padding(.bottom, 4)
+            if recent.isEmpty {
+                Text("Your conversations show up here.").font(.caption).foregroundStyle(.tertiary)
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(recent) { item in row(item) }
+                }
+            }
+            Spacer(minLength: 0)
+            if let deleted {
+                HStack {
+                    Text("Deleted").foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Undo") { Task { await restore(deleted) } }.buttonStyle(.borderless)
+                }
+                .font(.caption)
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.06)))
+            }
+        }
+        .padding(.trailing, 12)
+    }
+
+    private func row(_ item: ChatListItem) -> some View {
+        let selected = item.id == chat?.id
+        return HStack(alignment: .firstTextBaseline, spacing: 6) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title.isEmpty ? "Untitled" : item.title).lineLimit(1)
+                Text("\(Format.when(item.updated ?? item.created ?? 0)) \u{00B7} \(item.jobIds.isEmpty ? "Not run" : "Ran")")
+                    .font(.caption).foregroundStyle(item.jobIds.isEmpty ? .secondary : Color.green)
+            }
+            Spacer(minLength: 4)
+            Button { Task { await delete(item) } } label: { Image(systemName: "trash") }
+                .buttonStyle(.borderless).foregroundStyle(.secondary)
+                .help("Delete this conversation (you can undo)")
+                .opacity(selected || hovered == item.id ? 1 : 0)
+        }
+        .onHover { inside in hovered = inside ? item.id : (hovered == item.id ? nil : hovered) }
+        .font(.callout)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 7).fill(selected ? Color.accentColor.opacity(0.18) : .clear))
+        .contentShape(Rectangle())
+        .onTapGesture { Task { await open(item.id) } }
+        .contextMenu { Button("Delete", role: .destructive) { Task { await delete(item) } } }
     }
 
     // ---- before the first message ------------------------------------------------
@@ -56,27 +118,9 @@ struct ChatPlanView: View {
                     }
                 }
             }
-            MacPicker(macs: macs, turnedOff: $turnedOff)
-            if !recent.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    SectionLabel("Recent conversations")
-                    ForEach(recent.prefix(5)) { item in
-                        Button {
-                            Task { await open(item.id) }
-                        } label: {
-                            HStack {
-                                Image(systemName: item.jobIds.isEmpty ? "bubble.left.and.bubble.right" : "checkmark.bubble")
-                                    .foregroundStyle(.secondary)
-                                Text(item.title.isEmpty ? "Untitled" : item.title).lineLimit(1)
-                                Spacer()
-                                if !item.jobIds.isEmpty { Text("ran").font(.caption).foregroundStyle(.secondary) }
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .font(.callout)
-                    }
-                }
+            VStack(alignment: .leading, spacing: 6) {
+                SectionLabel("Use these Macs")
+                MacChecks(macs: macs, turnedOff: $turnedOff)
             }
             Spacer(minLength: 0)
         }
@@ -108,6 +152,7 @@ struct ChatPlanView: View {
                     Color.clear.frame(height: 1).id("end")
                 }
                 .padding(.vertical, 4)
+                .padding(.trailing, 4)
             }
             .onChange(of: chat) { _, _ in withAnimation { scroll.scrollTo("end", anchor: .bottom) } }
             .onAppear { scroll.scrollTo("end", anchor: .bottom) }
@@ -134,32 +179,39 @@ struct ChatPlanView: View {
         }
     }
 
-    // ---- the plan, ready to run ------------------------------------------------------
+    // ---- the plan, ready to run: compact rows ------------------------------------------
     private func planCard(_ card: ChatInfo.PlanCard, _ chat: ChatInfo) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("The plan", systemImage: "checklist").fontWeight(.medium)
-            if !card.explanation.isEmpty { Text(card.explanation).fixedSize(horizontal: false, vertical: true) }
-            Text("\(card.tasks) \(card.tasks == 1 ? "task" : "tasks") using \(card.programs.joined(separator: ", "))")
-                .font(.callout).foregroundStyle(.secondary)
-            if let example = card.example.first {
-                Text(example).font(.system(.caption, design: .monospaced)).lineLimit(2).textSelection(.enabled)
-                    .padding(6).frame(maxWidth: .infinity, alignment: .leading)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(card.name).fontWeight(.semibold)
+                Text("\(card.tasks) \(card.tasks == 1 ? "task" : "tasks") with \(card.programs.joined(separator: ", "))")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .help(card.example.first.map { "First task: \($0)" } ?? "")
             }
-            ForEach(card.reasons, id: \.self) { Text("\u{2022} It \($0).").font(.caption).foregroundStyle(.orange) }
+            ForEach(card.reasons, id: \.self) { Label("It \($0).", systemImage: "hand.raised").font(.caption).foregroundStyle(.orange) }
             ForEach(card.needsInstall.sorted(by: { $0.key < $1.key }), id: \.key) { mac, programs in
-                Text("\u{2022} \(mac) will be asked to install \(programs.joined(separator: ", ")); its owner decides.")
+                Label("\(mac) will be asked to install \(programs.joined(separator: ", "))", systemImage: "shippingbox")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            MacPicker(macs: macs, turnedOff: $turnedOff)
-            LabeledContent("This Mac works on") {
-                Stepper("\(slotsHere) at once", value: $slotsHere, in: 1...max(1, ProcessInfo.processInfo.activeProcessorCount))
-            }
-            .font(.callout)
-            LabeledContent("Results go to") {
-                HStack {
-                    TextField("Folder", text: $output).textFieldStyle(.roundedBorder)
-                    Button("Choose\u{2026}") { chooseOutput() }
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 9) {
+                GridRow {
+                    Text("Macs").foregroundStyle(.secondary)
+                    MacChecks(macs: macs, turnedOff: $turnedOff)
+                }
+                GridRow {
+                    Text("At once").foregroundStyle(.secondary)
+                    Stepper("This Mac: \(slotsHere)", value: $slotsHere, in: 1...max(1, ProcessInfo.processInfo.activeProcessorCount))
+                        .help("How many tasks this Mac runs at the same time")
+                }
+                GridRow {
+                    Text("Results").foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        TextField("Folder name", text: $outputName).textFieldStyle(.roundedBorder).frame(maxWidth: 200)
+                        Text("in \((outputParent as NSString).abbreviatingWithTildeInPath)")
+                            .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 4)
+                        Button("Change\u{2026}") { chooseOutput() }
+                    }
                 }
             }
             .font(.callout)
@@ -170,7 +222,7 @@ struct ChatPlanView: View {
                 } else {
                     Button("Run") { Task { await run(chat) } }
                         .buttonStyle(.borderedProminent)
-                        .disabled(usable.isEmpty || output.isEmpty)
+                        .disabled(usable.isEmpty || outputName.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
         }
@@ -185,9 +237,15 @@ struct ChatPlanView: View {
         guard cardFor != chat.card?.example.first else { return }
         cardFor = chat.card?.example.first
         let root = engine.status?.outputDir ?? NSString(string: "~/Movies/macmesh").expandingTildeInPath
-        let name = chat.suggest?.outputFolder ?? "\(chat.card?.name ?? "job") (macmesh)"
-        output = name.hasPrefix("/") || name.hasPrefix("~") ? NSString(string: name).expandingTildeInPath
-                                                            : (root as NSString).appendingPathComponent(name)
+        let suggested = chat.suggest?.outputFolder ?? "\(chat.card?.name ?? "job") (macmesh)"
+        if suggested.hasPrefix("/") || suggested.hasPrefix("~") {
+            let full = NSString(string: suggested).expandingTildeInPath as NSString
+            outputParent = full.deletingLastPathComponent
+            outputName = full.lastPathComponent
+        } else {
+            outputParent = root
+            outputName = suggested
+        }
         let here = engine.status?.name ?? ""
         slotsHere = chat.suggest?.slots?.first(where: { $0.key == here || $0.key == "This Mac" })?.value
             ?? engine.status?.slots ?? 1
@@ -214,6 +272,19 @@ struct ChatPlanView: View {
         }
     }
 
+    // ---- actions -----------------------------------------------------------------------
+    private func newChat() {
+        chat = nil
+        started = nil
+        cardFor = nil
+        error = nil
+        draft = ""
+    }
+
+    private func reloadList() async {
+        if let list = await engine.chats() { recent = list }
+    }
+
     private func sendDraft() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !thinking else { return }
@@ -230,14 +301,45 @@ struct ChatPlanView: View {
             } else {
                 next = try await engine.chatStart(text ?? "", paths: files.map(\.path), macs: usable.map(\.nodeId))
             }
+            await reloadList()
             await engine.follow(chat: next) { chat = $0 }
+            await reloadList()
         } catch {
             self.error = error.localizedDescription
         }
     }
 
     private func open(_ id: String) async {
-        do { chat = try await engine.chat(id) } catch { self.error = error.localizedDescription }
+        do {
+            chat = try await engine.chat(id)
+            started = nil
+            cardFor = nil
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func delete(_ item: ChatListItem) async {
+        do {
+            try await engine.chatDelete(item.id)
+            if chat?.id == item.id { newChat() }
+            deleted = item
+            await reloadList()
+            try? await Task.sleep(for: .seconds(8))
+            if deleted?.id == item.id { deleted = nil }
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+
+    private func restore(_ item: ChatListItem) async {
+        deleted = nil
+        do {
+            chat = try await engine.chatRestore(item.id)
+            await reloadList()
+        } catch {
+            self.error = error.localizedDescription
+        }
     }
 
     private func run(_ chat: ChatInfo) async {
@@ -246,6 +348,7 @@ struct ChatPlanView: View {
             started = try await engine.chatRun(chat.id, macs: usable.map(\.nodeId), output: output,
                                                slots: slotsHere == engine.status?.slots ? nil : slotsHere)
             self.chat = try await engine.chat(chat.id)
+            await reloadList()
         } catch {
             self.error = error.localizedDescription
         }
@@ -264,8 +367,9 @@ struct ChatPlanView: View {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
-        panel.message = "Where should the results go?"
-        if panel.runModal() == .OK, let url = panel.url { output = url.path }
+        panel.message = "Where should the \u{201C}\(outputName)\u{201D} folder go?"
+        panel.prompt = "Put it here"
+        if panel.runModal() == .OK, let url = panel.url { outputParent = url.path }
     }
 
     private func addFiles() {
@@ -274,5 +378,49 @@ struct ChatPlanView: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         if panel.runModal() == .OK { files.append(contentsOf: panel.urls.filter { !files.contains($0) }) }
+    }
+}
+
+/// Macs as a row of checkboxes (compact; the Mac picker's circles are for the file sheet).
+struct MacChecks: View {
+    var macs: [Mac]
+    @Binding var turnedOff: Set<String>
+
+    var body: some View {
+        HStack(spacing: 14) {
+            ForEach(macs) { mac in
+                Toggle(isOn: Binding(get: { mac.available && !turnedOff.contains(mac.nodeId) },
+                                     set: { on in if on { turnedOff.remove(mac.nodeId) } else { turnedOff.insert(mac.nodeId) } })) {
+                    Text(mac.thisMac ? "This Mac" : mac.name).lineLimit(1)
+                }
+                .toggleStyle(.checkbox)
+                .disabled(!mac.available)
+                .help(mac.available ? mac.name : "\(mac.name): \(Format.macState(mac))")
+            }
+        }
+    }
+}
+
+/// A sheet's title and its close button (Esc closes too).
+struct SheetTitleBar<Accessory: View>: View {
+    @Environment(\.dismiss) private var dismiss
+    var title: String
+    @ViewBuilder var accessory: Accessory
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title).font(.title3).fontWeight(.semibold)
+            Spacer()
+            accessory
+            Spacer()
+            Button { dismiss() } label: {
+                Image(systemName: "xmark.circle.fill").font(.title2).symbolRenderingMode(.hierarchical)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .keyboardShortcut(.cancelAction)
+            .help("Close (Esc)")
+            .accessibilityLabel("Close")
+        }
     }
 }

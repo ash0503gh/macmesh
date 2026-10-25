@@ -195,6 +195,16 @@ struct Inspection: Decodable, Equatable {
 }
 
 enum Format {
+    /// "Today 16:40", "Yesterday 09:12", "23 Oct".
+    static func when(_ timestamp: Double) -> String {
+        let date = Date(timeIntervalSince1970: timestamp)
+        let cal = Calendar.current
+        let time = date.formatted(date: .omitted, time: .shortened)
+        if cal.isDateInToday(date) { return "Today \(time)" }
+        if cal.isDateInYesterday(date) { return "Yesterday \(time)" }
+        return date.formatted(.dateTime.day().month(.abbreviated))
+    }
+
     /// "12 MB", "1.4 GB".
     static func bytes(_ n: Int) -> String {
         n == 0 ? "\u{2013}" : ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file)
@@ -326,6 +336,7 @@ struct ChatListItem: Decodable, Equatable, Identifiable {
     var id: String
     var title: String
     var created: Double?
+    var updated: Double?
     var jobIds: [String]
     var hasPlan: Bool
 }

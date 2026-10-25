@@ -178,11 +178,11 @@ struct JobsPage: View {
         }
         .sheet(item: $explaining) { job in ExplainSheet(job: job).environment(engine) }
         .sheet(isPresented: Binding(get: { chatting != nil }, set: { if !$0 { chatting = nil } })) {
-            VStack(alignment: .trailing) {
+            VStack(alignment: .leading, spacing: 18) {
+                SheetTitleBar(title: "Conversation") { EmptyView() }
                 ChatPlanView(chatId: chatting).environment(engine)
-                Button("Done") { chatting = nil }.keyboardShortcut(.cancelAction)
             }
-            .padding(22).frame(width: 600, height: 700)
+            .padding(22).frame(width: 880, height: 700)
         }
     }
 

@@ -259,8 +259,18 @@ final class Engine {
         try await client.call("chat", ["id": id])
     }
 
-    func chats() async -> [ChatListItem] {
-        (try? await client.call("chats")) ?? []
+    /// Saved conversations, or nil if the engine couldn't be asked (keep showing what you had).
+    func chats() async -> [ChatListItem]? {
+        try? await client.call("chats")
+    }
+
+    func chatDelete(_ id: String) async throws {
+        struct Deleted: Decodable { var deleted: String }
+        let _: Deleted = try await client.call("chat_delete", ["id": id])
+    }
+
+    func chatRestore(_ id: String) async throws -> ChatInfo {
+        try await client.call("chat_restore", ["id": id])
     }
 
     func chatRun(_ id: String, macs: [String], output: String, slots: Int?) async throws -> Job {

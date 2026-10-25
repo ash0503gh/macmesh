@@ -66,6 +66,13 @@ enum Snapshots {
                     programs: ["demucs-stem"], example: ["demucs-stem 01 Intro.mp3 01 Intro.zip"], name: "Party set stems",
                     reasons: [], needsInstall: [:]),
         suggest: .init(slots: ["This Mac": 4], macs: nil, outputFolder: "Party set stems"), jobIds: [])
+    static let sampleRecent: [ChatListItem] = [
+        .init(id: "c1", title: "Split the 600 songs into stems", created: Date().timeIntervalSince1970 - 600,
+              updated: Date().timeIntervalSince1970 - 300, jobIds: [], hasPlan: true),
+        .init(id: "c2", title: "Hip hop stems in a new folder", created: Date().timeIntervalSince1970 - 90_000,
+              updated: Date().timeIntervalSince1970 - 86_500, jobIds: ["j1"], hasPlan: true),
+        .init(id: "c3", title: "Re-encode the vlog to HEVC", created: 1_792_500_000, updated: 1_792_500_000, jobIds: ["j2"], hasPlan: true),
+    ]
     static let finished = [
         Job(id: "b1", name: "Launch ad (motion)", state: "done", error: "", output: "/tmp/x.mov", tasks: 8, done: 8, progress: 1,
             elapsed: 74, eta: nil, macs: [.init(nodeId: "a", name: "This Mac", done: 5, running: 0)], chunks: [],
@@ -150,8 +157,13 @@ enum Snapshots {
             ("newjob-project", AnyView(DropSheetView(file: project).environment(engine(working)))),
             ("newjob-comp", AnyView(DropSheetView(file: comp).environment(engine(working)))),
             ("dashboard-ai", dash(.ai, engine(working))),
-            ("newjob-describe", AnyView(ChatPlanView(chat: sampleChat).padding(22).frame(width: 600, height: 760)
-                                            .environment(engine(working)))),
+            ("newjob-describe", AnyView(VStack(alignment: .leading, spacing: 18) {
+                SheetTitleBar(title: "New job") {
+                    Picker("", selection: .constant(1)) { Text("Pick a file").tag(0); Text("Describe it").tag(1) }
+                        .pickerStyle(.segmented).labelsHidden().frame(width: 240)
+                }
+                ChatPlanView(chat: sampleChat, recent: sampleRecent)
+            }.padding(22).frame(width: 880, height: 700).environment(engine(working)))),
             ("teach-done", AnyView(TeachSheet(program: URL(filePath: "/Applications/Blender.app/Contents/MacOS/Blender"), name: "blender",
                                               sample: URL(filePath: "/Users/me/Scenes/Robot.blend"), task: teachTask)
                                    .environment(engine(working)))),
