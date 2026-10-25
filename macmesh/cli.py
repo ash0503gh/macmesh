@@ -286,6 +286,14 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def cmd_agents(args) -> int:
+    """Set up /macmesh in Claude Code and Antigravity (whichever are installed)."""
+    from . import agents
+    for line in agents.install(config.load()):
+        print(line)
+    return 0
+
+
 def cmd_mcp(args) -> int:
     from .mcp import main as mcp_main
     return mcp_main()
@@ -512,6 +520,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("mcp", help="MCP server for AI agents (stdio), talking to this Mac's running daemon")
     p.set_defaults(fn=cmd_mcp)
+
+    p = sub.add_parser("agents", help="set up /macmesh in Claude Code and Antigravity (skill + MCP server)")
+    p.set_defaults(fn=cmd_agents)
 
     p = sub.add_parser("apps", help="list app profiles and whether this Mac has each app")
     p.add_argument("-v", "--verbose", action="store_true")

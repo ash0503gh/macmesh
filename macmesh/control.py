@@ -280,14 +280,19 @@ class Control:
     def plan_job(self, spec: dict) -> dict:
         """spec: {"kind": "app", "path", "app"?, "start"?, "end"?, "vars"?, "chunk"?}
                | {"kind": "video", "path", "preset"?, "vf"?}
-               | {"kind": "batch", "files", "template"?, "out_ext"?, "name"?}
-               plus "title"? and "macs"? (node ids)."""
+               | {"kind": "batch", "files" | "folder" + "extensions"? + "recursive"?, "template"?, "out_ext"?, "name"?}
+               plus "title"?, "macs"? (node ids) and "output"? (where the result goes)."""
         out_root = Path(self.cfg.get("output_dir", "~/Movies/macmesh")).expanduser()
         kind, path = spec.get("kind"), spec.get("path")
         if kind == "batch":
             files = spec.get("files") or ([path] if path else [])
+            if spec.get("folder"):
+                try:
+                    files = list(files) + chat.files_in(spec["folder"], spec.get("extensions"), bool(spec.get("recursive")))
+                except ValueError as e:
+                    raise ControlError(str(e)) from None
             if not files:
-                raise ControlError("say which files to work on (files)")
+                raise ControlError("say which files to work on (files, or a folder)")
             stem = spec.get("name") or spec.get("title") or "batch"
             workdir = Path(spec.get("workdir") or (out_root / ".work" / f"{stem}-{uuid.uuid4().hex[:6]}")).expanduser().resolve()
             template = spec.get("template") or ["demucs-stem", "{in:file}", "{out:result}"]
@@ -332,7 +337,27 @@ class Control:
 
     def m_start(self, **spec) -> dict:
         planned = self.plan_job(spec)
-        return self._start(planned["job"], spec, planned["final"]).summary()
+        if spec.get("slots"):
+            self.m_slots(int(spec["slots"]))
+        final = str(Path(spec["output"]).expanduser()) if spec.get("output") else planned["final"]
+        return self._start(planned["job"], spec, final).summary()
+
+    def m_preview(self, **spec) -> dict:
+        """What `start` would do with this spec, without starting it: for an agent to confirm first."""
+        planned = self.plan_job(spec)
+        job = planned["job"]
+        programs = sorted({p for t in job["tasks"] for p in jobspec.programs(t)})
+        first = job["tasks"][0]
+        names = {**{f"{{in:{k}}}": Path(v).name for k, v in first.get("inputs", {}).items()},
+                 **{f"{{out:{k}}}": Path(v).name for k, v in first.get("outputs", {}).items()}}
+        macs = [m for m in self.m_macs() if self._chosen(m, spec)]
+        return {"name": job["name"], "tasks": len(job["tasks"]), "programs": programs,
+                "first_task": [" ".join(names.get(a, a) for a in step) for step in first["steps"]],
+                "output": str(Path(spec["output"]).expanduser()) if spec.get("output") else planned["final"],
+                "macs": [{"name": m["name"], "this_mac": m["this_mac"], "state": m["state"], "slots": m["slots"],
+                          "missing": [p for p in programs if p not in m["programs"]]} for m in macs],
+                "this_mac_at_once": int(spec.get("slots") or self.cfg.get("slots", 1)),
+                "note": "Macs missing a program are asked to install it when the job starts; their owner decides."}
 
     def m_submit(self, job: dict, final: str | None = None, kind: str | None = None, title: str | None = None,
                  options: dict | None = None) -> dict:
@@ -718,6 +743,18 @@ class Control:
         self._chat_turn(c, macs)
         return c.summary()
 
+    def m_setup_agents(self) -> dict:
+        """Set up /macmesh in Claude Code and Antigravity (whichever are installed here)."""
+        from . import agents
+        return {"done": agents.install(self.cfg)}
+
+    def m_folder(self, path: str) -> dict:
+        """What's in a folder: counts by type, size and names (never contents)."""
+        try:
+            return chat.folder_summary(path, names=200)
+        except OSError as e:
+            raise ControlError(f"can't read {path}: {e}") from None
+
     def m_chat(self, id: str) -> dict:
         return self._chat(id).summary()
 
@@ -824,7 +861,7 @@ class Control:
 
     # ---- dispatch --------------------------------------------------------
     METHODS = {"status", "macs", "apps", "inspect", "start", "submit", "jobs", "job", "cancel", "lend", "owner", "invite", "approve",
-               "install", "revoke", "stop", "chat_start", "chat_send", "chat", "chats", "chat_run", "chat_delete", "chat_restore", "slots",
+               "install", "revoke", "stop", "preview", "folder", "setup_agents", "chat_start", "chat_send", "chat", "chats", "chat_run", "chat_delete", "chat_restore", "slots",
                "ai", "set_ai", "plan", "run_plan", "teach", "explain", "ai_task"}
 
     def call(self, method: str, params: dict):

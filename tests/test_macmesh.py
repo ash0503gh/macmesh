@@ -1114,11 +1114,17 @@ class ControlTests(MeshCase):
         names = {t["name"] for t in server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]}
         self.assertTrue({"get_status", "inspect_file", "start_job", "get_job", "cancel_job"} <= names)
 
-        def call(name, **args):
-            r = server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": name, "arguments": args}})
+        def call(tool, **args):
+            r = server.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": tool, "arguments": args}})
             return r["result"]
 
-        started = call("start_job", path=str(self.project), end=49)
+        refused = call("start_job", path=str(self.project), end=49)  # not without the user's yes
+        self.assertTrue(refused["isError"])
+        self.assertIn("preview_job", refused["content"][0]["text"])
+        preview = json.loads(call("preview_job", path=str(self.project), end=49)["content"][0]["text"])
+        self.assertEqual((preview["tasks"] > 0, preview["programs"]), (True, ["fakeapp2"]))
+        self.assertEqual(self.client.call("jobs"), [])  # a preview starts nothing
+        started = call("start_job", path=str(self.project), end=49, confirmed=True)
         self.assertFalse(started["isError"], started)
         jid = json.loads(started["content"][0]["text"])["id"]
         job = self.wait_job(lambda j: json.loads(call("get_job", id=j)["content"][0]["text"]), jid)
@@ -1133,11 +1139,29 @@ class ControlTests(MeshCase):
         tools = {t["name"]: t for t in server.handle({"jsonrpc": "2.0", "id": 5, "method": "tools/list"})["result"]["tools"]}
         self.assertTrue({"files", "template", "out_ext"} <= set(tools["start_job"]["inputSchema"]["properties"]))
         self.assertTrue({"answer_join_request", "answer_install_request"} <= set(tools))
-        self.assertIn("give path", call("start_job")["content"][0]["text"])
+        self.assertIn("give path", call("start_job", confirmed=True)["content"][0]["text"])
         st = json.loads(call("set_lending", limit=0.8, mode="shared")["content"][0]["text"])
         self.assertEqual((st["limit"], st["owner_mode"]), (0.8, "shared"))
         self.assertEqual(config.load()["owner"]["limit"], 0.8)
         self.assertTrue(call("set_lending", limit=0.99)["isError"])
+        # /macmesh: the prompt, and the folder listing it relies on
+        prompts = server.handle({"jsonrpc": "2.0", "id": 6, "method": "prompts/list"})["result"]["prompts"]
+        self.assertEqual([p["name"] for p in prompts], ["macmesh"])
+        got = server.handle({"jsonrpc": "2.0", "id": 7, "method": "prompts/get",
+                             "params": {"name": "macmesh", "arguments": {"request": "split my songs"}}})["result"]
+        text = got["messages"][0]["content"]["text"]
+        self.assertIn("What they asked for: split my songs", text)
+        self.assertIn("preview_job", text)
+        self.assertIn("confirmed: true", text)
+        (self.tmp / "songs").mkdir()
+        for name in ("a.mp3", "b.mp3", "c.txt"):
+            (self.tmp / "songs" / name).write_text(name)
+        listing = json.loads(call("list_folder", path=str(self.tmp / "songs"))["content"][0]["text"])
+        self.assertEqual((listing["files"], listing["by_type"]), (3, {".mp3": 2, ".txt": 1}))
+        batch = json.loads(call("preview_job", folder=str(self.tmp / "songs"), extensions=[".mp3"],
+                                template=["fakeapp2", "info", "{in:file}"], out_ext=".txt", name="songs",
+                                output=str(self.tmp / "Songs out"))["content"][0]["text"])
+        self.assertEqual((batch["tasks"], batch["output"], batch["first_task"]), (2, str(self.tmp / "Songs out"), ["fakeapp2 info a.mp3"]))
         gone = call("answer_install_request", program="demucs-stem", allow=True)
         self.assertTrue(gone["isError"])
         self.assertIn("gone", gone["content"][0]["text"])
@@ -1166,6 +1190,35 @@ print(json.dumps({"type": "result", "result": "Here you go:\\n" + reply}))
 
 
 class AgentLookupTests(unittest.TestCase):
+    def test_setting_up_slash_macmesh_for_both_agents(self):
+        from macmesh import agents
+        home = Path(tempfile.mkdtemp())
+        log = home / "calls.txt"
+        for name in ("claude", "agy"):
+            exe = home / ".local/bin" / name
+            exe.parent.mkdir(parents=True, exist_ok=True)
+            exe.write_text(f'#!/bin/sh\necho "{name} $*" >> "{log}"\n')
+            exe.chmod(0o755)
+        old = dict(os.environ)
+        os.environ.update(HOME=str(home), PATH="/usr/bin:/bin")
+        saved, ai._login_path = ai._login_path, []
+        try:
+            done = agents.install(config.defaults())
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+            ai._login_path = saved
+        for folder in (".claude/skills/macmesh", ".gemini/config/skills/macmesh"):
+            text = (home / folder / "SKILL.md").read_text()
+            self.assertTrue(text.startswith("---\nname: macmesh\n"))
+            self.assertIn("preview_job", text)
+            self.assertIn("confirmed: true", text)
+        calls = log.read_text()
+        self.assertIn("claude mcp add --scope user macmesh --", calls)
+        self.assertIn("agy mcp add macmesh", calls)
+        self.assertTrue(any("Claude Code: /macmesh installed" in d for d in done), done)
+        shutil.rmtree(home, ignore_errors=True)
+
     def test_old_antigravity_command_is_replaced_on_load(self):
         home = Path(tempfile.mkdtemp())
         old_home = os.environ.get("MACMESH_HOME")

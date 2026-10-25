@@ -47,9 +47,11 @@ GPU or cores partly idle gain from 2-4 at once on a 16 GB Mac; never more than i
 """
 
 
-def folder_summary(path: str) -> dict:
+def folder_summary(path: str, names: int = SAMPLE_NAMES) -> dict:
     """What's in a folder, for the agent: counts by type, size, and some names. Never contents."""
     root = Path(path).expanduser().resolve()
+    if not root.is_dir():
+        raise OSError(f"there's no folder at {root}")
     files, top = [], []
     for p in root.rglob("*"):
         if p.is_file() and not p.name.startswith("."):
@@ -63,7 +65,18 @@ def folder_summary(path: str) -> dict:
             "subfolders": sorted(d.name for d in root.iterdir() if d.is_dir() and not d.name.startswith("."))[:20],
             "by_type": dict(by_ext.most_common(12)),
             "total_gb": round(sum(p.stat().st_size for p in files) / 1e9, 2),
-            "some_names": [p.relative_to(root).as_posix() for p in sorted(files)[:SAMPLE_NAMES]]}
+            "some_names": [p.relative_to(root).as_posix() for p in sorted(files)[:names]]}
+
+
+def files_in(folder: str, extensions: list[str] | None = None, recursive: bool = False) -> list[str]:
+    """The files in a folder (optionally its subfolders), of the given types, in name order."""
+    root = Path(folder).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError(f"there's no folder at {root}")
+    exts = {e.lower() if e.startswith(".") else "." + e.lower() for e in extensions or []}
+    walk = root.rglob("*") if recursive else root.iterdir()
+    return sorted(str(p) for p in walk if p.is_file() and not p.name.startswith(".")
+                  and (not exts or p.suffix.lower() in exts))
 
 
 def expand_files(plan: dict, folders: list[str]) -> dict:
@@ -81,10 +94,7 @@ def expand_files(plan: dict, folders: list[str]) -> dict:
         folder = Path(entry["folder"]).expanduser().resolve()
         if not any(folder == r or r in folder.parents for r in roots):
             raise ValueError(f"{folder} isn't a folder they picked")
-        exts = {e.lower() if e.startswith(".") else "." + e.lower() for e in entry.get("extensions") or []}
-        walk = folder.rglob("*") if entry.get("recursive") else folder.iterdir()
-        files += sorted(str(p) for p in walk
-                        if p.is_file() and not p.name.startswith(".") and (not exts or p.suffix.lower() in exts))
+        files += files_in(str(folder), entry.get("extensions"), bool(entry.get("recursive")))
     if not files:
         raise ValueError("that matches no files")
     return dict(plan, params=dict(plan["params"], files=files))

@@ -172,6 +172,8 @@ struct ExplainSheet: View {
 
 struct AIPage: View {
     @Environment(Engine.self) private var engine
+    @State private var setupDone: [String]?
+    @State private var settingUp = false
 
     var body: some View {
         Form {
@@ -196,6 +198,20 @@ struct AIPage: View {
                     LabeledContent("Learns apps", value: "Apps > Teach an app")
                     LabeledContent("Explains failures", value: "Jobs > History > Explain")
                 }
+                Section {
+                    HStack {
+                        Text("Type /macmesh in Claude Code or Antigravity to run a job from there: it asks a few questions, shows the plan, and starts only when you say yes.")
+                            .font(.callout).fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button(settingUp ? "Setting up\u{2026}" : "Set up /macmesh") { Task { await setUp() } }
+                            .disabled(settingUp)
+                    }
+                    ForEach(setupDone ?? [], id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+                } header: {
+                    Text("Use macmesh from your AI agent")
+                } footer: {
+                    Text("Adds a macmesh skill to each agent and registers macmesh's MCP server with it, for the agents installed on this Mac.")
+                }
                 Section("What the AI sees") {
                     Text("Your request, the names, sizes and formats of the files you add, your Macs' specs, and the text of project files. Never the media itself.")
                         .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -209,5 +225,11 @@ struct AIPage: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private func setUp() async {
+        settingUp = true
+        setupDone = await engine.setupAgents()
+        settingUp = false
     }
 }

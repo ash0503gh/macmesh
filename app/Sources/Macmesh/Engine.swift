@@ -243,6 +243,12 @@ final class Engine {
         try await client.call("plan", ["request": request, "paths": paths, "macs": macs])
     }
 
+    /// Sets up /macmesh in Claude Code and Antigravity; what was done, in plain words.
+    func setupAgents() async -> [String] {
+        struct Done: Decodable { var done: [String] }
+        do { let d: Done = try await client.call("setup_agents"); return d.done } catch { return [error.localizedDescription] }
+    }
+
     // ---- planning by conversation --------------------------------------------
     func chatStart(_ message: String, paths: [String], macs: [String]) async throws -> ChatInfo {
         try await client.call("chat_start", ["message": message, "paths": paths, "macs": macs])

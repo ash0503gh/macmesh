@@ -93,11 +93,36 @@ Under the hood, `macmesh serve` listens on `~/.macmesh/control.sock` (only your 
 
 ## For AI agents (MCP)
 
-`macmesh mcp` is an MCP server (stdio) with these tools: `get_status`, `list_apps`, `inspect_file`, `start_job` (one project or video, or `files` for a batch such as stem separation), `get_job` (with what each Mac is doing, its CPU and GPU load, and events), `list_jobs`, `cancel_job`, `set_lending` (on or off, the lending mode, and how much of the Mac may be used), `create_invite`, `answer_join_request` and `answer_install_request`. The last two are for when the user has said yes; the server tells agents never to answer them on their own. It talks to the running engine, so jobs an agent starts show up in the app. For Claude Code:
+**`/macmesh` in Claude Code and Antigravity.** Type `/macmesh` (optionally with what you want, e.g.
+`/macmesh split the 600 songs into stems`). The agent asks only what it can't work out (at most three
+questions: what to do, which files or folder, where results go), shows a preview of the job, and starts
+it only after you say yes. Then it reports progress, and the job is live on the app's Jobs page too.
+Set it up once per Mac with the AI page's *Set up /macmesh* button, or:
 
 ```sh
-claude mcp add macmesh -- /Applications/macmesh.app/Contents/Resources/engine/bin/macmesh mcp
+/Applications/macmesh.app/Contents/Resources/engine/bin/macmesh agents
 ```
+
+That adds a `macmesh` skill to each agent installed (`~/.claude/skills/macmesh`,
+`~/.gemini/config/skills/macmesh`) and registers the MCP server with it. The same intake is also
+the MCP server's `macmesh` prompt, for clients that offer MCP prompts.
+
+`macmesh mcp` is the MCP server (stdio). Its tools:
+
+- **Look:** `get_status`, `list_apps`, `inspect_file`, and `list_folder` (counts by type, size and
+  names, never contents).
+- **Run:**
+  - `preview_job` shows what would run, on which Macs, how many at once here and where results go,
+    without starting anything.
+  - `start_job` takes the same arguments: one project or video, or `files` or a `folder` (with
+    `extensions`) for a batch, plus `output` and `slots`. It refuses to start unless called with
+    `confirmed: true`, which its description says to set only after the user's yes.
+- **Follow:** `get_job` (what each Mac is doing, CPU and GPU load, events), `list_jobs`, `cancel_job`.
+- **Settings:** `set_lending` (on or off, lending mode, how much of the Mac may be used),
+  `create_invite`, and `answer_join_request` and `answer_install_request`, which are only for when
+  the user has said yes.
+
+It talks to the running engine, so jobs an agent starts show up in the app.
 
 ## What's in this prototype
 
