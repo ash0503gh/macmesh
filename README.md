@@ -347,7 +347,9 @@ the next section). The AI works on the parts that have no rule yet:
 - **Lid closed / Wi-Fi dropped:** status calls time out after 2 s, and a Mac
   that misses two in a row has its chunk re-queued (about 4 s). A transfer
   that stalls for 10 s counts as dead too. The Mac rejoins automatically when
-  it comes back.
+  it comes back. A task that its Mac stops asking about for 60 s (the job was
+  cancelled or the task re-queued, but the message didn't get through) is
+  cancelled on the Mac running it, so it doesn't run later for nothing.
 - **Shutdown / logout:** the worker catches SIGTERM and hands its chunks back
   at once, so nothing waits for a timeout.
 - **The owner needs their Mac (owner first):** the whole Mac, the owner's apps
@@ -369,9 +371,10 @@ the next section). The AI works on the parts that have no rule yet:
   `--match hash` always compares binaries; `--match none` turns the check off.
   A Mac without the program is skipped, and the job stops with a clear message
   if no Mac can run a task.
-- **Stragglers:** once the queue is empty, an idle Mac starts a duplicate
-  of any chunk that is badly overdue. The first copy to finish wins and
-  the other is cancelled.
+- **Stragglers:** once the queue is empty, a Mac with a free slot starts a
+  duplicate of any chunk that is badly overdue, or still waiting in a slower
+  Mac's queue, when it would finish it clearly sooner. The first copy to
+  finish wins and the other is cancelled.
 - **Battery and disk:** a Mac on battery below `min_battery` (default 30%), or
   with less than `min_free_gb` (default 5) of free disk, stops accepting new
   chunks (`macmesh config accept_on_battery false` to refuse all battery work).

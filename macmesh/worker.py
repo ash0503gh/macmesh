@@ -46,6 +46,7 @@ DUTY_PERIOD = 0.1    # tasks run for duty x this, then stop for the rest
 HELP_QUIET_END = 120.0  # a job helped with that sends nothing for this long counts as finished
 HELP_HISTORY = 20       # helped jobs remembered
 GC_EVERY = 60.0
+ORPHAN_AFTER = 60.0  # a task its Mac hasn't asked about for this long was given up on there: cancel it
 ACTIVE = ("queued", "running", "paused")
 QOS = {"utility", "background", "maintenance"}
 
@@ -62,6 +63,7 @@ class Task:
         self.proc: subprocess.Popen | None = None
         self.outputs: dict = {}
         self.started = self.finished = 0.0
+        self.asked = time.time()  # when the Mac that sent it last asked how it's going
         self.own = False  # from a job this Mac started: never paused, slowed or handed back for its owner
 
     def elapsed(self) -> float:
@@ -201,8 +203,18 @@ class Worker:
                     busy = {str((t.spec.get("origin") or {}).get("job_id")) for t in self.tasks.values()
                             if t.state in ACTIVE}
                 self.helping.sweep(busy)
+                self._reap_orphans()
             except Exception:  # measuring must never take the worker down
                 pass
+
+    def _reap_orphans(self) -> None:
+        """Cancel tasks nobody is waiting for: the job was cancelled or the sending Mac gave up on this
+        one, but couldn't reach us to say so. Otherwise they'd run later for nothing."""
+        now = time.time()
+        with self.lock:
+            stale = [tid for tid, t in self.tasks.items() if t.state in ACTIVE and now - t.asked > ORPHAN_AFTER]
+        for tid in stale:
+            self.cancel(tid)
 
     def is_own(self, spec: dict) -> bool:
         return (spec.get("origin") or {}).get("node_id") == self.cfg["node_id"]
@@ -760,6 +772,7 @@ class Handler(BaseHTTPRequestHandler):
             if not task:
                 return self._reply(404, {"error": "no such task"})
             if len(p) == 2:
+                task.asked = time.time()
                 return self._reply(200, {**task.status(), "slots": self.worker.workers()})
             if len(p) == 4 and p[2] == "out" and p[3] in task.outputs:
                 return self._send_file(Path(task.outputs[p[3]]["served"]))

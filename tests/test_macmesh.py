@@ -422,6 +422,22 @@ class FasterRulesTests(unittest.TestCase):
         self.assertEqual(busy._pick(busy.nodes[1]).spec["cost"], 100)
         shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_a_free_mac_takes_over_a_chunk_waiting_on_a_slow_one(self):
+        tmp = Path(tempfile.mkdtemp())
+        s = self.scheduler(self, [100, 100], tmp)
+        fast, slow = s.nodes
+        fast.speeds, slow.speeds = [1.0], [0.5]  # 100 s here, 200 s there
+        now = time.time()
+        for t in s.tasks:  # both went to the slow Mac: one runs, one waits behind it
+            t.state = "running"
+            t.copies[slow.client.address] = now - 10
+        s.tasks[0].phase[slow.client.address] = {"phase": "running", "since": now - 10}
+        s.tasks[1].phase[slow.client.address] = {"phase": "queued", "since": now - 10}
+        fast.in_flight = 0
+        # The waiting one ends 390 s from now there (190 s wait + 200 s), the running one in 190 s.
+        self.assertIs(s._straggler(fast), s.tasks[1])
+        shutil.rmtree(tmp, ignore_errors=True)
+
     def test_speeds_are_remembered_between_jobs(self):
         tmp = Path(tempfile.mkdtemp())
         s = self.scheduler(self, [10, 20], tmp)
@@ -499,6 +515,19 @@ class HelpingTests(MeshCase):
         finally:
             ctl.stopped.set()
             ctl.poke.set()
+
+
+class OrphanTests(MeshCase):
+    def test_a_task_nobody_asks_about_is_cancelled(self):
+        air = self.nodes[1]
+        c = air.client()
+        c.submit({"task_id": "kept-1", "argv": ["fakeapp"], "origin": {"node_id": "pro-id"}})
+        c.submit({"task_id": "lost-1", "argv": ["fakeapp"], "origin": {"node_id": "pro-id"}})
+        c.status("kept-1")  # its Mac is still asking
+        air.worker.tasks["lost-1"].asked -= 1000  # the sending Mac gave up on this one long ago
+        air.worker._reap_orphans()
+        self.assertIn("kept-1", air.worker.tasks)
+        self.assertNotIn("lost-1", air.worker.tasks)
 
 
 class OwnWorkTests(MeshCase):

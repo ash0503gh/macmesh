@@ -371,8 +371,8 @@ class Scheduler:
                 if task is None:
                     break
                 self._start(task, node)
-            if node.in_flight == 0 and self.speculate:
-                task = self._straggler(node)
+            if node.in_flight < max(1, int(node.client.info.get("slots", 1))) and self.speculate:
+                task = self._straggler(node)  # a free slot and nothing left to take: help finish
                 if task:
                     self.log(f"  ↻ {task.id}: duplicating on {node.client.name} (straggler)")
                     self._start(task, node)
@@ -503,13 +503,21 @@ class Scheduler:
             expected = t.spec["cost"] / self._speed(runner)
             elapsed = now - start
             remaining = max(expected - elapsed, 0.0)
-            if elapsed > 1.5 * expected:  # overdue: assume it's stuck or throttled
+            if t.phase.get(addr, {}).get("phase") == "queued":  # not started: it waits for a slot there first
+                remaining = expected + self._slot_wait(runner, now)
+            elif elapsed > 1.5 * expected:  # overdue: assume it's stuck or throttled
                 remaining = elapsed
             fresh_run = t.spec["cost"] / self._speed(idle)
             gain = remaining - fresh_run
             if gain > max(5.0, 0.3 * fresh_run) and gain > best_gain:
                 best, best_gain = t, gain
         return best
+
+    def _slot_wait(self, node: NodeState, now: float) -> float:
+        """How long a chunk queued on this Mac waits: until its first running chunk should end."""
+        ends = [e["since"] + t.spec["cost"] / self._speed(node) for t in self.tasks
+                if t.state == "running" and (e := t.phase.get(node.client.address, {})).get("phase") == "running"]
+        return max(0.0, min(ends) - now) if ends else 0.0
 
     def _start(self, task: TaskState, node: NodeState) -> None:
         task.state = "running"
