@@ -105,11 +105,6 @@ class NodeState:
         return sum(t[1] for t in recent) / 3, sum(t[2] for t in recent) / 3
 
     @property
-    def capacity(self) -> int:
-        # One extra so the next chunk uploads while the current one computes.
-        return int(self.client.info.get("slots", 1)) + 1
-
-    @property
     def score(self) -> float:
         return float(self.client.info.get("hardware", {}).get("score", 1.0))
 
@@ -187,6 +182,9 @@ class Scheduler:
         finally:
             self._remember()
             self._cancel_all()
+            for n in self.nodes:  # helpers' job cards end now, not after a quiet while
+                if not n.local:
+                    threading.Thread(target=n.client.job_ended, args=(self.job_id,), daemon=True).start()
             if not self.keep_blobs:
                 self._forget_blobs()
             shutil.rmtree(self.staging, ignore_errors=True)
@@ -368,7 +366,7 @@ class Scheduler:
                 continue
             if node.probing:
                 continue
-            while node.in_flight < node.capacity:
+            while node.in_flight < self._capacity(node):
                 task = self._pick(node)
                 if task is None:
                     break
@@ -431,6 +429,18 @@ class Scheduler:
 
     def _finish(self, task: TaskState, node: NodeState, now: float) -> float:
         return self._free_at(node, now) + self._upload_s(task, node) + task.spec["cost"] / self._speed(node)
+
+    def _capacity(self, node: NodeState) -> int:
+        """Chunks to keep on a Mac: what it runs at once, plus enough queued that its next uploads are
+        done by the time it's free (1 normally; up to 3 on a slow link)."""
+        slots = max(1, int(node.client.info.get("slots", 1)))
+        pending = [t for t in self.tasks if t.state == "pending"]
+        if node.local or not pending or not node.speeds:
+            return slots + 1
+        typical = statistics.median(t.spec["cost"] for t in pending)
+        sample = max(pending, key=lambda t: t.spec["cost"])
+        run = typical / self._speed(node) / slots  # how often a slot frees up
+        return slots + 1 + min(2, int(self._upload_s(sample, node) // max(run, 1.0)))
 
     def _end_phase(self, pending: list) -> bool:
         """Everything left could start now: from here, where a chunk runs decides when the job ends."""

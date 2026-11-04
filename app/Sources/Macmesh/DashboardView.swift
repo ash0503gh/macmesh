@@ -163,7 +163,7 @@ struct JobsPage: View {
                         LiveJob(job: job) { confirmCancel = job }
                     }
                 }
-                if !engine.lendingJobs.isEmpty { lending }
+                if !engine.lendingJobs.isEmpty || !(engine.status?.helped ?? []).isEmpty { lending }
                 history
             }
             .padding(24)
@@ -186,23 +186,40 @@ struct JobsPage: View {
         }
     }
 
-    /// Work this Mac is doing for your other Macs.
+    /// Work this Mac is doing for your other Macs: one steady card per job, then a short history.
     private var lending: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
             Text("Helping other Macs").font(.headline)
             ForEach(engine.lendingJobs) { job in
-                HStack(spacing: 10) {
-                    Image(systemName: job.state == "paused" ? "pause.circle" : "arrow.triangle.2.circlepath")
-                        .foregroundStyle(job.state == "paused" ? .orange : .secondary)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(job.name).lineLimit(1)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Image(systemName: job.state == "paused" ? "pause.circle" : "arrow.triangle.2.circlepath")
+                            .foregroundStyle(job.state == "paused" ? .orange : .secondary)
+                        Text(job.name).fontWeight(.medium).lineLimit(1)
+                        Spacer()
                         Text(Format.jobState(job)).font(.caption).foregroundStyle(.secondary)
                     }
-                    Spacer()
-                    if job.state == "running" { ProgressView().controlSize(.small) }
+                    if let mac = job.macs.first { MacActivityCard(mac: mac, color: .teal) }
                 }
-                .padding(10)
-                .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.035)))
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color.primary.opacity(0.035)))
+            }
+            if let helped = engine.status?.helped, !helped.isEmpty {
+                DisclosureGroup("Recently helped") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ForEach(helped) { h in
+                            HStack {
+                                Text("\(h.job) for \(h.by)").lineLimit(1)
+                                Spacer()
+                                Text("\(h.done) done\(h.failed > 0 ? ", \(h.failed) failed" : "") \u{00B7} \(Format.duration(h.finished - h.started)) \u{00B7} \(Format.when(h.finished))")
+                                    .foregroundStyle(.secondary).monospacedDigit()
+                            }
+                            .font(.callout)
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+                .font(.callout)
             }
         }
     }
@@ -360,18 +377,31 @@ struct MacsPage: View {
                         }
                     }
                 }
-                .width(min: 220, ideal: 260)
+                .width(min: 190, ideal: 230)
                 TableColumn("Chip") { mac in
-                    Text(mac.chip ?? "–").lineLimit(1).help(mac.fanless ? "Fanless: slows down under long loads" : "")
+                    Text([mac.chip, mac.memoryGb.map { "\($0) GB" }].compactMap { $0 }.joined(separator: " \u{00B7} "))
+                        .lineLimit(1)
+                        .help("\(mac.cores.map { "\($0) cores" } ?? "")\(mac.fanless ? ". Fanless: slows down under long loads" : "")")
                 }
-                .width(min: 120, ideal: 140)
-                TableColumn("Cores") { mac in Text(mac.cores.map(String.init) ?? "–").monospacedDigit() }.width(50)
-                TableColumn("Memory") { mac in Text(mac.memoryGb.map { "\($0) GB" } ?? "–").monospacedDigit() }.width(70)
+                .width(min: 130, ideal: 160)
                 TableColumn("Power") { mac in
                     Text(mac.onBattery == true ? "Battery\(mac.batteryPct.map { " \($0)%" } ?? "")" : "Plugged in")
                         .foregroundStyle(.secondary)
                 }
                 .width(90)
+                TableColumn("Link") { mac in
+                    if mac.thisMac {
+                        Text("\u{2013}").foregroundStyle(.secondary)
+                    } else if let mbps = mac.uploadMbps {
+                        Text("\(mbps.formatted()) MB/s").monospacedDigit()
+                            .foregroundStyle(mbps < 5 ? Color.orange : .secondary)
+                            .help(mbps < 5 ? "Slow link: big files take long to reach this Mac, so it gets less of them. A cable, or 5 GHz Wi-Fi near the router, helps."
+                                           : "How fast files reach this Mac, measured in jobs")
+                    } else {
+                        Text("\u{2013}").foregroundStyle(.tertiary).help("Not measured yet: it's measured as files are sent in jobs")
+                    }
+                }
+                .width(72)
                 TableColumn("State") { mac in StateLabel(mac: mac) }.width(min: 150, ideal: 200)
             }
             .tableStyle(.inset)

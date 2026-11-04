@@ -67,8 +67,8 @@ What each Mac needs for the work it shares:
 `app/` is a native macOS app (SwiftUI) on top of the engine:
 
 - **Dashboard window:** the sidebar has five pages.
-  - **Jobs:** the running job, updated live, with progress (counting chunks still running), time left once each Mac's speed is measured, how much faster it is than one Mac, and a map of which Mac did which chunk. Below that, a card per Mac shows what it's doing right now (sending a file, working on it for 0:52, fetching the result), a 2-minute graph of the CPU this job uses there and the Mac's GPU load, and how much has gone to and from it. Then every chunk with its Mac and time, and a live activity feed. *Helping other Macs* lists work this Mac is doing for others. Below it, the job history with *Show in Finder*.
-  - **Macs:** every Mac on the mesh, with chip, cores, memory, power and what it's doing. *Your mesh* shows Macs asking to join (with the number to compare), how to add a Mac, *Remove…* and *Leave this mesh…*.
+  - **Jobs:** the running job, updated live, with progress (counting chunks still running), time left once each Mac's speed is measured, how much faster it is than one Mac, and a map of which Mac did which chunk. Below that, a card per Mac shows what it's doing right now (sending a file, working on it for 0:52, fetching the result), a 2-minute graph of the CPU this job uses there and the Mac's GPU load, and how much has gone to and from it. Then every chunk with its Mac and time, and a live activity feed. *Helping other Macs* shows one steady card per job this Mac is helping with (tasks done here, what it's working on, how many at once, its CPU and GPU), kept until the other Mac says the job is finished, then moved to *Recently helped*. Below it, the job history with *Show in Finder*.
+  - **Macs:** every Mac on the mesh, with chip and memory (cores on hover), power, the measured upload speed to it (*Link*, orange when it's slow enough to hold jobs back) and what it's doing. A Mac that stops answering stays listed as *not seen for N s* for a while instead of vanishing. *Your mesh* shows Macs asking to join (with the number to compare), how to add a Mac, *Remove…* and *Leave this mesh…*.
   - **Apps:** the app profiles, and whether this Mac has each app.
   - **Lending:** lend this Mac or not, *step aside when I need it* or *only while I'm away*, how much of the Mac may be used (50–95%, 90% to start), and open at login.
   - **Security:** encryption, this Mac's certificate, and removing a Mac.
@@ -332,8 +332,18 @@ the next section). The AI works on the parts that have no rule yet:
 - **Smaller chunks near the end:** videos and frame ranges are cut big first
   and shrinking toward the end (each about what's left divided by twice the
   workers), so the Macs finish close together.
-- **Upload overlap:** each Mac is sent one extra chunk, so its next
-  upload happens while it computes the current one.
+- **Upload overlap:** each Mac is sent one chunk more than it runs at once
+  (up to two more on a slow link), so its next upload happens while it
+  computes the current one. The stem tool's results are zipped without
+  compression (audio barely compresses), which saves time on both Macs.
+- **A steady mesh list:** every 3 s each Mac checks the Macs it has seen
+  (at their last address, remembered in `known_macs.json`) and Bonjour is
+  browsed every 15 s. A Mac is dropped from jobs only after 3 missed checks.
+  Macs say hello to each other when macmesh starts and when lending changes,
+  so both sides show the same list quickly.
+- **The fastest link:** each Mac advertises which of its addresses are wired
+  (Ethernet, Thunderbolt) and which are Wi-Fi. When both Macs have a wired
+  link, macmesh uses it.
 - **Lid closed / Wi-Fi dropped:** status calls time out after 2 s, and a Mac
   that misses two in a row has its chunk re-queued (about 4 s). A transfer
   that stalls for 10 s counts as dead too. The Mac rejoins automatically when
@@ -451,7 +461,8 @@ The suite starts in-process workers to stand in for Macs. It covers:
    heavy filters, motion-graphics renders and AI passes.
 3. **Peer-to-peer Wi-Fi and sleep notices in the app:** `Network.framework`
    with `includePeerToPeer = true` would give AirDrop-style Wi-Fi (AWDL)
-   without a shared router. The app could also catch sleep notifications, so
+   without a shared router (not built yet: today macmesh uses the router's
+   Wi-Fi, or a cable when there is one). The app could also catch sleep notifications, so
    a Mac about to sleep hands work back the way shutdown already does; today
    sleep is noticed by the 4 s heartbeat.
 4. **Real thermal state:** read `ProcessInfo.thermalState` (via the Swift

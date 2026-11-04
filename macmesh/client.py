@@ -87,6 +87,20 @@ class NodeClient:
         self.info = info
         return info
 
+    def hello(self, node_id: str, port: int) -> None:
+        """Tell this Mac ours started or changed, so it checks on us now."""
+        try:
+            self._json("POST", "/hello", {"node_id": node_id, "port": port})
+        except NodeError:
+            pass
+
+    def job_ended(self, job_id: str) -> None:
+        """Tell this Mac a job it helped with is over (its job card there becomes history)."""
+        try:
+            self._json("POST", f"/jobs/{job_id}/end", {})
+        except NodeError:
+            pass  # it'll notice on its own after a quiet while
+
     def request_install(self, program: str, by: str) -> dict:
         """Ask this Mac to set up `program` (its owner decides). Returns {"state", ...}."""
         code, body = self._json("POST", "/install", {"program": program, "by": by})

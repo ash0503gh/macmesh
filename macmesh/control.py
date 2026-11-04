@@ -49,11 +49,15 @@ from .planners.ai import MEDIA_EXT, plan_to_job, plan_with_agent, unsafe_reasons
 from .planners.app import probe_fps, probe_frames
 from .planners.range import NEEDS_FPS
 from .planners.sizes import shrinking, shrinking_frames
-from .client import NodeError
+from .client import NodeClient, NodeError
 from .scheduler import JobFailed, Scheduler
 
 VIDEO_EXT = MEDIA_EXT - {".wav", ".aif", ".aiff", ".mp3", ".m4a"}
 REFRESH = 10.0
+CHECK_EVERY = 3.0     # Macs already known are checked directly (no Bonjour) this often
+BROWSE_EVERY = 15.0   # Bonjour looks for new Macs, and Macs whose address changed, this often
+GONE_AFTER = 3        # missed checks in a row before a Mac shows as "not seen"
+FORGET_AFTER = 120.0  # a Mac not seen for this long leaves the list
 MAX_LINE = 1 << 20
 
 
@@ -203,6 +207,14 @@ class Control:
         self.lock = threading.Lock()
         self.nodes: list = []
         self.nodes_at = 0.0
+        # Every Mac seen: node id -> {"client", "addresses", "last_ok", "misses"}. A Mac stays listed
+        # through a missed check or two (Bonjour on Wi-Fi drops replies); known_macs.json keeps their
+        # addresses so a restart reconnects at once.
+        self.known: dict[str, dict] = {}
+        self.poke = threading.Event()
+        self._browsed = 0.0
+        if worker is not None:
+            worker.on_hello = self._hello
         self.pairing: pairing.PairingServer | None = None
         self.pairing_ad = None
         self.pairing_problem = ""
@@ -211,18 +223,118 @@ class Control:
 
     # ---- the Macs ------------------------------------------------------
     def _refresh_loop(self) -> None:
+        for node_id, addresses in self._saved_macs().items():
+            self.known[node_id] = {"client": None, "addresses": addresses, "last_ok": 0.0, "misses": 0}
+        said_hello = False
         while not self.stopped.is_set():
-            self.refresh()
-            self.stopped.wait(REFRESH)
+            try:
+                self._cycle(browse=time.time() - self._browsed >= BROWSE_EVERY or self.poke.is_set())
+            except Exception:  # discovery must never take the daemon down
+                pass
+            if not said_hello and self.nodes:
+                self.say_hello()
+                said_hello = True
+            self.poke.clear()
+            self.poke.wait(CHECK_EVERY)
 
     def refresh(self) -> list:
-        try:
-            found = mesh.find_nodes(self.cfg, seconds=2.0)
-        except Exception:  # discovery must never take the daemon down
-            found = []
+        """Look now (Bonjour included) and return the Macs that answer."""
+        self._cycle(browse=True)
         with self.lock:
-            self.nodes, self.nodes_at = found, time.time()
-        return found
+            return list(self.nodes)
+
+    def _cycle(self, browse: bool) -> None:
+        if browse or not self.known:
+            self._browsed = time.time()
+            try:
+                for c in mesh.find_nodes(self.cfg, seconds=2.0):
+                    self._seen(c.info["node_id"], c)
+            except Exception:
+                pass
+        checks = []
+        for node_id, k in list(self.known.items()):
+            if browse and k["last_ok"] >= self._browsed:
+                continue  # just answered the browse
+            t = threading.Thread(target=self._check, args=(node_id, k), daemon=True)
+            t.start()
+            checks.append(t)
+        for t in checks:
+            t.join(4)
+        now = time.time()
+        for node_id, k in list(self.known.items()):
+            if k["misses"] and now - k["last_ok"] > FORGET_AFTER:
+                del self.known[node_id]
+        with self.lock:
+            self.nodes = [k["client"] for k in self.known.values() if k["client"] and k["misses"] < GONE_AFTER]
+            self.nodes_at = now
+        self._save_macs()
+
+    def _check(self, node_id: str, k: dict) -> None:
+        """Ask a known Mac directly at its last address (then its others)."""
+        tls = pki.context(server=False) if self.cfg.get("tls", True) else None
+        addresses = ([k["client"].address] if k["client"] else []) + [a for a in k["addresses"]
+                                                                       if not k["client"] or a != k["client"].address]
+        for addr in addresses:
+            c = NodeClient(addr, self.cfg["token"], tls=tls, revoked=self.cfg.get("revoked", []))
+            try:
+                if c.fetch_info().get("node_id") == node_id:
+                    self._seen(node_id, c)
+                    return
+            except NodeError:
+                continue
+        k["misses"] += 1
+
+    def _seen(self, node_id: str, client) -> None:
+        k = self.known.setdefault(node_id, {"client": None, "addresses": [], "last_ok": 0.0, "misses": 0})
+        k["client"], k["last_ok"], k["misses"] = client, time.time(), 0
+        if client.address in k["addresses"]:
+            k["addresses"].remove(client.address)
+        k["addresses"].insert(0, client.address)
+        del k["addresses"][4:]
+
+    def _saved_macs(self) -> dict:
+        try:
+            return {k: list(v) for k, v in json.loads((self.home / "known_macs.json").read_text()).items()}
+        except (OSError, ValueError, AttributeError):
+            return {}
+
+    def _save_macs(self) -> None:
+        try:
+            (self.home / "known_macs.json").write_text(json.dumps({k: v["addresses"] for k, v in self.known.items()}))
+        except OSError:
+            pass
+
+    def _hello(self, ip: str, body: dict) -> None:
+        """Another Mac says it started or changed: check it now instead of on the next round."""
+        node_id, port = str(body.get("node_id") or ""), body.get("port")
+        if node_id and node_id != self.cfg["node_id"] and port:
+            k = self.known.setdefault(node_id, {"client": None, "addresses": [], "last_ok": 0.0, "misses": 0})
+            addr = f"{ip}:{int(port)}"
+            if addr not in k["addresses"]:
+                k["addresses"].append(addr)
+        self.poke.set()
+
+    def say_hello(self) -> None:
+        """Tell the other Macs this one started or changed (lending, limit), so they update at once."""
+        with self.lock:
+            others = [c for c in self.nodes if c.info.get("node_id") != self.cfg["node_id"]]
+        for c in others:
+            threading.Thread(target=c.hello, args=(self.cfg["node_id"], int(self.cfg["port"])), daemon=True).start()
+
+    def _job_clients(self) -> list:
+        """Fresh connections to the Macs known to be up (a job's own; no Bonjour wait)."""
+        with self.lock:
+            known = [c.address for c in self.nodes]
+        tls = pki.context(server=False) if self.cfg.get("tls", True) else None
+        found = []
+        for addr in known:
+            c = NodeClient(addr, self.cfg["token"], tls=tls, revoked=self.cfg.get("revoked", []))
+            try:
+                c.fetch_info()
+                found.append(c)
+            except NodeError:
+                continue
+        return found or mesh.find_nodes(self.cfg, seconds=2.0)
 
     def _mac(self, c) -> dict:
         i = c.info
@@ -239,10 +351,34 @@ class Control:
                 "programs": i.get("programs", []), "sandboxed": i.get("sandboxed", False),
                 "fingerprint": c.fingerprint}
 
+    def _links(self) -> dict[str, float]:
+        """The latest measured upload speed to each Mac (bytes/s), from jobs' remembered speeds."""
+        try:
+            known = json.loads((self.home / "speeds.json").read_text())
+        except (OSError, ValueError):
+            return {}
+        latest: dict[str, tuple] = {}
+        for key, v in known.items():
+            node_id = key.split("|", 1)[0]
+            if v.get("upload_bps") and v.get("at", 0) >= latest.get(node_id, (0, 0))[0]:
+                latest[node_id] = (v.get("at", 0), float(v["upload_bps"]))
+        return {k: bps for k, (_, bps) in latest.items()}
+
     def m_macs(self) -> list:
         with self.lock:
             nodes = list(self.nodes)
-        return [self._mac(c) for c in nodes]
+        macs = [self._mac(c) for c in nodes]
+        links = self._links()
+        for m in macs:
+            if not m["this_mac"] and m["node_id"] in links:
+                m["upload_mbps"] = round(links[m["node_id"]] / 1e6, 1)
+        now = time.time()
+        for k in list(self.known.values()):  # missed a few checks: still listed, as not seen lately
+            if k["client"] and k["misses"] >= GONE_AFTER:
+                mac = self._mac(k["client"])
+                mac.update(state="unavailable", reason=f"not seen for {int(now - k['last_ok'])} s")
+                macs.append(mac)
+        return macs
 
     # ---- what this Mac knows -------------------------------------------
     def m_apps(self) -> list:
@@ -385,7 +521,7 @@ class Control:
 
     def _run(self, record: Job, final: str | None) -> None:
         try:
-            clients = [c for c in mesh.find_nodes(self.cfg, seconds=2.0)
+            clients = [c for c in self._job_clients()
                        if not record.spec.get("macs") or c.info["node_id"] in record.spec["macs"]]
             if not clients:
                 raise JobFailed("no Macs are available")
@@ -437,32 +573,30 @@ class Control:
         return sorted(jobs + self._lending(), key=lambda j: j.get("created") or 0, reverse=True)
 
     def _lending(self) -> list:
-        """Work this Mac is doing for other Macs right now, one entry per job they asked for."""
+        """Work this Mac is doing for other Macs: one steady entry per job it's helping with, from the
+        first task until that job ends (worker.Helping), with what's running here now."""
         if not self.worker:
             return []
+        h = self.worker.helping
         with self.worker.lock:
-            tasks = [t for t in self.worker.tasks.values() if t.state in ("queued", "running", "paused")]
-        groups: dict[str, dict] = {}
-        for t in tasks:
-            origin = t.spec.get("origin") or {}
-            if origin.get("node_id") == self.cfg["node_id"]:
-                continue  # this Mac's own jobs show as jobs
-            key = origin.get("job_id") or t.id.split("-")[0]
-            g = groups.setdefault(key, {
-                "id": f"lend-{key}", "kind": "lending", "state": "running", "error": "", "output": "",
-                "name": f"For {origin.get('name') or 'another Mac'}: {origin.get('job') or 'a job'}",
-                "tasks": 0, "done": 0, "progress": 0.0, "elapsed": 0.0, "eta": None, "speedup": None,
-                "created": t.started or time.time(), "chunks": [],
-                "macs": [{"name": self.cfg["node_name"], "done": 0, "running": 0}]})
-            g["tasks"] += 1
-            g["macs"][0]["running"] += t.state == "running"
-            g["chunks"].append({"state": "running" if t.state == "running" else "pending", "mac": self.cfg["node_name"]})
-            if t.started:
-                g["created"] = min(g["created"], t.started)
-                g["elapsed"] = round(max(g["elapsed"], time.time() - t.started), 1)
-            if t.state == "paused":
-                g["state"] = "paused"
-        return list(groups.values())
+            tasks = [t for t in self.worker.tasks.values() if t.state in ("queued", "running", "paused") and not t.own]
+        with h.lock:
+            active = [dict(r, load=list(r["load"])) for r in h.active.values()]
+        now, found = time.time(), []
+        for rec in active:
+            mine = [t for t in tasks if str((t.spec.get("origin") or {}).get("job_id")) == rec["job_id"]]
+            doing = [{"label": next((i.get("filename") for i in t.spec.get("inputs", {}).values()), t.id),
+                      "phase": t.state, "since": round(now - (t.started or now), 1), "bytes": 0, "total": 0}
+                     for t in mine]
+            state = "paused" if any(t.state == "paused" for t in mine) else "running" if mine else "waiting"
+            found.append({
+                "id": f"lend-{rec['job_id']}", "kind": "lending", "state": state, "error": "", "output": "",
+                "name": f"For {rec['by']}: {rec['job']}", "tasks": rec["done"] + len(mine), "done": rec["done"],
+                "progress": 0.0, "elapsed": round(now - rec["started"], 1), "eta": None, "speedup": None,
+                "created": rec["started"], "chunks": [],
+                "macs": [{"name": self.cfg["node_name"], "done": rec["done"], "running": len(mine), "doing": doing,
+                          "load": rec["load"], "workers": self.worker.workers()}]})
+        return found
 
     def _job(self, id: str) -> Job:
         with self.lock:
@@ -489,6 +623,7 @@ class Control:
         saved = config.load() if config.config_path().exists() else dict(self.cfg)
         saved["lend"] = bool(on)
         config.save(saved)
+        self.say_hello()
         return self.m_status()
 
     def m_owner(self, mode: str | None = None, limit: float | None = None) -> dict:
@@ -508,6 +643,7 @@ class Control:
         saved = config.load()
         saved["owner"].update(changes)
         config.save(saved)
+        self.say_hello()
         return self.m_status()
 
     def m_status(self) -> dict:
@@ -523,6 +659,7 @@ class Control:
                 "fingerprint": pki.own_fingerprint(self.home) if pki.ready(self.home) else "",
                 "mesh": self._mesh_id(), "firewall": firewall.state(), "version": __version__,
                 "installs": self.worker.installer.list() if self.worker else [],
+                "helped": list(reversed(self.worker.helping.history[-10:])) if self.worker else [],
                 "output_dir": str(Path(self.cfg.get("output_dir", "~/Movies/macmesh")).expanduser()),
                 "macs": self.m_macs(), "jobs": self.m_jobs()[:10]}
 

@@ -387,7 +387,8 @@ class FasterRulesTests(unittest.TestCase):
             t.step(running=t.n, waiting=1, now=now)
         self.assertEqual(t.n, 1)
 
-    def scheduler(self, costs, tmp):
+    @staticmethod
+    def scheduler(_, costs, tmp):
         class Fake:
             def __init__(self, name, node_id):
                 self.address, self.name, self.info = f"{name}:1", name, {"node_id": node_id, "slots": 1, "programs": ["x"]}
@@ -404,7 +405,7 @@ class FasterRulesTests(unittest.TestCase):
 
     def test_longest_first_and_near_the_end_only_where_it_finishes_soonest(self):
         tmp = Path(tempfile.mkdtemp())
-        s = self.scheduler([10, 100, 50], tmp)
+        s = self.scheduler(self, [10, 100, 50], tmp)
         fast, slow = s.nodes
         fast.speeds, slow.speeds = [10.0], [1.0]
         slow.upload_bps = [1e6]  # 4 MB takes 4 s to reach it
@@ -416,18 +417,18 @@ class FasterRulesTests(unittest.TestCase):
         picked = s._pick(slow)
         self.assertNotEqual(picked and picked.spec["cost"], 100)
         # ...and with plenty of work left it just takes the longest, so nothing sits idle.
-        busy = self.scheduler([10] * 20 + [100], tmp)
+        busy = self.scheduler(self, [10] * 20 + [100], tmp)
         busy.nodes[0].speeds, busy.nodes[1].speeds = [10.0], [1.0]
         self.assertEqual(busy._pick(busy.nodes[1]).spec["cost"], 100)
         shutil.rmtree(tmp, ignore_errors=True)
 
     def test_speeds_are_remembered_between_jobs(self):
         tmp = Path(tempfile.mkdtemp())
-        s = self.scheduler([10, 20], tmp)
+        s = self.scheduler(self, [10, 20], tmp)
         s.nodes[0].speeds = [9.0, 11.0]
         s.nodes[1].speeds, s.nodes[1].upload_bps = [2.0, 2.0], [5e6]
         s._remember()
-        again = self.scheduler([10, 20], tmp)
+        again = self.scheduler(self, [10, 20], tmp)
         self.assertEqual(again.nodes[0].speeds, [10.0])
         self.assertEqual((again.nodes[1].speeds, again.nodes[1].upload_bps), ([2.0], [5e6]))
         shutil.rmtree(tmp, ignore_errors=True)
@@ -444,6 +445,60 @@ class FasterRulesTests(unittest.TestCase):
         self.assertGreater(costs["long.mp3"], 3 * costs["short.mp3"])  # though long.mp3 is the smaller file
         self.assertEqual({t["unit"] for t in job["tasks"]}, {"media-seconds"})
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+class LinksAndPrefetchTests(unittest.TestCase):
+    def test_wired_addresses_first_only_when_this_mac_has_a_cable_too(self):
+        from macmesh import discovery
+        ips = {"192.168.31.5", "169.254.3.4"}
+        links = {"169.254.3.4": "wired", "192.168.31.5": "wifi"}
+        self.assertEqual(discovery.order_addresses(ips, links, "192.168.31.190", True), ["169.254.3.4", "192.168.31.5"])
+        self.assertEqual(discovery.order_addresses(ips, links, "192.168.31.190", False), ["192.168.31.5", "169.254.3.4"])
+
+    def test_a_mac_on_a_slow_link_gets_more_queued_ahead(self):
+        tmp = Path(tempfile.mkdtemp())
+        s = FasterRulesTests.scheduler(None, [60.0] * 10, tmp)
+        fast, slow = s.nodes
+        fast.speeds, slow.speeds = [1.0], [1.0]    # a minute per chunk on either
+        slow.upload_bps = [40_000]                   # 4 MB takes 100 s to reach it
+        self.assertEqual(s._capacity(fast), 2)       # this Mac: one running, one next
+        self.assertEqual(s._capacity(slow), 1 + 1 + 1)  # enough queued to hide the upload
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_stems_are_stored_not_recompressed(self):
+        wrapper = json.loads((Path(profiles.PACKAGED) / "demucs-stem.json").read_text())["install"]["files"]["demucs-stem"]
+        self.assertIn("zip -q -0 -j", wrapper)
+        self.assertIn('echo "demucs-stem 1.0.0"', wrapper)  # same build as before: Macs still match
+
+
+class HelpingTests(MeshCase):
+    """A helper's view of a job: one steady record from first task to the end signal, then history."""
+
+    def test_a_helped_job_stays_one_card_until_it_ends(self):
+        air = self.nodes[1]
+        origin = {"node_id": "pro-id", "job_id": "j1", "job": "Stems", "name": "Pro"}
+        h = air.worker.helping
+        h.started(origin)
+        h.finished(origin, ok=True)  # one task done, none running: between tasks
+        self.assertEqual(h.active["j1"]["done"], 1)
+        cfg = dict(config.defaults(), token=TOKEN, tls=False, node_name="air", node_id=air.worker.cfg["node_id"],
+                   peers=[], tools={})
+        os.environ["MACMESH_HOME"] = str(air.home)
+        ctl = control.Control(cfg, worker=air.worker, home=air.home)
+        try:
+            cards = ctl._lending()
+            self.assertEqual([(c["name"], c["state"], c["done"]) for c in cards], [("For Pro: Stems", "waiting", 1)])
+            air.client().job_ended("j1")  # the asking Mac says it's over
+            self.assertEqual(ctl._lending(), [])
+            self.assertEqual(ctl.m_status()["helped"][0]["job"], "Stems")
+            self.assertEqual(json.loads((air.home / "helped.json").read_text())[-1]["done"], 1)
+            h.started(dict(origin, job_id="j2"))
+            h.active["j2"]["last"] -= 1000  # nothing from the asking Mac for a long while
+            h.sweep(set())
+            self.assertNotIn("j2", h.active)
+        finally:
+            ctl.stopped.set()
+            ctl.poke.set()
 
 
 class OwnWorkTests(MeshCase):
@@ -1149,6 +1204,11 @@ class ControlTests(MeshCase):
         self.assertEqual(Path(job["output"]).name, "ad (macmesh)")
         self.assertEqual(len(os.listdir(job["output"])), 120)
         self.assertEqual(self.client.call("jobs")[0]["id"], job["id"])
+        for _ in range(50):  # each helper turned its card into history when the job ended
+            if all(n.worker.helping.history for n in self.nodes):
+                break
+            time.sleep(0.1)
+        self.assertTrue(all(n.worker.helping.history and not n.worker.helping.active for n in self.nodes))
 
     def test_a_running_job_shows_what_each_mac_is_doing(self):
         os.environ["FAKE_BUSY"] = "6"  # each chunk keeps a core busy for 6 s
@@ -1176,6 +1236,29 @@ class ControlTests(MeshCase):
         self.assertGreater(sum(m["sent"] for m in job["macs"]), 0)  # the project and its media went out
         self.assertTrue(any("on pro in" in e["text"] for e in job["events"]), job["events"])
         self.assertTrue(all(e["at"] > job["created"] - 1 for e in job["events"]))
+
+    def test_macs_stay_listed_through_missed_checks_and_say_hello(self):
+        self.ctl.refresh()
+        extra = Node(self.tmp, "mini", self.tools)
+        self.ctl.cfg["peers"] = [n.address for n in self.nodes] + [extra.address]
+        self.ctl.refresh()
+        self.assertEqual(len(self.ctl.m_macs()), 3)
+        extra.stop()  # it goes quiet
+        self.ctl._cycle(browse=False)
+        self.assertEqual(len(self.ctl.m_macs()), 3)  # one missed check: still there
+        self.ctl._cycle(browse=False)
+        self.ctl._cycle(browse=False)
+        gone = [m for m in self.ctl.m_macs() if m["name"] == "mini"]
+        self.assertEqual((gone[0]["state"], gone[0]["reason"][:12]), ("unavailable", "not seen for"))
+        self.nodes[0].client().hello("a1b2c3", 9999)  # another Mac says it started
+        self.assertIn("127.0.0.1:9999", self.ctl.known["a1b2c3"]["addresses"])
+
+    def test_link_speed_shows_from_past_jobs(self):
+        self.ctl.refresh()
+        air = next(m for m in self.ctl.m_macs() if m["name"] == "air")
+        (self.home / "speeds.json").write_text(json.dumps({f"{air['node_id']}|x|s": {"upload_bps": 800_000, "at": 1}}))
+        air = next(m for m in self.ctl.m_macs() if m["name"] == "air")
+        self.assertEqual(air["upload_mbps"], 0.8)
 
     def test_command_line_jobs_run_in_the_engine(self):
         from contextlib import redirect_stdout

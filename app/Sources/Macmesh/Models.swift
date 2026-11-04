@@ -22,6 +22,19 @@ struct MeshStatus: Decodable, Equatable {
     var firewall: Firewall?
     var version: String?
     var installs: [InstallRequest]?
+    var helped: [Helped]?
+
+    /// A job this Mac helped another Mac with, now finished.
+    struct Helped: Decodable, Equatable, Identifiable {
+        var jobId: String
+        var job: String
+        var by: String
+        var started: Double
+        var finished: Double
+        var done: Int
+        var failed: Int
+        var id: String { jobId }
+    }
 
     /// Another Mac's job needs a program this Mac lacks; its owner decides whether to set it up.
     struct InstallRequest: Decodable, Equatable, Identifiable {
@@ -84,6 +97,7 @@ struct Mac: Decodable, Equatable, Identifiable {
     var programs: [String]
     var sandboxed: Bool
     var fingerprint: String
+    var uploadMbps: Double?   // measured speed of sending files to it (MB/s), from past jobs
 
     var id: String { nodeId }
     var isLaptop: Bool { (model ?? "").localizedCaseInsensitiveContains("book") }
@@ -250,7 +264,8 @@ enum Format {
     static func jobState(_ job: Job) -> String {
         switch job.state {
         case "starting": return "Finding Macs…"
-        case "running" where job.kind == "lending": return "Working · \(job.tasks) \(job.tasks == 1 ? "chunk" : "chunks")"
+        case "running" where job.kind == "lending", "waiting":
+            return "\(job.done) done here \u{00B7} helping for \(duration(job.elapsed))"
         case "paused": return "Paused while you use this Mac"
         case "running": return job.eta.map { "About \(duration($0)) left" } ?? (job.done > 0 ? "Working…" : "Measuring speed…")
         case "merging": return "Joining the pieces…"

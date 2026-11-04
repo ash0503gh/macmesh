@@ -43,6 +43,8 @@ MAX_JSON = 1 << 20
 OWNER_POLL = 2.0
 GOVERN_EVERY = 1.0   # seconds between measurements of the whole Mac
 DUTY_PERIOD = 0.1    # tasks run for duty x this, then stop for the rest
+HELP_QUIET_END = 120.0  # a job helped with that sends nothing for this long counts as finished
+HELP_HISTORY = 20       # helped jobs remembered
 GC_EVERY = 60.0
 ACTIVE = ("queued", "running", "paused")
 QOS = {"utility", "background", "maintenance"}
@@ -96,6 +98,8 @@ class Worker:
         # How many tasks run at once is measured, not set (tuning.py); "auto_workers": false pins
         # cfg["slots"] instead (tests rely on a fixed number).
         self.tuner = tuning.AutoWorkers(self.root / "tuning.json", at_limit=lambda: self.governor.duty < 0.9)
+        self.helping = Helping(self.root / "helped.json")
+        self.on_hello = lambda ip, body: None  # the control daemon sets this: another Mac says hello
         self.slots = SlotGate(self.workers)
         self.extract_lock = threading.Lock()
         self.fingerprints = toolinfo.fingerprints(cfg, self.root)
@@ -193,6 +197,10 @@ class Worker:
                 waiting = sum(t.state == "queued" for t in self.tasks.values())
             try:
                 self.tuner.step(running, waiting)
+                with self.lock:
+                    busy = {str((t.spec.get("origin") or {}).get("job_id")) for t in self.tasks.values()
+                            if t.state in ACTIVE}
+                self.helping.sweep(busy)
             except Exception:  # measuring must never take the worker down
                 pass
 
@@ -292,6 +300,9 @@ class Worker:
             jobs = meter.sample(roots, time.time())
             self.load = {"at": time.time(), "gpu": sysinfo.gpu_percent(), "jobs": jobs, "cores": meter.cores,
                          "duty": round(self.governor.duty, 2), "limit": self.governor.limit}
+            for job_id, cpu in jobs.items():  # the helper's own graph, per job it helps with
+                self.helping.sample(job_id, {"at": round(self.load["at"], 1), "cpu": cpu, "gpu": self.load["gpu"],
+                                             "cores": meter.cores, "duty": self.load["duty"], "limit": self.load["limit"]})
 
     def _gc_loop(self) -> None:
         while not self.stopped.wait(GC_EVERY):
@@ -336,6 +347,8 @@ class Worker:
             task.own = self.is_own(spec)
             self.tasks[tid] = task
         self.tuner.started(steps[0][0])
+        if not task.own:
+            self.helping.started(spec.get("origin") or {})
         threading.Thread(target=self._run, args=(task, [programs[a[0]] for a in steps]), daemon=True).start()
         return task
 
@@ -356,10 +369,14 @@ class Worker:
                 if rc != 0:
                     task.state = "failed"
                     task.error = task.error or f"exit code {rc}"
+                    if not task.own:
+                        self.helping.finished(task.spec.get("origin") or {}, ok=False)
                 else:
                     self._collect(task)
                     task.state = "done"
                     self.tuner.finished(float(task.spec.get("cost") or 1.0))
+                    if not task.own:
+                        self.helping.finished(task.spec.get("origin") or {}, ok=True)
             except Exception as e:  # report anything to the coordinator
                 if task.state not in ("cancelled", "yielded"):
                     task.state, task.error = "failed", f"{type(e).__name__}: {e}"
@@ -579,6 +596,65 @@ class Worker:
         return self.yield_all(f"yielded: {reason}")
 
 
+class Helping:
+    """The jobs this Mac is helping other Macs with: one steady record per job, from its first task
+    until the asking Mac says it's finished (or HELP_QUIET_END with nothing from it), then kept as
+    history in helped.json, so the owner sees what their Mac was used for."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.active: dict[str, dict] = {}
+        try:
+            self.history: list[dict] = json.loads(path.read_text())[-HELP_HISTORY:]
+        except (OSError, ValueError):
+            self.history = []
+
+    def started(self, origin: dict) -> None:
+        key = str(origin.get("job_id") or "")
+        if not key:
+            return
+        now = time.time()
+        with self.lock:
+            rec = self.active.setdefault(key, {"job_id": key, "job": origin.get("job") or "a job",
+                                               "by": origin.get("name") or "another Mac", "started": now,
+                                               "done": 0, "failed": 0, "load": []})
+            rec["last"] = now
+
+    def finished(self, origin: dict, ok: bool) -> None:
+        with self.lock:
+            rec = self.active.get(str(origin.get("job_id") or ""))
+            if rec:
+                rec["done" if ok else "failed"] += 1
+                rec["last"] = time.time()
+
+    def sample(self, job_id: str, point: dict) -> None:
+        with self.lock:
+            rec = self.active.get(job_id)
+            if rec:
+                rec["load"].append(point)
+                del rec["load"][:-60]
+
+    def ended(self, job_id: str) -> bool:
+        with self.lock:
+            rec = self.active.pop(job_id, None)
+            if not rec:
+                return False
+            self.history.append({k: v for k, v in rec.items() if k != "load"} | {"finished": time.time()})
+            del self.history[:-HELP_HISTORY]
+            try:
+                self.path.write_text(json.dumps(self.history, indent=1))
+            except OSError:
+                pass
+        return True
+
+    def sweep(self, busy: set[str]) -> None:
+        """Jobs with no work here and nothing from the asking Mac for a while are over."""
+        now = time.time()
+        for key in [k for k, r in list(self.active.items()) if k not in busy and now - r["last"] > HELP_QUIET_END]:
+            self.ended(key)
+
+
 class SlotGate:
     """Lets at most `limit()` tasks run at once, reading the limit live (it changes from the app)."""
 
@@ -717,6 +793,15 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         if not self._auth(body):
             return
+        p = self._parts()
+        if p == ["hello"]:
+            try:
+                self.worker.on_hello(self.client_address[0], json.loads(body or b"{}"))
+            except (ValueError, TypeError):
+                pass
+            return self._reply(200, {"hello": True})
+        if len(p) == 3 and p[0] == "jobs" and p[2] == "end":  # the asking Mac's job is over
+            return self._reply(200, {"ended": self.worker.helping.ended(p[1])})
         if self._parts() == ["install"]:
             try:
                 req = json.loads(body)

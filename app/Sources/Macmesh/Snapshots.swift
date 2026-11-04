@@ -5,17 +5,17 @@ import SwiftUI
 @MainActor
 enum Snapshots {
     static func mac(_ name: String, _ model: String, _ chip: String, state: String = "ready", reason: String = "",
-                    this: Bool = false, fanless: Bool = false) -> Mac {
+                    this: Bool = false, fanless: Bool = false, link: Double? = nil) -> Mac {
         Mac(nodeId: name.lowercased().replacingOccurrences(of: " ", with: ""), name: name, address: "10.0.0.2:7477",
             thisMac: this, model: model, chip: chip, fanless: fanless, score: 7, cores: 10, memoryGb: 16, slots: 2, state: state, reason: reason,
             onBattery: false, batteryPct: nil, programs: ["ffmpeg", "filmcraft"], sandboxed: true,
-            fingerprint: String(repeating: "a1b2c3d4", count: 8))
+            fingerprint: String(repeating: "a1b2c3d4", count: 8), uploadMbps: link)
     }
 
     static let macs = [
         mac("Maya's MacBook Pro", "MacBook Pro", "Apple M5", state: "working", this: true),
-        mac("MacBook Air", "MacBook Air", "Apple M3", state: "working", fanless: true),
-        mac("Mac Studio", "Mac Studio", "Apple M4 Max", state: "working"),
+        mac("MacBook Air", "MacBook Air", "Apple M3", state: "working", fanless: true, link: 0.8),
+        mac("Mac Studio", "Mac Studio", "Apple M4 Max", state: "working", link: 92),
         mac("Noor's MacBook", "MacBook Pro", "Apple M2 Pro", state: "paused", reason: "owner using 72% CPU"),
         mac("Old iMac", "iMac", "Apple M1", state: "unavailable", reason: "not lending"),
     ]
@@ -73,6 +73,17 @@ enum Snapshots {
               updated: Date().timeIntervalSince1970 - 86_500, jobIds: ["j1"], hasPlan: true),
         .init(id: "c3", title: "Re-encode the vlog to HEVC", created: 1_792_500_000, updated: 1_792_500_000, jobIds: ["j2"], hasPlan: true),
     ]
+    static let helping = Job(id: "lend-j1", name: "For Leo\u{2019}s MacBook Air: Party set stems", state: "running", error: "",
+                             output: "", tasks: 8, done: 6, progress: 0, elapsed: 520, eta: nil,
+                             macs: [.init(nodeId: nil, name: "Maya's MacBook Pro", done: 6, running: 2,
+                                          doing: [.init(label: "Firestone.mp3", phase: "running", since: 52, bytes: 0, total: 0),
+                                                  .init(label: "Wiggle.mp3", phase: "queued", since: 4, bytes: 0, total: 0)],
+                                          load: load(28, 72, duty: 0.8), workers: 2)],
+                             chunks: [], speedup: nil, created: 0, kind: "lending")
+    static let helpedBefore: [MeshStatus.Helped] = [
+        .init(jobId: "j0", job: "Vlog 12 to HEVC", by: "Leo\u{2019}s MacBook Air", started: Date().timeIntervalSince1970 - 90_000,
+              finished: Date().timeIntervalSince1970 - 89_000, done: 9, failed: 0),
+    ]
     static let finished = [
         Job(id: "b1", name: "Launch ad (motion)", state: "done", error: "", output: "/tmp/x.mov", tasks: 8, done: 8, progress: 1,
             elapsed: 74, eta: nil, macs: [.init(nodeId: "a", name: "This Mac", done: 5, running: 0)], chunks: [],
@@ -103,13 +114,14 @@ enum Snapshots {
                                     error: "", awaitingOk: false)
 
     static func status(jobs: [Job], macs: [Mac]? = nil, paused: Int = 0, requests: Bool = false,
-                       blockedFirewall: Bool = false) -> MeshStatus {
+                       blockedFirewall: Bool = false, helped: [MeshStatus.Helped]? = nil) -> MeshStatus {
         let macs = macs ?? Self.macs
         return MeshStatus(nodeId: "mayasmacbookpro", name: "Maya's MacBook Pro", lend: true, accepting: true, reason: "",
                    running: 2, paused: paused, ownerMode: "shared", tls: true, holdsCa: true,
                    fingerprint: "0b4109f4ba1c7033bf0ac00db1c03e381d2d4f9a1864c0d393d8efde5d1aeeaa",
                    outputDir: "/Users/me/Movies/macmesh", mesh: "0b4109f4ba1c",
                    firewall: .init(on: true, blockAll: false, blocked: blockedFirewall, program: "/Applications/macmesh.app/Contents/Resources/engine/python/bin/python3.13"),
+                   helped: helped,
                    invite: .init(code: "7K2Q-M9XD-4TRA", state: "waiting", expires: nil, joined: nil, error: nil,
                                  requests: requests ? [.init(id: "r1", name: "Noor's MacBook", number: "736 487", age: 4)] : []),
                    macs: macs, jobs: jobs)
@@ -149,6 +161,7 @@ enum Snapshots {
             ("dashboard-jobs-running", dash(.jobs, engine(working))),
             ("dashboard-jobs-empty", dash(.jobs, engine(idle))),
             ("dashboard-macs", dash(.macs, engine(working))),
+            ("dashboard-helping", dash(.jobs, engine(status(jobs: [helping] + finished, helped: helpedBefore)))),
             ("dashboard-apps", dash(.apps, engine(working))),
             ("dashboard-lending", dash(.lending, engine(working))),
             ("dashboard-security", dash(.security, engine(working))),
