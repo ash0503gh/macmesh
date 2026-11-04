@@ -139,7 +139,8 @@ class Scheduler:
         self.keep_blobs = keep_blobs
         # Who asked for this job ({"node_id", "name"}): workers show it, and skip their own Mac's.
         self.origin = dict(origin or {}, job=job["name"], job_id=self.job_id)
-        # installer(client, program) -> {"state"}: asks a Mac that lacks a program to set it up.
+        # installer(client, program[, packages]) -> {"state"}: asks a Mac that lacks a program to set it
+        # up (packages: for a script's Python, the list its name stands for).
         self.installer = installer
         self._install_checked = 0.0
         # Remembered speeds (speeds.json): per Mac, program and cost unit.
@@ -246,10 +247,11 @@ class Scheduler:
         if not self.installer:
             return
         needed = {p for t in self.tasks for p in jobspec.programs(t.spec)}
+        envs = self.job.get("envs", {})  # a script's Python: the packages its name stands for
         for n in self.nodes:
             for prog in sorted(needed - set(n.client.info.get("programs", []))):
                 try:
-                    reply = self.installer(n.client, prog)
+                    reply = self.installer(n.client, prog, *([envs[prog]] if prog in envs else []))
                 except (NodeError, OSError) as e:
                     self.log(f"  ? couldn't ask {n.client.name} to install {prog}: {e}")
                     continue
@@ -568,6 +570,7 @@ class Scheduler:
                 "origin": self.origin,
                 "inputs": inputs,
                 "outputs": {k: Path(v).name for k, v in task.spec["outputs"].items()},
+                **({"output_dirs": task.spec["output_dirs"]} if task.spec.get("output_dirs") else {}),
                 "timeout": task.spec.get("timeout"),
                 "cost": task.spec["cost"],
             })

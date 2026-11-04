@@ -4,11 +4,16 @@ Template placeholders:
   {in:file}     the input file on the worker
   {out:result}  where to write the result (named <stem><out_ext>)
   {stem}        the input's file name without extension
+  {in:NAME}     a file every task gets too (a script, a model), from `extra_inputs`
+
+With `packages`, the template's "python" is a Python with those packages (scripts.py).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+
+from .. import scripts
 
 
 MEDIA = {".mp3", ".m4a", ".wav", ".aif", ".aiff", ".flac", ".ogg", ".mov", ".mp4", ".m4v", ".mkv", ".webm", ".avi", ".mxf"}
@@ -31,7 +36,7 @@ def _durations(paths: list[Path]) -> dict[Path, float]:
 
 
 def plan_batch(files: list[str], template: list[str], out_ext: str, name: str = "batch",
-               workdir: str = "", extra_inputs: dict | None = None) -> dict:
+               workdir: str = "", extra_inputs: dict | None = None, packages: list | None = None) -> dict:
     """One task per file. A task's cost is the file's length when they're all audio or video (work
     on media scales with its duration, not its size), else its size in MB."""
     if not files:
@@ -55,4 +60,4 @@ def plan_batch(files: list[str], template: list[str], out_ext: str, name: str = 
                       "outputs": {"result": f"results/{stem}{out_ext}"},
                       "cost": max(lengths[p], 0.1) if by_length else max(size / 1e6, 0.01),
                       "unit": "media-seconds" if by_length else "mb"})
-    return {"name": name, "workdir": str(wd), "tasks": tasks, "merge": []}
+    return scripts.use_packages({"name": name, "workdir": str(wd), "tasks": tasks, "merge": []}, packages)

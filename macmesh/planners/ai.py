@@ -20,7 +20,7 @@ SCHEMA_DOC = """\
 Reply with ONE JSON object and nothing else:
 {
   "explanation": "1-3 sentences: how you are splitting the work and why",
-  "planner": "app" | "video" | "range" | "batch" | "job",
+  "planner": "app" | "video" | "range" | "batch" | "runs" | "job",
   "params": { ... }
 }
 
@@ -44,7 +44,19 @@ planner "range" — render a frame range with any other command-line renderer:
 
 planner "batch" — one task per file:
   params: {"files": [paths], "template": [full argv including program, using {in:file}
-           {out:result} {stem}], "out_ext": ".ext", "name": job name}
+           {out:result} {stem}], "out_ext": ".ext", "name": job name,
+           "extra_inputs": {name: path} for files every task gets (a script), as {in:name},
+           "packages": ["numpy==2.5.4", ...] when the template's "python" script needs packages}
+
+planner "runs" — the same command N times (shards, seeds, a parameter sweep):
+  params: {"template": [full argv, using {index} (0..count-1), {count}, {in:NAME},
+           {out:result} (an empty folder for that run's results)], "count": int,
+           "inputs": {name: path} (the script, its data), "packages": [...] as for batch,
+           "name": job name}
+
+Scripts: "python" (packages via "packages"; otherwise only the standard library), "zsh" and
+"bash" run a script given as an input, e.g. ["python", "{in:script}", "{in:file}", "{out:result}"].
+They run sandboxed on each Mac: no network, no files beyond their inputs.
 
 planner "job" — anything else: params is a raw job spec:
   {"name": str, "tasks": [{"id": str, "argv": [program, ...{in:NAME}..{out:NAME}...],
@@ -118,7 +130,7 @@ def plan_with_agent(request: str, files: list[str], nodes: list[dict], cfg: dict
     apps = {k: p for k, p in profiles.load(home).items() if p.get("range")}  # the rest are plain tools
     prompt = build_prompt(request, files, nodes, toolinfo.tools(cfg, home), apps)
     plan = extract_plan(ai.ask(prompt, cfg, agent))
-    if plan.get("planner") not in ("app", "video", "range", "batch", "job"):
+    if plan.get("planner") not in ("app", "video", "range", "batch", "runs", "job"):
         raise ValueError(f"agent chose unknown planner {plan.get('planner')!r}")
     if not isinstance(plan.get("params"), dict):
         raise ValueError("agent plan has no params object")

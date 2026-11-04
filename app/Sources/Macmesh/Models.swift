@@ -46,6 +46,8 @@ struct MeshStatus: Decodable, Equatable {
         var detail: String?
         var error: String?
         var id: String { program }
+        /// A script's Python is named python-<hash>: say what it is instead (the list is in the summary).
+        var shownName: String { program.hasPrefix("python-") ? "Python packages" : program }
     }
     var invite: Invite
     var macs: [Mac]

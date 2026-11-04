@@ -110,7 +110,8 @@ class Worker:
         self.draining = ""        # why this worker is going away, or ""
         self.stopped = threading.Event()
         self.watch = owner.OwnerWatch(cfg["owner"], sample=owner_sample)
-        self.installer = install.Installer(self.root, have=lambda name: name in self.programs())
+        self.installer = install.Installer(self.root, have=lambda name: name in self.programs(),
+                                           scripts_ok=lambda: toolinfo.scripts_allowed(self.cfg))
         self.load = {"at": 0.0, "gpu": None, "jobs": {}, "cores": os.cpu_count() or 1}
         threading.Thread(target=self._load_loop, daemon=True).start()
         threading.Thread(target=self._tune_loop, daemon=True).start()
@@ -352,6 +353,8 @@ class Worker:
             _check_filename(inp.get("filename", ""))
         for fname in spec.get("outputs", {}).values():
             _check_filename(fname)
+        if not set(spec.get("output_dirs", [])) <= set(spec.get("outputs", {})):
+            raise ValueError("output_dirs must name outputs")
         with self.lock:
             if tid in self.tasks:
                 raise FileExistsError("duplicate task_id")
@@ -408,6 +411,8 @@ class Worker:
             paths[("in", name)] = str(dest)
         for name, fname in task.spec.get("outputs", {}).items():
             paths[("out", name)] = str(task.dir / "out" / fname)
+            if name in task.spec.get("output_dirs", []):  # a folder the task fills, made for it
+                (task.dir / "out" / fname).mkdir()
 
         def expand(arg: str) -> str:
             def sub(m):
@@ -434,7 +439,9 @@ class Worker:
     def _execute(self, task: Task, steps: list[list[str]]) -> int:
         """Run the steps in order in the task folder; the first that fails ends the task."""
         nice = int(self.cfg.get("nice", 0))
-        env = dict(os.environ, TMPDIR=str(task.dir / "tmp"))
+        env = dict(os.environ, TMPDIR=str(task.dir / "tmp"), PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1")
+        env.pop("PYTHONPATH", None)  # macmesh's own packages aren't the task's (a script's Python has its own)
+        env.pop("PYTHONHOME", None)
         deadline = time.time() + task.spec["timeout"] if task.spec.get("timeout") else None
         with open(task.dir / "task.log", "wb") as log:
             for i, argv in enumerate(steps):
@@ -818,7 +825,9 @@ class Handler(BaseHTTPRequestHandler):
         if self._parts() == ["install"]:
             try:
                 req = json.loads(body)
-                return self._reply(200, self.worker.installer.ask(str(req["program"]), str(req.get("by", "another Mac"))))
+                packages = req.get("packages") if isinstance(req.get("packages"), list) else None
+                return self._reply(200, self.worker.installer.ask(str(req["program"]), str(req.get("by", "another Mac")),
+                                                                  packages))
             except (ValueError, KeyError, TypeError):
                 return self._reply(400, {"error": "say which program to install"})
         if self._parts() != ["tasks"]:

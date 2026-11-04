@@ -40,8 +40,18 @@ JOB_ARGS = {
     "folder": {**S, "description": "A folder whose files are the batch (instead of listing files)"},
     "extensions": {"type": "array", "items": S, "description": "With folder: only these types, e.g. [\".mp3\"]"},
     "recursive": {"type": "boolean", "description": "With folder: include subfolders"},
-    "template": {"type": "array", "items": S, "description": "Batch command, e.g. "
-                 "[\"demucs-stem\", \"{in:file}\", \"{out:result}\"] (the default)"},
+    "template": {"type": "array", "items": S, "description": "The command, e.g. "
+                 "[\"demucs-stem\", \"{in:file}\", \"{out:result}\"] (the batch default). Scripts: "
+                 "[\"python\", \"{in:script}\", ...], [\"zsh\", \"{in:script}\", ...] or [\"bash\", ...]; "
+                 "with count, {index} (0 to count-1) and {count} say which run it is and {out:result} is an "
+                 "empty folder for its results"},
+    "count": {"type": "integer", "minimum": 1, "description": "Run the template this many times (a runs job: "
+              "shards, seeds, a sweep) instead of once per file"},
+    "inputs": {"type": "object", "additionalProperties": S, "description": "Files or folders every task gets, "
+               "by name: {\"script\": \"/path/train.py\", \"data\": \"/path/data\"}, used as {in:script}"},
+    "packages": {"type": "array", "items": S, "description": "Python packages the script needs, e.g. "
+                 "[\"numpy\", \"pandas==2.3.3\"] (pin versions so every Mac gets the same). Each Mac's owner "
+                 "allows them once; without this, \"python\" has only the standard library"},
     "out_ext": {**S, "description": "Batch result extension (default .zip)"},
     "name": {**S, "description": "The job's name (a batch's results folder is named after it)"},
     "output": {**S, "description": "Where results go: a new folder (or file) path"},
@@ -59,7 +69,7 @@ PROMPT = """You're helping the user run a job with macmesh, which splits heavy w
 
 1. Call get_status (the Macs, what each has, how many tasks each runs at once) and list_apps.
 2. Work out the job. Ask ONLY what you can't infer: at most 3 questions, one at a time, using your question picker if you have one, each with sensible default options:
-   a. What to do: re-encode a video, render an app's project, or a batch with one of the programs the Macs have (one task per file).
+   a. What to do: re-encode a video, render an app's project, a batch with one of the programs the Macs have (one task per file), or a script (Python, zsh or bash) run once per file or N times (count, with {index}/{count}: shards, seeds, sweeps). For a Python script, ask which packages it imports if you can't tell, and pin versions.
    b. Which files: a project, a video, or a folder. If they describe a folder loosely, ask for it; then call list_folder to see what's in it and confirm the count ("612 MP3s").
    c. Where results go: default a new folder named after the job in their macmesh folder; ask only if they mentioned a place.
    Don't ask which Macs unless they brought it up: default to all available Macs. Never ask how many tasks run at once: each Mac works that out itself by measuring (it adds tasks while that makes it faster, within its owner's limit and its memory).
@@ -92,8 +102,8 @@ TOOLS = [
      "ask before calling start_job.",
      "inputSchema": _obj(JOB_ARGS), "annotations": {"readOnlyHint": True}},
     {"name": "start_job", "description": "Start a job across the Macs: a project of a known app renders (all "
-     "frames unless start/end are given), a video is re-encoded (preset), or with files/folder each file is "
-     "one task (a batch). Only call it after showing preview_job's result and the user saying yes, with "
+     "frames unless start/end are given), a video is re-encoded (preset), with files/folder each file is "
+     "one task (a batch), or with count the template runs that many times (runs). Only call it after showing preview_job's result and the user saying yes, with "
      "confirmed: true. Returns the job; poll get_job for progress.",
      "inputSchema": _obj({**JOB_ARGS, "confirmed": {"type": "boolean", "description":
                           "true only once the user has said yes to the preview"}}, ["confirmed"])},
@@ -149,8 +159,11 @@ class Server:
                                    "only after they say yes")
             args = {k: v for k, v in args.items() if k != "confirmed"}
             method = "start" if name == "start_job" else "preview"
+            if args.get("count") is not None:
+                return c.call(method, kind="runs", **{k: v for k, v in args.items() if v is not None})
             if not args.get("path") and not args.get("files") and not args.get("folder"):
-                raise ControlError("give path (one project or video), or files or a folder (a batch)")
+                raise ControlError("give path (one project or video), files or a folder (a batch), "
+                                   "or count with a template (runs)")
             if args.get("files") or args.get("folder"):
                 spec = {k: v for k, v in args.items() if v is not None}
                 spec.setdefault("kind", "batch")

@@ -3,10 +3,11 @@
 from .app import plan_app
 from .batch import plan_batch
 from .range import plan_range
+from .runs import plan_runs
 from .video import ENCODE_PRESETS, plan_video
 
-PLANNERS = {"video": plan_video, "range": plan_range, "batch": plan_batch, "app": plan_app}
+PLANNERS = {"video": plan_video, "range": plan_range, "batch": plan_batch, "app": plan_app, "runs": plan_runs}
 # Parameters an AI-written plan may not set (they'd let it choose what runs on this Mac).
 PRIVATE_PARAMS = {"cfg", "home"}
 
-__all__ = ["PLANNERS", "PRIVATE_PARAMS", "ENCODE_PRESETS", "plan_video", "plan_range", "plan_batch", "plan_app"]
+__all__ = ["PLANNERS", "PRIVATE_PARAMS", "ENCODE_PRESETS", "plan_video", "plan_range", "plan_batch", "plan_app", "plan_runs"]

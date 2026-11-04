@@ -44,7 +44,7 @@ import uuid
 from pathlib import Path
 
 from . import __version__, ai, chat, config, firewall, jobspec, media, mesh, pairing, pki, profiles, teach, toolinfo
-from .planners import plan_app, plan_batch, plan_video
+from .planners import plan_app, plan_batch, plan_runs, plan_video
 from .planners.ai import MEDIA_EXT, plan_to_job, plan_with_agent, unsafe_reasons
 from .planners.app import probe_fps, probe_frames
 from .planners.range import NEEDS_FPS
@@ -418,7 +418,9 @@ class Control:
     def plan_job(self, spec: dict) -> dict:
         """spec: {"kind": "app", "path", "app"?, "start"?, "end"?, "vars"?, "chunk"?}
                | {"kind": "video", "path", "preset"?, "vf"?}
-               | {"kind": "batch", "files" | "folder" + "extensions"? + "recursive"?, "template"?, "out_ext"?, "name"?}
+               | {"kind": "batch", "files" | "folder" + "extensions"? + "recursive"?, "template"?, "out_ext"?, "name"?,
+                  "inputs"?, "packages"?}
+               | {"kind": "runs", "template", "count", "inputs"?, "packages"?, "name"?}
                plus "title"?, "macs"? (node ids) and "output"? (where the result goes)."""
         out_root = Path(self.cfg.get("output_dir", "~/Movies/macmesh")).expanduser()
         kind, path = spec.get("kind"), spec.get("path")
@@ -435,9 +437,24 @@ class Control:
             workdir = Path(spec.get("workdir") or (out_root / ".work" / f"{stem}-{uuid.uuid4().hex[:6]}")).expanduser().resolve()
             template = spec.get("template") or ["demucs-stem", "{in:file}", "{out:result}"]
             out_ext = spec.get("out_ext", ".zip")
-            job = plan_batch(files, template, out_ext=out_ext, name=stem, workdir=str(workdir))
+            try:
+                job = plan_batch(files, template, out_ext=out_ext, name=stem, workdir=str(workdir),
+                                 extra_inputs=spec.get("inputs"), packages=spec.get("packages"))
+            except ValueError as e:
+                raise ControlError(str(e)) from None
             final_out = spec.get("workdir") or str(out_root / f"{stem} (macmesh)")
             return {"job": jobspec.validate(job), "final": str(final_out)}
+
+        if kind == "runs":
+            stem = spec.get("name") or spec.get("title") or "runs"
+            workdir = Path(spec.get("workdir") or (out_root / ".work" / f"{stem}-{uuid.uuid4().hex[:6]}")).expanduser().resolve()
+            try:
+                job = plan_runs(spec.get("template"), spec.get("count"), inputs=spec.get("inputs"), name=stem,
+                                workdir=str(workdir), packages=spec.get("packages"))
+                job = jobspec.validate(job)
+            except ValueError as e:
+                raise ControlError(str(e)) from None
+            return {"job": job, "final": spec.get("workdir") or str(out_root / f"{stem} (macmesh)")}
 
         if not path:
             raise ControlError("say which file to work on (path)")
@@ -468,7 +485,7 @@ class Control:
                              vf=spec.get("vf", ""), chunk_seconds=chunk, workdir=str(workdir), chunks=chunks)
             job.pop("final")
         else:
-            raise ControlError("kind is \"app\", \"video\" or \"batch\"")
+            raise ControlError("kind is \"app\", \"video\", \"batch\" or \"runs\"")
         # The result lands as "<name> (macmesh)" plus its own extension (or as a folder).
         return {"job": jobspec.validate(job), "final": str(out_root / f"{stem} (macmesh)")}
 
@@ -491,11 +508,14 @@ class Control:
                  **{f"{{out:{k}}}": Path(v).name for k, v in first.get("outputs", {}).items()}}
         macs = [m for m in self.m_macs() if self._chosen(m, spec)]
         return {"name": job["name"], "tasks": len(job["tasks"]), "programs": programs,
+                **({"packages": {k: v for k, v in job["envs"].items()}} if job.get("envs") else {}),
                 "first_task": [" ".join(names.get(a, a) for a in step) for step in first["steps"]],
                 "output": str(Path(spec["output"]).expanduser()) if spec.get("output") else planned["final"],
                 "macs": [{"name": m["name"], "this_mac": m["this_mac"], "state": m["state"], "at_once_now": m["slots"],
                           "missing": [p for p in programs if p not in m["programs"]]} for m in macs],
-                "note": "Macs missing a program are asked to install it when the job starts; their owner decides. "
+                "note": "Macs missing a program are asked to install it when the job starts; their owner decides "
+                        "(for a script's Python packages, they see the exact list). Scripts only run on Macs that "
+                        "sandbox tasks. "
                         "Each Mac sets how many tasks it runs at once by measuring, so there's nothing to choose."}
 
     def m_submit(self, job: dict, final: str | None = None, kind: str | None = None, title: str | None = None,
@@ -528,7 +548,8 @@ class Control:
             record.scheduler = Scheduler(record.job, clients, log=record.note,
                                          reference=toolinfo.fingerprints(self.cfg, self.home),
                                          origin={"node_id": self.cfg["node_id"], "name": self.cfg["node_name"]},
-                                         installer=lambda client, prog: client.request_install(prog, self.cfg["node_name"]),
+                                         installer=lambda client, prog, packages=None: client.request_install(
+                                             prog, self.cfg["node_name"], packages),
                                          memory=self.home / "speeds.json",
                                          **record.spec.get("options", {}))
             if record.cancel_requested:  # cancelled while the Macs were being found

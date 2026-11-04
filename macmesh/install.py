@@ -5,6 +5,8 @@ name (POST /install). If this Mac's own app profile for that program has an "ins
 the request waits for the owner: the app shows what would be installed, and nothing happens
 until they click Allow. The recipe always comes from this Mac's profiles, never from the asking
 Mac, so another Mac can't make this one run anything. See profiles.py for the recipe format.
+The one exception is a Python with packages for a script (scripts.py): the asking Mac names the
+packages, its name is a hash of that list, and the owner sees the exact list before allowing it.
 
 The recipe runs in ~/.macmesh/tools/<name> with macmesh's own Python, without administrator
 rights, logging to install.log there. When it finishes, the program is found like any other
@@ -21,7 +23,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import config, profiles
+from . import config, profiles, scripts
 
 STEP_TIMEOUT = 2400.0   # pip installing torch over slow Wi-Fi
 FORGET_AFTER = 600.0    # a finished, failed or declined request drops off the list after this
@@ -43,21 +45,37 @@ class Installer:
     """This Mac's install requests: {program: {"program", "summary", "by", "state", "detail", "error", "at"}}.
     States: asking (waiting for the owner), installing, done, failed, declined."""
 
-    def __init__(self, home: Path | None = None, on_change=None, have=None):
+    def __init__(self, home: Path | None = None, on_change=None, have=None, scripts_ok=None):
         self.home = home
         self.on_change = on_change or (lambda: None)
         self.have = have or (lambda name: False)  # whether this Mac already has the program
+        self.scripts_ok = scripts_ok or (lambda: True)  # whether this Mac runs scripts (it sandboxes tasks)
         self.lock = threading.Lock()
         self.requests: dict[str, dict] = {}
+        self.envs: dict[str, dict] = {}  # recipes for Pythons with packages that jobs asked for
 
     def recipe(self, name: str) -> dict | None:
+        if scripts.is_env(name):
+            return self.envs.get(name)
         prof = profiles.load(self.home).get(name)
         return prof if prof and prof.get("install") else None
 
-    def ask(self, name: str, by: str) -> dict:
-        """Another Mac's job needs `name`. Returns the request's state ("installed" if already here)."""
+    def ask(self, name: str, by: str, packages: list | None = None) -> dict:
+        """Another Mac's job needs `name`. Returns the request's state ("installed" if already here).
+        For a Python with packages, `packages` is the list its name stands for."""
         if self.have(name):
             return {"program": name, "state": "installed"}
+        if scripts.is_env(name):
+            if not self.scripts_ok():
+                return {"program": name, "state": "unavailable",
+                        "error": "this Mac doesn't sandbox tasks, so it doesn't run scripts"}
+            try:
+                if scripts.env_name(packages) != name:
+                    raise ValueError(f"{name} doesn't stand for those packages")
+            except ValueError as e:
+                return {"program": name, "state": "unavailable", "error": str(e)}
+            with self.lock:
+                self.envs.setdefault(name, scripts.env_recipe(packages))
         prof = self.recipe(name)
         if not prof:
             return {"program": name, "state": "unavailable",
@@ -68,6 +86,7 @@ class Installer:
             if r and r["state"] in ("asking", "installing", "declined"):
                 return dict(r)
             self.requests[name] = r = {"program": name, "summary": prof["install"]["summary"],
+                                       "packages": list(prof["install"].get("packages", [])),
                                        "description": prof.get("description", ""), "by": by[:64],
                                        "state": "asking", "detail": "", "error": "", "at": time.time()}
         self.on_change()
@@ -156,6 +175,6 @@ class Installer:
             f.write_text(_fill(text, values))
             if fname in inst.get("executable", []):
                 f.chmod(0o755)
-        program = Path(os.path.expanduser(prof["program"]["path"]))
+        program = Path(os.path.expanduser(_fill(prof["program"]["path"], values)))
         if not (program.is_file() and os.access(program, os.X_OK)):
             raise RuntimeError(f"the recipe finished but {program} isn't there")

@@ -12,7 +12,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from . import profiles, wire
+from . import profiles, sandbox, scripts, wire
 
 # Version flags known to be safe (print and exit). App tools declare theirs as
 # `version_args` in the `tools` table; running an unknown GUI binary with
@@ -25,14 +25,22 @@ _hash_cache: dict[tuple, str] = {}
 def tools(cfg: dict, home: Path | None = None) -> dict[str, dict]:
     """The `tools` table: app profiles' programs, with the config's entries layered on top."""
     table = {name: profiles.tool_entry(p) for name, p in profiles.load(home).items()}
+    if scripts_allowed(cfg):
+        table.update(scripts.tool_entries(home))
     for name, entry in cfg["tools"].items():
         table[name] = {**table.get(name, {}), **entry}
     return table
 
 
+def scripts_allowed(cfg: dict) -> bool:
+    """Scripts from other Macs (Python, zsh, bash) run only while tasks are sandboxed here, and the
+    owner can turn them off (`macmesh config scripts false`)."""
+    return bool(cfg.get("scripts", True)) and bool(cfg.get("sandbox")) and sandbox.available()
+
+
 def programs(cfg: dict, home: Path | None = None) -> dict[str, str]:
     """Allowed program name -> resolved executable, for those present here."""
-    found = {}
+    found = dict(scripts.programs(home)) if scripts_allowed(cfg) else {}
     for name in cfg["allowed_programs"]:
         path = shutil.which(name)
         if path:
@@ -83,6 +91,8 @@ def _ask_version(path: str, args: list[str]) -> str:
 def fingerprints(cfg: dict, home: Path | None = None) -> dict[str, dict]:
     out, table = {}, tools(cfg, home)
     for name, path in programs(cfg, home).items():
+        if name in scripts.SHELLS:
+            continue  # their builds differ with each macOS update, and a script doesn't care
         try:
             out[name] = {"sha256": file_sha256(path), "version": version(name, path, table)}
         except OSError:

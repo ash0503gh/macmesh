@@ -71,6 +71,7 @@ def defaults() -> dict:
                   "limit": 0.9},  # the whole Mac (owner + macmesh) stays at or under this, CPU and GPU
         "blob_ttl": 1800,           # seconds an unused uploaded file is kept
         "sandbox": True,            # run tasks under sandbox-exec (no network, writes only to the task)
+        "scripts": True,            # run other Macs' scripts (Python, zsh, bash; only while sandboxed)
         "tls": True,                # mutual TLS with certificates from the mesh's CA (see `macmesh invite`)
         "revoked": [],              # SHA-256 fingerprints of certificates this Mac refuses
         "peers": [],                # static "host:port" entries (skip Bonjour)

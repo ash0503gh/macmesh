@@ -16,11 +16,11 @@ import time
 import unittest
 from pathlib import Path
 
-from macmesh import ai, config, control, jobspec, media, mediarefs, owner, pairing, pki, profiles, sandbox, sysinfo, toolinfo, wire
+from macmesh import ai, config, control, jobspec, media, mediarefs, owner, pairing, pki, profiles, sandbox, scripts, sysinfo, toolinfo, wire
 from macmesh import mcp as mcp_module
 from macmesh import worker as worker_module
 from macmesh.client import NodeClient, NodeError, TaskRejected
-from macmesh.planners import plan_app, plan_batch, plan_range, plan_video
+from macmesh.planners import plan_app, plan_batch, plan_range, plan_runs, plan_video
 from macmesh.planners.range import exact_fps
 from macmesh.planners.ai import extract_plan
 from macmesh.scheduler import JobFailed, Scheduler
@@ -1390,6 +1390,13 @@ class ControlTests(MeshCase):
                                 template=["fakeapp2", "info", "{in:file}"], out_ext=".txt", name="songs",
                                 output=str(self.tmp / "Songs out"))["content"][0]["text"])
         self.assertEqual((batch["tasks"], batch["output"], batch["first_task"]), (2, str(self.tmp / "Songs out"), ["fakeapp2 info a.mp3"]))
+        (self.tmp / "sweep.py").write_text("print('hi')")
+        runs = json.loads(call("preview_job", count=8, template=["python", "{in:script}", "--seed", "{index}", "{out:result}"],
+                               inputs={"script": str(self.tmp / "sweep.py")}, packages=["numpy==2.5.4"],
+                               name="sweep")["content"][0]["text"])
+        env = scripts.env_name(["numpy==2.5.4"])
+        self.assertEqual((runs["tasks"], runs["programs"], runs["packages"]), (8, [env], {env: ["numpy==2.5.4"]}))
+        self.assertEqual(runs["first_task"], [f"{env} sweep.py --seed 0 run-0001"])
         gone = call("answer_install_request", program="demucs-stem", allow=True)
         self.assertTrue(gone["isError"])
         self.assertIn("gone", gone["content"][0]["text"])
@@ -1708,6 +1715,132 @@ class SandboxTests(unittest.TestCase):
         self.assertFalse(escape.exists())
         with self.assertRaises(JobFailed):
             self.run_task(["sh", "-c", f"curl -sf -m 3 http://{self.node.address}/ > {{out:result}}"])
+
+
+class PackageListTests(unittest.TestCase):
+    def test_names_and_versions_only(self):
+        self.assertEqual(scripts.check_packages(["pandas==2.3.3", "numpy", "scikit-learn>=1.7,<2", "torch[cpu]"]),
+                         ["numpy", "pandas==2.3.3", "scikit-learn>=1.7,<2", "torch[cpu]"])
+        for bad in ["https://evil.example/x.whl", "--index-url=http://x", "./local", "numpy; os_name=='posix'",
+                    "-e git+https://x", "a b"]:
+            with self.assertRaises(ValueError, msg=bad):
+                scripts.check_packages([bad])
+
+    def test_the_name_stands_for_the_list(self):
+        self.assertEqual(scripts.env_name(["numpy", "Pandas"]), scripts.env_name(["pandas", "numpy"]))
+        self.assertNotEqual(scripts.env_name(["numpy"]), scripts.env_name(["numpy==2.5.4"]))
+        self.assertTrue(scripts.is_env(scripts.env_name(["numpy"])))
+
+    def test_a_job_must_say_what_its_python_holds(self):
+        name = scripts.env_name(["numpy"])
+        with self.assertRaisesRegex(jobspec.JobError, "packages listed"):
+            jobspec.validate({"tasks": [{"id": "t", "argv": [name, "x.py"]}]})
+        with self.assertRaisesRegex(jobspec.JobError, "doesn't stand for"):
+            jobspec.validate({"envs": {name: ["pandas"]}, "tasks": [{"id": "t", "argv": [name, "x.py"]}]})
+
+    def test_packages_need_a_python_command(self):
+        with self.assertRaisesRegex(ValueError, "start the command with"):
+            plan_runs(["zsh", "-c", "true"], 2, packages=["numpy"])
+
+
+@unittest.skipUnless(sandbox.available(), "sandbox-exec not available")
+class ScriptTests(MeshCase):
+    """Scripts sent with the job, run N times or once per file, sandboxed on each Mac."""
+
+    def test_a_python_script_runs_n_times_across_the_macs(self):
+        script = self.tmp / "work.py"
+        script.write_text("import sys, pathlib, time\n"
+                          "i, n, out = sys.argv[1:]\n"
+                          "time.sleep(0.2)\n"
+                          "pathlib.Path(out, 'part.txt').write_text(f'{i}/{n} ' + sys.version.split()[0])\n")
+        job = jobspec.validate(plan_runs(["python", "{in:script}", "{index}", "{count}", "{out:result}"], 6,
+                                         inputs={"script": str(script)}, workdir=str(self.tmp / "out")))
+        result = self.run_job(job)
+        parts = sorted((self.tmp / "out/results").iterdir())
+        self.assertEqual([p.name for p in parts], [f"run-{i:04d}" for i in range(1, 7)])
+        self.assertEqual((parts[2] / "part.txt").read_text().split()[0], "2/6")
+        self.assertEqual(len([n for n, r in result["nodes"].items() if r["tasks"]]), 2, result)
+
+    def test_a_shell_script_runs_once_per_file(self):
+        script = self.tmp / "count.sh"
+        script.write_text('wc -c < "$1" | tr -d " " > "$2"\n')
+        files = []
+        for i in range(3):
+            f = self.tmp / f"in{i}.txt"
+            f.write_text("x" * (i + 1))
+            files.append(str(f))
+        job = jobspec.validate(plan_batch(files, ["zsh", "{in:script}", "{in:file}", "{out:result}"], ".txt",
+                                          workdir=str(self.tmp / "out"), extra_inputs={"script": str(script)}))
+        self.run_job(job)
+        self.assertEqual((self.tmp / "out/results/in2.txt").read_text().strip(), "3")
+
+    def test_a_script_cannot_read_the_owners_files(self):
+        secret = Path.home() / "Library/Preferences/.GlobalPreferences.plist"
+        job = jobspec.validate(plan_runs(["python", "-c", f"open({str(secret)!r}).read()", "{out:result}"], 1,
+                                         workdir=str(self.tmp / "out")))
+        with self.assertRaisesRegex(JobFailed, "Operation not permitted"):
+            self.run_job(job, max_attempts=1)
+
+    def test_no_scripts_on_a_mac_without_the_sandbox(self):
+        self.nodes[1].stop()
+        self.nodes[1] = Node(self.tmp, "air", self.tools, sandbox=False)
+        self.assertNotIn("python", self.nodes[1].worker.programs())
+        self.assertIn("python", self.nodes[0].worker.programs())
+        name = scripts.env_name(["numpy"])
+        self.assertEqual(self.nodes[1].worker.installer.ask(name, "pro", ["numpy"])["state"], "unavailable")
+
+    def test_the_owner_can_turn_scripts_off(self):
+        self.nodes[1].stop()
+        self.nodes[1] = Node(self.tmp, "air", self.tools, scripts=False)
+        self.assertNotIn("python", self.nodes[1].worker.programs())
+        self.assertIn("fakeapp", self.nodes[1].worker.programs())
+
+
+@unittest.skipUnless(sandbox.available(), "sandbox-exec not available")
+class PythonPackagesTests(MeshCase):
+    """A job's packages: each Mac's owner allows the exact list, then its Python joins the job."""
+
+    def setUp(self):
+        super().setUp()
+        real = scripts.env_recipe
+
+        def offline(packages):  # the real recipe, with pip swapped for a step that needs no network
+            recipe = real(packages)
+            recipe["install"]["steps"][1] = ["{dir}/env/bin/python", "-c", "print('pip would run here')"]
+            return recipe
+        scripts.env_recipe, self.real = offline, real
+
+    def tearDown(self):
+        scripts.env_recipe = self.real
+        super().tearDown()
+
+    def test_the_owner_sees_the_list_and_the_job_uses_it(self):
+        air = self.nodes[1].worker.installer
+        name = scripts.env_name(["numpy==2.5.4"])
+        self.assertEqual(air.ask(name, "pro", ["pandas"])["state"], "unavailable")  # not what the name means
+
+        def owner():
+            for _ in range(500):
+                for r in air.list():
+                    if r["state"] == "asking":
+                        self.seen = r
+                        air.decide(r["program"], True)
+                        return
+                time.sleep(0.02)
+        threading.Thread(target=owner, daemon=True).start()
+        job = jobspec.validate(plan_runs(
+            ["python", "-c", "import sys; open(sys.argv[1] + '/where.txt', 'w').write(sys.prefix)", "{out:result}"],
+            2, packages=["numpy==2.5.4"], workdir=str(self.tmp / "out")))
+        old, scheduler_module.INSTALL_RECHECK = scheduler_module.INSTALL_RECHECK, 0.3
+        try:
+            self.run_job(job, clients=[self.nodes[1].client()],
+                         installer=lambda client, prog, packages=None: client.request_install(prog, "pro", packages))
+        finally:
+            scheduler_module.INSTALL_RECHECK = old
+        self.assertEqual(self.seen["packages"], ["numpy==2.5.4"])
+        self.assertIn("numpy==2.5.4", self.seen["summary"])
+        where = (self.tmp / "out/results/run-0001/where.txt").read_text()
+        self.assertEqual(Path(where), (self.tmp / "air/tools" / name / "env").resolve())
 
 
 if __name__ == "__main__":

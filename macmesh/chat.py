@@ -18,7 +18,7 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
-from . import ai, config, jobspec, profiles, toolinfo
+from . import ai, config, jobspec, profiles, scripts, toolinfo
 from .planners.ai import SCHEMA_DOC, build_prompt, plan_to_job, unsafe_reasons
 
 SAMPLE_NAMES = 40       # file names per folder shown to the agent
@@ -199,9 +199,11 @@ def card(plan: dict, job: dict, nodes: list[dict], home: Path) -> dict:
     missing = {n["node_name"]: [p for p in programs if p not in n.get("programs", [])] for n in nodes}
     names = {**{f"{{in:{k}}}": Path(v).name for k, v in first.get("inputs", {}).items()},
              **{f"{{out:{k}}}": Path(v).name for k, v in first.get("outputs", {}).items()}}
+    envs = job.get("envs", {})
+    names.update({p: scripts.shown(p, envs) for p in envs})
     example = [" ".join(names.get(a, a) for a in step) for step in first["steps"]]
     return {"explanation": plan.get("explanation", ""), "planner": plan["planner"], "tasks": len(job["tasks"]),
-            "programs": programs, "example": example,
+            "programs": [scripts.shown(p, envs) for p in programs], "example": example,
             "name": plan["params"].get("name") or job.get("name") or "job",
             "reasons": unsafe_reasons(job, set(profiles.load(home))),
-            "needs_install": {mac: progs for mac, progs in missing.items() if progs}}
+            "needs_install": {mac: [scripts.shown(p, envs) for p in progs] for mac, progs in missing.items() if progs}}

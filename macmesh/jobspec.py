@@ -33,6 +33,12 @@ render). They run in order and the task fails at the first that fails.
 validate() turns "argv" into a one-step "steps". "fail_if" lists regular
 expressions that, matched anywhere in the task's output, mean it failed even
 though it exited 0 (some apps render placeholders for missing media).
+"output_dirs" names outputs that are folders: each Mac makes them empty for the
+task to fill (a script's results).
+
+A script's Python with packages is a program named "python-<id>" (scripts.py);
+the job says which packages each such name stands for, so a Mac without it can
+be asked to set it up: "envs": {"python-<id>": ["numpy", "pandas==2.3.3"]}.
 """
 
 from __future__ import annotations
@@ -40,6 +46,8 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+
+from . import scripts
 
 NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 PLACEHOLDER = re.compile(r"\{(in|out):([A-Za-z0-9_.-]+)\}")
@@ -66,6 +74,15 @@ def validate(job: dict) -> dict:
     job.setdefault("name", "job")
     job.setdefault("workdir", f"./macmesh-out/{job['name']}")
     job.setdefault("merge", [])
+    envs = job.setdefault("envs", {})
+    if not isinstance(envs, dict):
+        raise JobError("envs must map python-<id> names to package lists")
+    for name, packages in envs.items():
+        try:
+            if scripts.env_name(packages) != name:
+                raise JobError(f"envs: {name} doesn't stand for {packages}")
+        except ValueError as e:
+            raise JobError(f"envs: {name}: {e}") from None
     tasks = job.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         raise JobError("job needs a non-empty 'tasks' list")
@@ -106,6 +123,11 @@ def validate(job: dict) -> dict:
             if Path(dest).name.startswith("."):
                 raise JobError(f"{tid}: output file names may not start with '.'")
             dests.add(dest)
+        if not isinstance(t.setdefault("output_dirs", []), list) or not set(t["output_dirs"]) <= set(t["outputs"]):
+            raise JobError(f"{tid}: output_dirs must name outputs")
+        for prog in {step[0] for step in steps}:
+            if scripts.is_env(prog) and prog not in envs:
+                raise JobError(f"{tid}: {prog} needs its packages listed in the job's envs")
         names = {"in": set(t["inputs"]), "out": set(t["outputs"])}
         for arg in (a for step in steps for a in step):
             for kind, name in PLACEHOLDER.findall(arg):

@@ -101,9 +101,11 @@ class NodeClient:
         except NodeError:
             pass  # it'll notice on its own after a quiet while
 
-    def request_install(self, program: str, by: str) -> dict:
-        """Ask this Mac to set up `program` (its owner decides). Returns {"state", ...}."""
-        code, body = self._json("POST", "/install", {"program": program, "by": by})
+    def request_install(self, program: str, by: str, packages: list | None = None) -> dict:
+        """Ask this Mac to set up `program` (its owner decides). Returns {"state", ...}.
+        For a Python with packages (scripts.py), `packages` is the list its name stands for."""
+        req = {"program": program, "by": by, **({"packages": packages} if packages else {})}
+        code, body = self._json("POST", "/install", req)
         if code != 200:
             raise NodeError(f"{self.address}: /install returned {code}: {body.get('error', '')}")
         return body

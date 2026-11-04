@@ -114,8 +114,10 @@ the MCP server's `macmesh` prompt, for clients that offer MCP prompts.
 - **Run:**
   - `preview_job` shows what would run, on which Macs and where results go,
     without starting anything.
-  - `start_job` takes the same arguments: one project or video, or `files` or a `folder` (with
-    `extensions`) for a batch, plus `output`. It refuses to start unless called with
+  - `start_job` takes the same arguments: one project or video, `files` or a `folder` (with
+    `extensions`) for a batch, or `count` with a `template` to run a command that many times, plus
+    `output`. Scripts come in `inputs` and their Python packages in `packages`
+    (see [Scripts](#scripts-python-zsh-bash)). It refuses to start unless called with
     `confirmed: true`, which its description says to set only after the user's yes.
 - **Follow:** `get_job` (what each Mac is doing, CPU and GPU load, events), `list_jobs`, `cancel_job`.
 - **Settings:** `set_lending` (on or off, lending mode, how much of the Mac may be used),
@@ -136,6 +138,7 @@ It talks to the running engine, so jobs an agent starts show up in the app.
 | `macmesh range` | Frame-range rendering with any app that has a command line: `--app` uses an [app profile](#any-app-profiles), `--tool` takes the tool's arguments. Projects and the media they use are uploaded once per Mac. |
 | `macmesh apps` | Lists app profiles, and which apps (and builds) this Mac has. |
 | `macmesh batch` | One task per file: transcode, transcribe, upscale, mask, convert. |
+| Scripts | Python, zsh and bash scripts sent with the job, run once per file or N times (shards, seeds, sweeps), with the Python packages the job lists. See [Scripts](#scripts-python-zsh-bash). |
 | `macmesh plan` | **AI planner** via **Claude Code CLI** or **Antigravity CLI**, headless, no API keys. It reads the request, file metadata, Mac specs and the app profiles, and picks how to split the work. |
 | `macmesh run` | Runs a raw job spec (JSON). This is what every planner produces; see `macmesh/jobspec.py`. |
 
@@ -252,6 +255,40 @@ example profiles show what each app needed:
 - **EffectCraft:** takes seconds, relinks footage in the background unless
   asked to wait, and renders missing footage silently. Its profile relinks,
   then checks for missing footage **and fonts** before rendering.
+
+## Scripts: Python, zsh, bash
+
+Heavy work that's a script, not an app: feature extraction over a dataset, simulations with many
+seeds, a parameter sweep, image processing over a folder. The script goes with the job like any
+other input, so nothing needs installing by hand on the other Macs.
+
+- **Once per file:** a batch whose command runs the script, e.g.
+  `["python", "{in:script}", "{in:file}", "{out:result}"]`, with the script in the job's inputs.
+- **N times:** a runs job. The command runs `count` times; `{index}` (0 to count-1) and `{count}`
+  tell each run which it is, and `{out:result}` is an empty folder for its results. They come back
+  as `run-0001/`, `run-0002/`, ... in one results folder.
+- **Programs:** `python` is macmesh's own Python (standard library only). `zsh` and `bash` run shell
+  scripts, which can call any program both Macs have (ffmpeg, sips, ...). An installed command-line
+  tool works the same way once it has a profile (see [Any app](#any-app-profiles)).
+- **Python packages:** the job lists them (`"packages": ["numpy==2.5.4", "pandas==2.3.3"]`). Each Mac
+  builds a Python with exactly that list once, in `~/.macmesh/tools/python-<id>`, after its owner
+  clicks *Allow* on a request that shows the list. `<id>` is a hash of the list, so the name stands
+  for those packages and nothing else. Only package names and versions are accepted (no URLs,
+  paths or pip options), and pip takes ready-built packages only, so no package's own setup code
+  runs while installing. Pin versions so every Mac gets the same ones. Each list takes its own
+  space (numpy alone is about 100 MB, torch a few GB) and stays until you delete its folder.
+
+With the MCP tools (or `/macmesh`), a sweep looks like this:
+
+```json
+{"count": 40, "template": ["python", "{in:script}", "--seed", "{index}", "--out", "{out:result}"],
+ "inputs": {"script": "/Users/me/sim/run.py", "data": "/Users/me/sim/data"},
+ "packages": ["numpy==2.5.4", "scipy==1.16.3"]}
+```
+
+Scripts run in the sandbox like every task: no network, no files beyond their inputs and their
+results folder. A Mac that doesn't sandbox tasks never runs scripts, and an owner can refuse them
+with `macmesh config scripts false`.
 
 ## AI (Claude Code or Antigravity, no API keys)
 
@@ -428,9 +465,13 @@ the next section). The AI works on the parts that have no rule yet:
   owner allowed to be installed (`~/.macmesh/tools`).
 - **Still on you:** keep FileVault on, because cached media is not separately
   encrypted on disk. Tasks run as your user, not a separate low-privilege
-  account. There are no memory limits per task. Don't add `sh`/`python3` to
-  `allowed_programs` unless you mean it: the sandbox limits a shell, but an
-  allowlisted interpreter can still run anything inside it.
+  account. There are no memory limits per task.
+- **Scripts:** with scripts on (the default), any Mac in your mesh can run
+  Python, zsh or bash code on a lending Mac. The sandbox is what limits that
+  code, so scripts only run while tasks are sandboxed; `macmesh config scripts
+  false` refuses them. Installing a script's Python packages is the one step
+  outside the sandbox: it needs the owner's *Allow* on the exact list, takes
+  ready-built packages from PyPI only, and runs no package's setup code.
 
 ## Testing
 

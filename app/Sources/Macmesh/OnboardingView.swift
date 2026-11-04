@@ -259,17 +259,17 @@ struct InstallRequestBanner: View {
 
     private var title: String {
         switch request.state {
-        case "installing": "Installing \(request.program)\u{2026}"
-        case "done": "Installed \(request.program)"
-        case "failed": "Couldn't install \(request.program)"
-        default: "\(request.by) needs \(request.program) on this Mac"
+        case "installing": "Installing \(request.shownName)\u{2026}"
+        case "done": "Installed \(request.shownName)"
+        case "failed": "Couldn't install \(request.shownName)"
+        default: "\(request.by) needs \(request.shownName) on this Mac"
         }
     }
 
     private var detail: String {
         switch request.state {
         case "installing": request.detail.flatMap { $0.isEmpty ? nil : $0 } ?? "Setting it up\u{2026}"
-        case "done": "This Mac can help with \(request.program) jobs now."
+        case "done": "This Mac can help with \(request.program.hasPrefix("python-") ? "those scripts" : "\(request.program) jobs") now."
         case "failed": request.error ?? "Something went wrong."
         default: "To help with its job: \(request.summary). It goes into macmesh's own folder, with no administrator password."
         }
