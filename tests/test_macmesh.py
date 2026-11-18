@@ -54,7 +54,8 @@ class Node:
         self.home = root / name
         os.environ["MACMESH_HOME"] = str(self.home)
         cfg = config.defaults()
-        cfg.update(node_name=name, token=TOKEN, slots=slots, port=0, tools=tools, auto_workers=False)
+        cfg.update(node_name=name, token=TOKEN, slots=slots, port=0, tools=tools, auto_workers=False,
+                   min_battery=0)  # the test machine's real battery mustn't turn work away
         cfg.update(extra)
         cfg["owner"].update(owner or {"mode": "off"})
         self.worker = Worker(cfg, home=self.home, owner_sample=owner_sample)
@@ -555,6 +556,165 @@ class OwnWorkTests(MeshCase):
             time.sleep(0.05)
         sched.cancel()
         self.assertTrue(any("waiting: no Mac will take work right now (air: not lending)" in m for m in lines), lines)
+
+
+class JoinTests(MeshCase):
+    """Macs that turn up while a job runs take chunks from then on."""
+
+    def run_in_background(self, sched):
+        out = {}
+        t = threading.Thread(target=lambda: out.setdefault("result", sched.run()), daemon=True)
+        t.start()
+        for _ in range(200):
+            if sched.running:
+                break
+            time.sleep(0.02)
+        return t, out
+
+    def test_a_mac_that_turns_up_mid_job_takes_chunks(self):
+        pro, air = self.nodes
+        job = self.range_job(frames=600, chunk=50)
+        lines = []
+        sched = Scheduler(job, [pro.client()], log=lines.append)
+        os.environ["FAKE_DELAY"] = "0.3"
+        try:
+            t, out = self.run_in_background(sched)
+            self.assertTrue(sched.add_node(air.client()))
+            self.assertFalse(sched.add_node(air.client()))  # already in the job
+            t.join(60)
+        finally:
+            os.environ.pop("FAKE_DELAY")
+        self.assertEqual(out["result"]["nodes"]["air"]["tasks"] + out["result"]["nodes"]["pro"]["tasks"], 12)
+        self.assertGreater(out["result"]["nodes"]["air"]["tasks"], 0, lines)
+        self.assertTrue(any("+ air joined the job" in m for m in lines), lines)
+        media.run_merge(Path(job["workdir"]), job["merge"], log=lambda m: None)
+        self.assertEqual(len(list((self.tmp / "out").rglob("frame_*.txt"))), 600)
+
+    def test_a_mac_at_a_new_address_is_reached_there(self):
+        pro, air = self.nodes
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))  # a port nothing answers on: the Mac's old address
+        moved = NodeClient(f"127.0.0.1:{dead.getsockname()[1]}", TOKEN, timeout=5)
+        dead.close()
+        moved.info = dict(air.client().info)
+        lines = []
+        sched = Scheduler(self.range_job(frames=600, chunk=50), [pro.client(), moved], log=lines.append)
+        os.environ["FAKE_DELAY"] = "0.3"
+        try:
+            t, out = self.run_in_background(sched)
+            for _ in range(200):  # its first chunk fails at the old address
+                if any("! air" in m for m in lines):
+                    break
+                time.sleep(0.02)
+            for _ in range(200):
+                with sched.cond:
+                    idle = sched.nodes[1].in_flight == 0
+                if idle:
+                    break
+                time.sleep(0.02)
+            self.assertFalse(sched.add_node(air.client()))  # not a new Mac: the same one, moved
+            t.join(60)
+        finally:
+            os.environ.pop("FAKE_DELAY")
+        self.assertTrue(any(f"air is at {air.address} now" in m for m in lines), lines)
+        self.assertGreater(out["result"]["nodes"]["air"]["tasks"], 0, lines)
+
+    def test_no_joining_before_or_after_the_job_runs(self):
+        pro, air = self.nodes
+        sched = Scheduler(self.range_job(frames=50), [pro.client()], log=lambda m: None)
+        self.assertFalse(sched.add_node(air.client()))
+        sched.run()
+        self.assertFalse(sched.add_node(air.client()))
+        self.assertEqual(len(sched.nodes), 1)
+
+    def test_control_hands_new_macs_to_running_jobs(self):
+        class Sched:
+            def __init__(self, nodes):
+                self.nodes, self.added = nodes, []
+
+            def add_node(self, c):
+                self.added.append(c.address)
+
+        def client(node_id, address):
+            c = NodeClient(address, TOKEN)
+            c.info = {"node_id": node_id, "node_name": node_id}
+            return c
+
+        class Rec:
+            def __init__(self, sched, macs=None):
+                self.scheduler, self.state, self.spec = sched, "running", {"macs": macs} if macs else {}
+
+        ctl = object.__new__(control.Control)
+        ctl.cfg, ctl.lock = {"token": TOKEN, "tls": False}, threading.Lock()
+        ctl.nodes = [client("pro", "10.0.0.1:1"), client("air", "10.0.0.2:1")]
+        has_pro = Sched([type("N", (), {"client": client("pro", "10.0.0.1:1")})()])
+        moved = Sched([type("N", (), {"client": client("air", "10.0.0.9:1")})()])
+        only_pro = Sched([])
+        done = Sched([])
+        ctl.jobs = {"a": Rec(has_pro), "b": Rec(moved), "c": Rec(only_pro, macs=["pro"]), "d": Rec(done)}
+        ctl.jobs["d"].state = "merging"
+        ctl._join_jobs()
+        self.assertEqual(has_pro.added, ["10.0.0.2:1"])
+        self.assertEqual(moved.added, ["10.0.0.1:1", "10.0.0.2:1"])
+        self.assertEqual(only_pro.added, ["10.0.0.1:1"])
+        self.assertEqual(done.added, [])
+
+
+class BrokenMacTests(MeshCase):
+    """A Mac whose program fails every task stops getting the job's work."""
+
+    def setUp(self):
+        super().setUp()
+        self.nodes[1].stop()
+        broken = self.tmp / "broken-fakeapp"
+        broken.write_text("#!/bin/sh\necho 'demucs: Operation not permitted' >&2\nexit 1\n")
+        broken.chmod(0o755)
+        self.nodes[1] = Node(self.tmp, "air", {"fakeapp": {"path": str(broken)}})
+
+    def test_a_mac_failing_everything_is_dropped_and_the_job_finishes(self):
+        lines = []
+        result = self.run_job(self.range_job(frames=600, chunk=50), log=lines.append)
+        self.assertEqual(result["nodes"]["pro"]["tasks"], 12)
+        dropped = next(i for i, m in enumerate(lines) if "giving it no more of this job" in m)
+        self.assertFalse([m for m in lines[dropped:] if m.endswith(" on air")], lines)  # nothing sent after
+        self.assertTrue(any("air failed 3 different tasks and finished none: giving it no more of this job "
+                            "(demucs: Operation not permitted)" in m for m in lines), lines)
+
+    def test_when_every_mac_fails_the_job_says_why(self):
+        with self.assertRaises(JobFailed) as e:
+            self.run_job(self.range_job(frames=600, chunk=50), clients=[self.nodes[1].client()])
+        self.assertIn("every Mac fails these tasks", str(e.exception))
+        self.assertIn("Operation not permitted", str(e.exception))
+
+
+class HomeCopyTests(unittest.TestCase):
+    """In the sandbox, someone's own copy of a program under the home folder isn't offered."""
+
+    def test_home_copies_are_left_out_only_when_sandboxed(self):
+        from unittest import mock
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            for d in ("home/.local/bin", "opt/bin"):
+                (tmp / d).mkdir(parents=True)
+            for d, name in (("home/.local/bin", "hometool"), ("opt/bin", "opttool")):
+                exe = tmp / d / name
+                exe.write_text("#!/bin/sh\n")
+                exe.chmod(0o755)
+            cfg = config.defaults()
+            cfg["tools"] = {"hometool": {"path": str(tmp / "missing/hometool")},
+                            "opttool": {"path": str(tmp / "missing/opttool")}}
+            path = f"{tmp / 'home/.local/bin'}:{tmp / 'opt/bin'}:{os.environ['PATH']}"
+            with mock.patch.dict(os.environ, {"PATH": path}), \
+                    mock.patch("pathlib.Path.home", return_value=tmp / "home"), \
+                    mock.patch.object(sandbox, "available", return_value=True):
+                cfg["sandbox"] = True
+                found = toolinfo.programs(cfg, tmp / "mm")
+                self.assertNotIn("hometool", found)
+                self.assertEqual(found["opttool"], str(tmp / "opt/bin/opttool"))
+                cfg["sandbox"] = False
+                self.assertEqual(toolinfo.programs(cfg, tmp / "mm")["hometool"], str(tmp / "home/.local/bin/hometool"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class InstallTests(MeshCase):

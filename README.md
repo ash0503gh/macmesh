@@ -384,7 +384,9 @@ the next section). The AI works on the parts that have no rule yet:
 - **Lid closed / Wi-Fi dropped:** status calls time out after 2 s, and a Mac
   that misses two in a row has its chunk re-queued (about 4 s). A transfer
   that stalls for 10 s counts as dead too. The Mac rejoins automatically when
-  it comes back. A task that its Mac stops asking about for 60 s (the job was
+  it comes back, even at a new address. A Mac that wasn't there when the job
+  started (asleep, off the network, not lending yet) joins the running job
+  within seconds of turning up and takes chunks from then on. A task that its Mac stops asking about for 60 s (the job was
   cancelled or the task re-queued, but the message didn't get through) is
   cancelled on the Mac running it, so it doesn't run later for nothing.
 - **Shutdown / logout:** the worker catches SIGTERM and hands its chunks back

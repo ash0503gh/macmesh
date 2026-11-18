@@ -45,13 +45,21 @@ def programs(cfg: dict, home: Path | None = None) -> dict[str, str]:
         path = shutil.which(name)
         if path:
             found[name] = path
+    sandboxed = bool(cfg.get("sandbox")) and sandbox.available()
     for name, tool in tools(cfg, home).items():
         path = os.path.expanduser(tool.get("path", ""))
         if path and os.path.isfile(path) and os.access(path, os.X_OK):
             found[name] = path
-        elif shutil.which(name):
-            found[name] = shutil.which(name)
+        elif (other := shutil.which(name)) and not (sandboxed and _in_home(other)):
+            # Not where its profile puts it. A copy under the home folder is someone's own install,
+            # and in the sandbox it can't reach the files it keeps elsewhere in the home folder:
+            # leave it out, so the Mac is asked to install macmesh's own copy instead.
+            found[name] = other
     return found
+
+
+def _in_home(path: str) -> bool:
+    return Path(path).resolve().is_relative_to(Path.home().resolve())
 
 
 def file_sha256(path: str) -> str:

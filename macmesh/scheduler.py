@@ -41,6 +41,7 @@ NODE_COOLDOWN = 10.0
 INSTALL_RECHECK = 5.0  # how often to see whether a Mac asked to install something has it now
 BUSY_COOLDOWN = 30.0  # a Mac that refused work (owner busy, battery, disk) is asked again after this
 MAX_NODE_ERRORS = 6  # per task: give up if Macs keep vanishing
+BROKEN_AFTER = 3     # different tasks failing on a Mac that has finished none: stop sending it work
 FINISH_SLACK = 1.15  # near the end, a Mac takes a chunk if it finishes within this of the best Mac
 LOCAL_BPS = 1e9      # uploading to this Mac's own worker: effectively free
 DEFAULT_BPS = 20e6   # another Mac's upload rate until measured (Wi-Fi)
@@ -90,6 +91,7 @@ class NodeState:
     upload_bps: list = field(default_factory=list)  # measured upload rates, bytes per second
     sent_paths: set = field(default_factory=set)    # local inputs already uploaded to this Mac
     local: bool = False                             # this Mac's own worker
+    failed_streak: set = field(default_factory=set)  # tasks that failed here in a row, none done yet
 
     def moved(self, up: int = 0, down: int = 0) -> None:
         now = time.time()
@@ -147,16 +149,53 @@ class Scheduler:
         self.memory = memory
         programs = sorted({step[0] for t in self.tasks for step in (t.spec.get("steps") or [t.spec.get("argv") or ["?"]])})
         self.key = "|".join(programs) + "|" + str(job["tasks"][0].get("unit", "")) if job["tasks"] else ""
-        mine = (origin or {}).get("node_id")
         known = self._recall()
         for n in self.nodes:
-            n.local = bool(mine) and n.client.info.get("node_id") == mine
-            seen = known.get(f"{n.client.info.get('node_id')}|{self.key}", {})
-            if seen.get("speed"):
-                n.speeds.append(float(seen["speed"]))  # a starting point; real timings soon outweigh it
-            if seen.get("upload_bps"):
-                n.upload_bps.append(float(seen["upload_bps"]))
+            self._prime(n, known)
         self._waiting_said = 0.0
+        self.running = False
+
+    def _prime(self, n: NodeState, known: dict) -> None:
+        """Whether it's this Mac, and its remembered speeds as a starting point."""
+        mine = self.origin.get("node_id")
+        n.local = bool(mine) and n.client.info.get("node_id") == mine
+        seen = known.get(f"{n.client.info.get('node_id')}|{self.key}", {})
+        if seen.get("speed"):
+            n.speeds.append(float(seen["speed"]))  # a starting point; real timings soon outweigh it
+        if seen.get("upload_bps"):
+            n.upload_bps.append(float(seen["upload_bps"]))
+
+    def add_node(self, client: NodeClient) -> bool:
+        """A Mac that turned up while the job runs (woke, came back on the network, started lending):
+        it takes chunks from now on. A Mac the job already has, seen at a new address, is reached
+        there once nothing of the job is in flight on it. True if the job gained a Mac."""
+        node_id = client.info.get("node_id")
+        with self.cond:
+            if not self.running or self.aborted or self.fatal or not node_id:
+                return False
+            have = next((n for n in self.nodes if n.client.info.get("node_id") == node_id), None)
+            if have:
+                if have.client.address != client.address and not have.in_flight:
+                    old = have.client.address
+                    have.client = client
+                    for t in self.tasks:  # what it failed or refused there was about the old address
+                        for marks in (t.failed_on, t.excluded):
+                            if old in marks:
+                                marks.discard(old)
+                                marks.add(client.address)
+                    have.sent_paths.clear()
+                    if have.cooldown_until and have.cooldown_until != float("inf"):
+                        have.cooldown_until = time.time()  # probe it at the new address now
+                    self.log(f"  ↪ {client.name} is at {client.address} now")
+                return False
+            node = NodeState(client)
+            self._prime(node, self._recall())
+            self.nodes.append(node)
+            self.log(f"  + {client.name} joined the job [{node.score}]")
+            self._check_builds([node])
+            self.cond.notify_all()
+        self._ask_installs([node])  # a network call: not while holding up the job
+        return True
 
     # ---- public -------------------------------------------------------
     def run(self) -> dict:
@@ -173,6 +212,7 @@ class Scheduler:
                  + ", ".join(f"{n.client.name}[{n.score}]" for n in self.nodes))
         try:
             with self.cond:
+                self.running = True
                 while not self._finished():
                     if self.fatal:
                         raise JobFailed(self.fatal)
@@ -181,6 +221,8 @@ class Scheduler:
                     self._say_if_stuck()
                     self.cond.wait(timeout=1.0)
         finally:
+            with self.cond:
+                self.running = False
             self._remember()
             self._cancel_all()
             for n in self.nodes:  # helpers' job cards end now, not after a quiet while
@@ -242,13 +284,13 @@ class Scheduler:
             return f"{t.id}: no node has '{prog}' installed/allowed"
         return ""
 
-    def _ask_installs(self) -> None:
+    def _ask_installs(self, nodes: list | None = None) -> None:
         """Ask each Mac without a program the job needs to set it up; its owner decides."""
         if not self.installer:
             return
-        needed = {p for t in self.tasks for p in jobspec.programs(t.spec)}
+        needed = {p for t in self.tasks if t.state != "done" for p in jobspec.programs(t.spec)}
         envs = self.job.get("envs", {})  # a script's Python: the packages its name stands for
-        for n in self.nodes:
+        for n in nodes or self.nodes:
             for prog in sorted(needed - set(n.client.info.get("programs", []))):
                 try:
                     reply = self.installer(n.client, prog, *([envs[prog]] if prog in envs else []))
@@ -257,7 +299,8 @@ class Scheduler:
                     continue
                 state = reply.get("state")
                 if state in ("asking", "installing"):
-                    n.installing.add(prog)
+                    with self.cond:
+                        n.installing.add(prog)
                     self.log(f"  ? asked {n.client.name} to install {prog}: "
                              + ("waiting for its owner to allow it" if state == "asking" else "installing"))
                 elif state == "declined":
@@ -712,6 +755,7 @@ class Scheduler:
             if outcome == "done":
                 task.elapsed = elapsed
                 node.completed += 1
+                node.failed_streak.clear()
                 node.busy_seconds += elapsed
                 if elapsed > 0:
                     node.speeds.append(task.spec["cost"] / elapsed)
@@ -731,6 +775,17 @@ class Scheduler:
                     self.fatal = f"task {task.id} failed {task.attempts} times. Last error:\n{detail}"
                 else:
                     task.state = "pending"
+                if not node.completed:
+                    node.failed_streak.add(task.id)
+                    if len(node.failed_streak) == BROKEN_AFTER:
+                        # Different tasks, all failing, none done: it's the Mac (its program, its setup),
+                        # not the tasks. Each would only cost an upload and a retry elsewhere.
+                        node.cooldown_until = float("inf")
+                        why = next((l for l in reversed(detail.splitlines()) if l.strip()), "no error given")
+                        self.log(f"  ✗ {name} failed {BROKEN_AFTER} different tasks and finished none: "
+                                 f"giving it no more of this job ({why[:300]})")
+                        if all(n.cooldown_until == float("inf") for n in self.nodes) and not self.fatal:
+                            self.fatal = f"every Mac fails these tasks. Last error:\n{detail}"
             elif outcome == "excluded":
                 task.excluded.add(node.client.address)
                 task.state = "pending"
@@ -738,13 +793,13 @@ class Scheduler:
                     self.fatal = f"task {task.id}: no node will run it ({detail})"
             elif outcome == "yielded":  # the Mac's owner needs it, or it's shutting down
                 task.state = "pending"
-                node.cooldown_until = time.time() + BUSY_COOLDOWN
+                node.cooldown_until = max(node.cooldown_until, time.time() + BUSY_COOLDOWN)
                 self.log(f"  ↩ {name} handed back {task.id} ({detail.removeprefix('yielded: ')}); re-queued")
             else:  # node trouble: unreachable, refusing work, lost task
                 task.state = "pending"
                 task.node_errors += outcome == "error"
                 wait = BUSY_COOLDOWN if outcome == "busy" else NODE_COOLDOWN
-                node.cooldown_until = time.time() + wait
+                node.cooldown_until = max(node.cooldown_until, time.time() + wait)  # a dropped Mac stays dropped
                 node.refused = detail.split("(", 1)[-1].rstrip(")") if outcome == "busy" else "not answering"
                 self.log(f"  ! {name}: {detail.splitlines()[0] if detail else outcome}; "
                          f"re-queued {task.id}, pausing node {wait:.0f}s")

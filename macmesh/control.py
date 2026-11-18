@@ -268,6 +268,26 @@ class Control:
             self.nodes = [k["client"] for k in self.known.values() if k["client"] and k["misses"] < GONE_AFTER]
             self.nodes_at = now
         self._save_macs()
+        self._join_jobs()
+
+    def _join_jobs(self) -> None:
+        """Hand Macs that turned up (or moved address) to the jobs running now."""
+        with self.lock:
+            up = [c for c in self.nodes if c.info.get("node_id")]
+            jobs = [r for r in self.jobs.values() if r.scheduler and r.state == "running"]
+        tls = None
+        for record in jobs:
+            sched = record.scheduler
+            have = {n.client.info.get("node_id"): n.client.address for n in list(sched.nodes)}
+            for c in up:
+                node_id = c.info["node_id"]
+                if have.get(node_id) == c.address or (record.spec.get("macs") and node_id not in record.spec["macs"]):
+                    continue
+                if tls is None and self.cfg.get("tls", True):
+                    tls = pki.context(server=False)
+                fresh = NodeClient(c.address, self.cfg["token"], tls=tls, revoked=self.cfg.get("revoked", []))
+                fresh.info = dict(c.info)  # just checked; the job's own client, as at the start
+                sched.add_node(fresh)
 
     def _check(self, node_id: str, k: dict) -> None:
         """Ask a known Mac directly at its last address (then its others)."""
